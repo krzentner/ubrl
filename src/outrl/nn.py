@@ -11,6 +11,7 @@ SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], torch.nn.Mo
 Initializer = Callable[[torch.Tensor], None]
 Shape = Union[int, Tuple[int, ...]]
 
+
 def as_2d(x):
     x = x.squeeze()
     if len(x.shape) == 1:
@@ -18,12 +19,12 @@ def as_2d(x):
     return x
 
 
+@torch.jit.script
 def compute_advantages(
     *,
     discount: float,
     gae_lambda: float,
-    max_episode_length: int,
-    expected_returns: torch.Tensor,
+    vf_returns: torch.Tensor,
     rewards: torch.Tensor,
 ):
     """Calculate advantages.
@@ -54,18 +55,18 @@ def compute_advantages(
         discount (float): RL discount factor (i.e. gamma).
         gae_lambda (float): Lambda, as used for Generalized Advantage
             Estimation (GAE).
-        max_episode_length (int): Maximum length of a single episode.
-        expected_returns (torch.Tensor): A 2D vector of value function
-            estimates with shape (N, T), where N is the batch dimension (number
-            of episodes) and T is the maximum episode length experienced by the
-            agent. If an episode terminates in fewer than T time steps, the
-            remaining elements in that episode should be set to 0.
-        rewards (torch.Tensor): A 2D vector of per-step rewards with shape
+        vf_returns (torch.Tensor): A 2D tensor of value function
+            estimates with shape (N, T + 1), where N is the batch dimension
+            (number of episodes) and T is the maximum episode length
+            experienced by the agent. If an episode terminates in fewer than T
+            time steps, the remaining elements in that episode should be set to
+            0.
+        rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
             (N, T), where N is the batch dimension (number of episodes) and T
             is the maximum episode length experienced by the agent. If an
             episode terminates in fewer than T time steps, the remaining
             elements in that episode should be set to 0.
-
+        episode_lengths (torch.Tensor): A 1D vector of episode lengths.
     Returns:
         torch.Tensor: A 2D vector of calculated advantage values with shape
             (N, T), where N is the batch dimension (number of episodes) and T
@@ -75,20 +76,17 @@ def compute_advantages(
 
     """
     rewards = as_2d(rewards)
-    expected_returns = as_2d(expected_returns)
+    vf_returns = as_2d(vf_returns)
+    n_episodes = rewards.shape[0]
+    max_episode_length = rewards.shape[1]
+    assert vf_returns.shape == (n_episodes, max_episode_length + 1)
 
-    adv_filter = torch.full(
-        (1, 1, 1, max_episode_length - 1), discount * gae_lambda, dtype=torch.float
-    )
-    adv_filter = torch.cumprod(F.pad(adv_filter, (1, 0), value=1), dim=-1)
-
-    deltas = (
-        rewards + discount * F.pad(expected_returns, (0, 1))[:, 1:] - expected_returns
-    )
-    deltas = F.pad(deltas, (0, max_episode_length - 1)).unsqueeze(0).unsqueeze(0)
-
-    advantages = F.conv2d(deltas, adv_filter, stride=1).reshape(rewards.shape)
-    return advantages.squeeze()
+    delta = -vf_returns[:, :-1] + rewards + discount * vf_returns[:, 1:]
+    adv_gae = torch.zeros((n_episodes, max_episode_length))
+    adv_gae[max_episode_length - 1] = delta[max_episode_length - 1]
+    for t in range(max_episode_length - 2, 0, -1):
+        adv_gae[:, t] = delta[:, t] + discount * gae_lambda * adv_gae[:, t + 1]
+    return adv_gae.squeeze()
 
 
 def discount_cumsum(x: torch.Tensor, discount: float):
@@ -103,9 +101,7 @@ def discount_cumsum(x: torch.Tensor, discount: float):
     x = x.reshape(B, 1, L)
     # Add pad end of episodes to zero
     # Only need 2l - 1 timesteps to make index L valid
-    x_pad = torch.cat(
-        [x, torch.zeros_like(x[:, :, :-1])], axis=-1
-    )
+    x_pad = torch.cat([x, torch.zeros_like(x[:, :, :-1])], axis=-1)
     returns = F.conv1d(x_pad, weights, stride=1)
     assert returns.shape == (B, 1, L)
     return returns.squeeze()
@@ -225,7 +221,6 @@ class DistConstructor:
 
 @dataclass
 class NormalConstructor(DistConstructor):
-
     min_std: float = 1e-6
     max_std: float = 2.0
     std_parameterization: str = "exp"
@@ -264,13 +259,15 @@ class CategoricalConstructor(DistConstructor):
         return flatten_shape(action_shape)
 
     def __call__(self, logits: torch.Tensor):
+        # dist = torch.distributions.Independent(torch.distributions.Categorical(logits=logits), 1)
         dist = torch.distributions.Categorical(logits=logits)
         return dist
 
     def encode_actions(
         self, actions: torch.Tensor, dist: torch.distributions.Distribution
     ) -> torch.Tensor:
-        return F.one_hot(actions, num_classes=len(dist.probs))
+        # return F.one_hot(actions, num_classes=dist.base_dist.probs.shape[1])
+        return F.one_hot(actions, num_classes=dist.probs.shape[1])
 
 
 DEFAULT_DIST_TYPES = {
@@ -304,7 +301,6 @@ def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
 
     # Handle corner cases
     if vary == 0:
-
         if torch.var(ypred) > 0:
             return 0
 
@@ -312,7 +308,8 @@ def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
 
     epsilon = 1e-8
 
-    return (1 - torch.var(y - ypred) + epsilon) / (vary + epsilon)
+    res = 1 - (torch.var(y - ypred) + epsilon) / (vary + epsilon)
+    return res
 
 
 def test_discount_cumsum():

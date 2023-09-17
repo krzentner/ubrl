@@ -53,8 +53,13 @@ class FragmentBuffer:
 
     """
 
-    def __init__(self, n_episodes: int, max_episode_length: int,
-                 eviction_policy: str = "fifo", eviction_policy_key: Optional[str] = None):
+    def __init__(
+        self,
+        n_episodes: int,
+        max_episode_length: int,
+        eviction_policy: str = "fifo",
+        eviction_policy_key: Optional[str] = None,
+    ):
         # User controlled per timestep data
         self.buffers: Dict[str, Union[torch.Tensor, List[List[Any]]]] = {}
         # User controlled per episode data
@@ -83,8 +88,8 @@ class FragmentBuffer:
         self._free_episodes = deque(range(n_episodes))
 
         # Changing these fields does not cause expected results, make them read-only
-        self._n_episodes = n_episodes
-        self._max_episode_length = max_episode_length
+        self._n_episodes: int = n_episodes
+        self._max_episode_length: int = max_episode_length
 
     @property
     def n_episodes(self):
@@ -117,15 +122,23 @@ class FragmentBuffer:
             # Re-sort the list.
             # This could probably be avoided using a binary tree, but profile
             # before/after changing it.
-            self._sorted_episode_data = sorted(enumerate(self.episode_data), key=lambda d: d[1][eviction_key])
+            self._sorted_episode_data = sorted(
+                enumerate(self.episode_data), key=lambda d: d[1][eviction_key]
+            )
             if self.eviction_policy == "uniform":
                 total_dists = []
                 for i, (original_i, data) in enumerate(self._sorted_episode_data):
                     # Uniform will never remove either end-point
                     if i == 0 or i + 1 == len(self._sorted_episode_data):
                         continue
-                    dist_to_prev = data[eviction_key] - self._sorted_episode_data[i - 1][1][eviction_key]
-                    dist_to_next = self._sorted_episode_data[i + 1][1][eviction_key] - data[eviction_key]
+                    dist_to_prev = (
+                        data[eviction_key]
+                        - self._sorted_episode_data[i - 1][1][eviction_key]
+                    )
+                    dist_to_next = (
+                        self._sorted_episode_data[i + 1][1][eviction_key]
+                        - data[eviction_key]
+                    )
                     # abs should not be necessary with this subtraction order, but may as well
                     total_dist = abs(dist_to_prev) + abs(dist_to_next)
                     total_dists.append((total_dist, original_i))
@@ -139,7 +152,6 @@ class FragmentBuffer:
                     self.clear_episode(original_i)
             else:
                 raise ValueError(f"Invalid eviction_policy {self.eviction_policy}")
-
 
     def clear_all(self):
         self._free_episodes = deque(range(self._n_episodes))
@@ -169,16 +181,18 @@ class FragmentBuffer:
     def start_episode(self) -> int:
         return self.start_episodes(1)[0]
 
-    def start_episodes(self, count: int) -> List[int]:
+    def start_episodes(self, count: int) -> torch.Tensor:
         episode_indices = []
         if len(self._free_episodes) < count:
             self.on_out_of_space(count - len(self._free_episodes))
         for _ in range(count):
             episode_index = self._free_episodes.popleft()
             episode_indices.append(episode_index)
-        return episode_indices
+        return torch.tensor(episode_indices, dtype=torch.int64)
 
-    def end_episode(self, episode_index: int, episode_data_update: Optional[Dict[str, Any]] = None):
+    def end_episode(
+        self, episode_index: int, episode_data_update: Optional[Dict[str, Any]] = None
+    ):
         if episode_data_update:
             self.episode_data[episode_index].update(episode_data_update)
         self.episode_complete[episode_index] = True
@@ -248,24 +262,72 @@ class FragmentBuffer:
                 raise TypeError("Unsupported timestep sequence type {}", type(v))
         self.episode_length_so_far[episode_index] += n_steps
 
+    def store_timesteps_multiepisode(
+        self,
+        episode_indices: torch.Tensor,
+        timesteps: Dict[str, Union[torch.Tensor, List[List[Any]]]],
+    ):
+        assert timesteps
+        for episode_index in episode_indices:
+            assert not self.episode_complete[episode_index]
+            start_step = self.episode_length_so_far[episode_index]
+        n_steps = None
+        for k, v in timesteps.items():
+            if n_steps is None:
+                n_steps = len(v[0])
+            else:
+                assert n_steps == len(v[0])
+
+            if isinstance(v, list):
+                buffer_m: Optional[List[List[Any]]] = self.buffers.get(k)
+                if buffer_m is None:
+                    buffer: List[List[Any]] = [
+                        [None] * self._max_episode_length
+                        for _ in range(self._n_episodes)
+                    ]
+                    self.buffers[k] = buffer
+                else:
+                    buffer = buffer_m
+                    if not isinstance(buffer, list):
+                        raise TypeError(
+                            f"Expected a timestep sequence of type {type(buffer)} "
+                            f"for {k} but got one of type {type(v)}"
+                        )
+                for i, episode_index in enumerate(episode_indices):
+                    assert not self.episode_complete[episode_index]
+                    start_step = self.episode_length_so_far[episode_index]
+                    buffer[episode_index][start_step : start_step + n_steps] = v[i]
+            elif isinstance(v, torch.Tensor):
+                buffer_tensor: torch.Tensor = self.buffers.get(k)
+                if buffer_tensor is None:
+                    buffer_tensor: torch.Tensor = torch.zeros(
+                        (
+                            self._n_episodes,
+                            self._max_episode_length,
+                        )
+                        + v.shape[2:],
+                        dtype=v.dtype,
+                    )
+                    self.buffers[k] = buffer_tensor
+                else:
+                    if not isinstance(buffer_tensor, torch.Tensor):
+                        raise TypeError(
+                            f"Expected a timestep sequence of type {type(buffer_tensor)} "
+                            f"for {k} but got one of type {type(v)}"
+                        )
+                for i, episode_index in enumerate(episode_indices):
+                    assert not self.episode_complete[episode_index]
+                    start_step = self.episode_length_so_far[episode_index]
+                    buffer_tensor[episode_index][start_step : start_step + n_steps] = v[i]
+            else:
+                raise TypeError("Unsupported timestep sequence type {}", type(v))
+        for episode_index in episode_indices:
+            self.episode_length_so_far[episode_index] += n_steps
+            assert self.episode_length_so_far[episode_index] <= self.max_episode_length
+
+
     def valid_indices(self, fragment_length=1):
-        assert fragment_length >= 1
-        all_allocations = []
-        for episode_index in range(self._n_episodes):
-            # Invalid episodes are filtered by being zero length
-            length = self.episode_length_so_far[episode_index]
-            last_valid_start = length - fragment_length
-            if last_valid_start < 0:
-                continue
-            valid_indices = torch.stack(
-                [
-                    episode_index * torch.ones(last_valid_start + 1, dtype=torch.int64),
-                    torch.arange(last_valid_start + 1),
-                ],
-                dim=1,
-            )
-            all_allocations.append(valid_indices)
-        return torch.cat(all_allocations)
+        return valid_indices_jit(self._n_episodes, self.episode_length_so_far, fragment_length)
 
     def index_timesteps(
         self,
@@ -372,6 +434,30 @@ class FragmentBuffer:
                 fragments[k] = v[indices[:, 0], indices[:, 1]]
         return fragments
 
+@torch.jit.script
+def valid_indices_jit(n_episodes: int, episode_length_so_far: torch.Tensor, fragment_length: int):
+    assert fragment_length >= 1
+    all_allocations = []
+    for episode_index in range(n_episodes):
+        # Invalid episodes are filtered by being zero length
+        length = episode_length_so_far[episode_index]
+        last_valid_start = length - fragment_length
+        if last_valid_start < 0:
+            continue
+        valid_indices = torch.stack(
+            [
+                episode_index * torch.ones(last_valid_start + 1, dtype=torch.int64),
+                torch.arange(last_valid_start + 1),
+            ],
+            dim=1,
+        )
+        all_allocations.append(valid_indices)
+    if all_allocations:
+        return torch.cat(all_allocations)
+    else:
+        return torch.zeros((0, 2), dtype=torch.int64)
+
+
 
 class FragmentDataset(torch.utils.data.IterableDataset):
     """Implements the dataset API around a FragmentBuffer.
@@ -379,6 +465,7 @@ class FragmentDataset(torch.utils.data.IterableDataset):
     You should probably use the FragmentDataloader API instead, but if you need
     to use the standard dataloader then this adapter exists.
     """
+
     def __init__(
         self,
         buffer: FragmentBuffer,
@@ -392,7 +479,7 @@ class FragmentDataset(torch.utils.data.IterableDataset):
         self.indices = self.buffer.valid_indices(fragment_length=self.fragment_length)
 
     def __len__(self):
-        return len(self.buffer.valid_indices(fragment_length=self.fragment_length))
+        return len(self.indices)
 
     def __getitem__(self, index: int):
         # Shuffling is handled by the DataLoader
@@ -418,6 +505,7 @@ class FragmentDataloader:
     It's also faster, since it bypasses the dataset api, and can thus make
     batch lookups into the FragmentBuffer.
     """
+
     def __init__(
         self,
         buffer: FragmentBuffer,
@@ -457,12 +545,13 @@ class FragmentDataloader:
                 # If we want to include the last batch, but we've run out of room, move batch_end back.
                 if not self.drop_last and batch_end > len(self.shuffle_indices):
                     batch_end = len(self.shuffle_indices)
-                if batch_end > len(self.shuffle_indices) or batch_end < self.next_start_index:
+                if (
+                    batch_end > len(self.shuffle_indices)
+                    or batch_end < self.next_start_index
+                ):
                     break
                 indices = self.indices[
-                    self.shuffle_indices[
-                        self.next_start_index : batch_end
-                    ]
+                    self.shuffle_indices[self.next_start_index : batch_end]
                 ]
                 self.next_start_index += self.batch_size
                 yield self.buffer.index(
@@ -492,7 +581,6 @@ def test_dataloader_smoke():
     batches = list(dataloader)
     assert len(batches) == 1
     assert batches[0]["t"].shape == (9, 1)
-
 
 
 def test_indexing():
@@ -600,8 +688,12 @@ def test_eviction_fifo():
 
 
 def test_eviction_uniform():
-    buffer = FragmentBuffer(n_episodes=5, max_episode_length=3, eviction_policy="uniform",
-                            eviction_policy_key="x_ep")
+    buffer = FragmentBuffer(
+        n_episodes=5,
+        max_episode_length=3,
+        eviction_policy="uniform",
+        eviction_policy_key="x_ep",
+    )
     for x in range(7):
         ep = buffer.start_episode()
         for i in range(3):
@@ -622,8 +714,12 @@ def test_eviction_uniform():
 
 
 def test_eviction_least():
-    buffer = FragmentBuffer(n_episodes=5, max_episode_length=3, eviction_policy="evict_least",
-                            eviction_policy_key="x_ep")
+    buffer = FragmentBuffer(
+        n_episodes=5,
+        max_episode_length=3,
+        eviction_policy="evict_least",
+        eviction_policy_key="x_ep",
+    )
     for x in range(7):
         ep = buffer.start_episode()
         for i in range(3):
@@ -644,8 +740,12 @@ def test_eviction_least():
 
 
 def test_eviction_most():
-    buffer = FragmentBuffer(n_episodes=5, max_episode_length=3, eviction_policy="evict_most",
-                            eviction_policy_key="x_ep")
+    buffer = FragmentBuffer(
+        n_episodes=5,
+        max_episode_length=3,
+        eviction_policy="evict_most",
+        eviction_policy_key="x_ep",
+    )
     for x in range(7):
         ep = buffer.start_episode()
         for i in range(3):

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 from tqdm import tqdm
 import torch
 import psutil
@@ -16,7 +16,7 @@ class Sampler:
             None, mask=torch.ones(self.vec_count, dtype=torch.bool)
         )
         self.agent_hidden_states: Optional[torch.Tensor] = None
-        self.episode_indices: torch.Tensor = torch.zeros(vec_count, dtype=torch.int32)
+        self.episode_indices: torch.Tensor = torch.tensor(0)
         self.env_active: torch.Tensor = torch.zeros(vec_count, dtype=torch.bool)
 
     @property
@@ -35,9 +35,16 @@ class Sampler:
         finish_episodes: bool = False,
         timestep_target: Optional[int] = None,
         episode_target: Optional[int] = None,
-        resume_episodes: bool = True,
-        reset_hidden_state: bool = False,
+        resume_episodes: bool = False,
+        reset_hidden_state: bool = True,
     ):
+        assert timestep_target or episode_target
+        if timestep_target:
+            eff_timestep_target = timestep_target
+        elif episode_target:
+            eff_timestep_target = episode_target * self.env.spec.max_episode_length
+        else:
+            raise ValueError("Need to specify timestep_target or episode_target")
         agent.train(mode=False)
         if self.agent_hidden_states is None or reset_hidden_state:
             self.agent_hidden_states = agent.initial_hidden_states(self.vec_count)
@@ -54,11 +61,7 @@ class Sampler:
         episodes_gathered = 0
         need_more_episodes = True
         done_gathering = False
-        with tqdm(
-            desc="Sampling",
-            total=timestep_target or episode_target * self.env.spec.max_episode_length,
-            disable=True
-        ) as pbar:
+        with tqdm(desc="Sampling", total=eff_timestep_target, disable=False) as pbar:
             while not done_gathering:
                 if need_more_episodes:
                     for i in range(self.vec_count):
@@ -73,7 +76,7 @@ class Sampler:
 
                 # TODO: Optimize only some environments being active
                 with torch.no_grad():
-                    agent_step = agent(
+                    agent_step = agent.step(
                         self.prev_env_step.observations,
                         self.agent_hidden_states,
                         self.prev_env_step.rewards,
@@ -101,8 +104,6 @@ class Sampler:
                     data[f"agent_info.{k}"] = v
 
                 data["rewards"] = env_step.rewards
-                data["terminated"] = env_step.terminated
-                data["truncated"] = env_step.truncated
 
                 for k, v in env_step.infos.items():
                     data[f"env_info.{k}"] = v
@@ -110,16 +111,22 @@ class Sampler:
                 self.prev_env_step = self.env.reset(env_step, env_step.done)
                 next_hidden_states = agent_step.hidden_states.clone()
 
+                buffer.store_timesteps_multiepisode(
+                    self.episode_indices[self.env_active],
+                    {k: v[self.env_active].unsqueeze(1) for (k, v) in data.items()},
+                )
                 for i, episode_done in enumerate(env_step.done):
-                    if self.env_active[i]:
-                        buffer.store_timestep(
-                            self.episode_indices[i],
-                            {k: v[i] for (k, v) in data.items()},
-                        )
                     if episode_done:
                         # If necessary, will re-enable this environment at the top of loop
                         self.env_active[i] = False
-                        buffer.end_episode(self.episode_indices[i])
+                        buffer.end_episode(
+                            self.episode_indices[i],
+                            {
+                                "last_observation": env_step.observations[i],
+                                "truncated": env_step.truncated[i],
+                                "terminated": env_step.terminated[i],
+                            },
+                        )
                         assert buffer.episode_complete[self.episode_indices[i]]
                         next_hidden_states[i] = agent.initial_hidden_states(1)[0]
                         episodes_gathered += 1

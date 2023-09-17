@@ -1,13 +1,10 @@
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 import torch
-
-import outrl
 
 
 @dataclass
 class Step:
-
     observations: torch.Tensor
     rewards: torch.Tensor
     terminated: torch.Tensor
@@ -22,7 +19,6 @@ class Step:
 
 @dataclass
 class EnvSpec:
-
     observation_low: torch.Tensor
     observation_high: torch.Tensor
 

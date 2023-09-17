@@ -7,7 +7,6 @@ import torch.nn as nn
 
 @dataclass(frozen=True)
 class Step:
-
     action_dists: Any
     actions: torch.Tensor
     actions_encoded: torch.Tensor

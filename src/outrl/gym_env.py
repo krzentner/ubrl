@@ -9,7 +9,6 @@ import outrl
 
 @dataclass
 class GymEnvCons:
-
     env_name: str
     # If not provided here, env.max_path_length must be defined
     max_episode_length: Optional[int] = None
@@ -103,6 +102,7 @@ class GymEnv(outrl.env.VecEnv):
                     first_obs, info = first_obs
                 else:
                     info = {}
+                    info.setdefault("TimeLimit.truncated", False)
                 obs[i] = torch.from_numpy(first_obs)
                 infos.append(outrl.as_torch_dict(info))
                 terminal[i] = False
@@ -113,7 +113,7 @@ class GymEnv(outrl.env.VecEnv):
                 # If mask is False anywhere, there must be a previous step
                 assert prev_step
                 obs[i] = prev_step.observations[i]
-                infos.append({k: v[i] for (k, v) in prev_step.infos})
+                infos.append({k: v[i] for (k, v) in prev_step.infos.items()})
                 terminal[i] = prev_step.terminated[i]
                 truncated[i] = prev_step.truncated[i]
                 rewards[i] = prev_step.rewards[i]
@@ -147,7 +147,7 @@ class GymEnv(outrl.env.VecEnv):
             step_res = env.step(actions[i].detach().cpu().numpy())
             if len(step_res) == 4:
                 observation, reward, done, info = step_res
-                trunc = info.get("TimeLimit.truncated", False)
+                trunc = info.setdefault("TimeLimit.truncated", False)
                 terminated = done and not trunc
             elif len(step_res) == 6:
                 observation, reward, terminated, trunc, info, done = step_res
@@ -160,7 +160,7 @@ class GymEnv(outrl.env.VecEnv):
             rewards[i] = reward
             truncated[i] = trunc
             terminal[i] = terminated
-            infos.append(info)
+            infos.append(outrl.as_torch_dict(info))
 
         return outrl.env.Step(
             observations=obs,

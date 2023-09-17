@@ -19,7 +19,7 @@ class StochasticMLPAgent(outrl.agent.Agent):
         hidden_b_init: outrl.nn.Initializer = torch.nn.init.zeros_,
         output_w_init: outrl.nn.Initializer = torch.nn.init.xavier_normal_,
         output_b_init: outrl.nn.Initializer = torch.nn.init.zeros_,
-        layer_normalization: bool = False
+        layer_normalization: bool = False,
     ):
         super().__init__()
 
@@ -46,8 +46,8 @@ class StochasticMLPAgent(outrl.agent.Agent):
             hidden_nonlinearity=hidden_nonlinearity,
             hidden_w_init=hidden_w_init,
             hidden_b_init=hidden_b_init,
-            output_w_init=output_w_init,
-            output_b_init=output_b_init,
+            # output_w_init=output_w_init,
+            # output_b_init=output_b_init,
             layer_normalization=layer_normalization,
         )
 
@@ -63,7 +63,7 @@ class StochasticMLPAgent(outrl.agent.Agent):
             layer_normalization=layer_normalization,
         )
 
-    def forward(
+    def step(
         self,
         observations: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -90,8 +90,33 @@ class StochasticMLPAgent(outrl.agent.Agent):
             hidden_states=hidden_states,
         )
 
+    def forward(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor
+    ):
+        B = observations.shape[0]
+        T = observations.shape[1]
+        # At least B, T, X dimensions
+        assert len(observations.shape) >= 3
+        shared_x = self.shared_layers(observations.reshape(B * T, -1))
+        pi_x = self.pi_layers(shared_x)
+        vf_x = self.vf_layers(shared_x).squeeze(-1)
+
+        dists = self.distribution_constructor(pi_x)
+
+        return self.action_energy(dists, actions.reshape(B * T, -1).squeeze(-1)), vf_x
+
+    def vf_forward(self, observations: torch.Tensor):
+        B = observations.shape[0]
+        T = observations.shape[1]
+        shared_x = self.shared_layers(observations.reshape(B * T, -1))
+        vf_x = self.vf_layers(shared_x).squeeze(-1)
+        return vf_x.reshape(B, T)
+
     def action_energy(self, action_dists, actions):
-        return -action_dists.log_prob(actions)
+        res = -action_dists.log_prob(actions)
+        return res
 
     def initial_hidden_states(self, batch_size: int):
         return torch.zeros((batch_size,))
