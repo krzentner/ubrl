@@ -60,7 +60,7 @@ class PPO(LightningModule):
         advantages -= advantages.mean()
         advantages /= advantages.std()
 
-        action_energy, predicted_returns = self.agent(
+        action_energy, predicted_returns = self.agent.forward_both(
             batch["observations"], batch["actions"]
         )
         log_prob = -action_energy

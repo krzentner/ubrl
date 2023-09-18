@@ -90,7 +90,7 @@ class StochasticMLPAgent(outrl.agent.Agent):
             hidden_states=hidden_states,
         )
 
-    def forward(
+    def forward_both(
         self,
         observations: torch.Tensor,
         actions: torch.Tensor

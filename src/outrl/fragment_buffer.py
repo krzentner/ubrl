@@ -200,13 +200,47 @@ class FragmentBuffer:
     def store_timestep(
         self, episode_index: int, timestep: Dict[str, Union[torch.Tensor, Any]]
     ):
-        timesteps = {}
+        assert not self.episode_complete[episode_index]
+        start_step = self.episode_length_so_far[episode_index]
         for k, v in timestep.items():
-            if isinstance(v, torch.Tensor):
-                timesteps[k] = v.unsqueeze(0)
+            if isinstance(v, list):
+                buffer_m: Optional[List[List[Any]]] = self.buffers.get(k)
+                if buffer_m is None:
+                    buffer: List[List[Any]] = [
+                        [None] * self._max_episode_length
+                        for _ in range(self._n_episodes)
+                    ]
+                    self.buffers[k] = buffer
+                else:
+                    buffer = buffer_m
+                    if not isinstance(buffer, list):
+                        raise TypeError(
+                            f"Expected a timestep sequence of type {type(buffer)} "
+                            f"for {k} but got one of type {type(v)}"
+                        )
+                buffer[episode_index][start_step] = v
+            elif isinstance(v, torch.Tensor):
+                buffer_tensor: torch.Tensor = self.buffers.get(k)
+                if buffer_tensor is None:
+                    buffer_tensor: torch.Tensor = torch.zeros(
+                        (
+                            self._n_episodes,
+                            self._max_episode_length,
+                        )
+                        + v.shape,
+                        dtype=v.dtype,
+                    )
+                    self.buffers[k] = buffer_tensor
+                else:
+                    if not isinstance(buffer_tensor, torch.Tensor):
+                        raise TypeError(
+                            f"Expected a timestep sequence of type {type(buffer_tensor)} "
+                            f"for {k} but got one of type {type(v)}"
+                        )
+                buffer_tensor[episode_index][start_step] = v
             else:
-                timesteps[k] = [v]
-        self.store_timesteps(episode_index, timesteps)
+                raise TypeError("Unsupported timestep sequence type {}", type(v))
+        self.episode_length_so_far[episode_index] += 1
 
     def store_timesteps(
         self,

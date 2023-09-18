@@ -111,11 +111,11 @@ class Sampler:
                 self.prev_env_step = self.env.reset(env_step, env_step.done)
                 next_hidden_states = agent_step.hidden_states.clone()
 
-                buffer.store_timesteps_multiepisode(
-                    self.episode_indices[self.env_active],
-                    {k: v[self.env_active].unsqueeze(1) for (k, v) in data.items()},
-                )
                 for i, episode_done in enumerate(env_step.done):
+                    buffer.store_timestep(
+                        self.episode_indices[i],
+                        {k: v[i] for (k, v) in data.items()},
+                    )
                     if episode_done:
                         # If necessary, will re-enable this environment at the top of loop
                         self.env_active[i] = False
