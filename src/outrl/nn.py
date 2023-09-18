@@ -302,9 +302,9 @@ def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
     # Handle corner cases
     if vary == 0:
         if torch.var(ypred) > 0:
-            return 0
+            return torch.tensor(0)
 
-        return 1
+        return torch.tensor(1)
 
     epsilon = 1e-8
 

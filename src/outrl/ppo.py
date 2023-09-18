@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from lightning.pytorch import LightningModule, seed_everything, Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -201,9 +202,24 @@ class PPO(LightningModule):
 
 
 def gym_ppo(cfg: DictConfig):
+    config_yaml = OmegaConf.to_yaml(cfg).strip()
     print("CONFIG START")
-    print(OmegaConf.to_yaml(cfg).strip())
+    print(config_yaml)
     print("CONFIG END")
+
+    cfg.setdefault('algorithm', 'gym_ppo')
+
+    if 'log_dir' in cfg:
+        log_dir = cfg['log_dir']
+    else:
+        import hashlib
+
+        hexdigest = hashlib.sha1(config_yaml.encode()).hexdigest()
+        log_dir = f'outputs/{cfg["algorithm"]}/{hexdigest}'
+
+    import os
+    os.makedirs(log_dir, exist_ok=True)
+    OmegaConf.save(cfg, f"{log_dir}/cfg.yaml")
 
     import outrl.gym_env
 
@@ -213,14 +229,17 @@ def gym_ppo(cfg: DictConfig):
         max_episode_length=cfg.get("max_episode_length", 200),
     )
     checkpoint_callback = ModelCheckpoint(
+        dirpath=f"{log_dir}/checkpoints",
         save_top_k=10,
         save_last=True,
         mode="max",
-        every_n_epochs=100,
+        every_n_epochs=10,
         monitor="avg_return",
+        save_on_train_epoch_end=False, # Actually want to checkpoint on start of epoch
     )
+    logger = CSVLogger(log_dir)
     model = PPO(cfg, env_cons)
-    trainer = Trainer(max_epochs=-1, callbacks=[checkpoint_callback])
+    trainer = Trainer(max_epochs=-1, callbacks=[checkpoint_callback], logger=logger)
     trainer.fit(model)
 
 

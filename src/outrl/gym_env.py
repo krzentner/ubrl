@@ -13,13 +13,19 @@ class GymEnvCons:
     # If not provided here, env.max_path_length must be defined
     max_episode_length: Optional[int] = None
     make_env: Optional[Callable[[str], "gym.Env"]] = None
+    use_gymnasium: bool = True
 
     def __call__(self, step_batch: int):
         make_env = self.make_env
         if make_env is None:
-            import gym
+            if self.use_gymnasium:
+                import gymnasium as gym
 
-            make_env = gym.make
+                make_env = gym.make
+            else:
+                import gym
+
+                make_env = gym.make
         return GymEnv(
             env_name=self.env_name,
             make_env=make_env,
@@ -152,6 +158,8 @@ class GymEnv(outrl.env.VecEnv):
             elif len(step_res) == 6:
                 observation, reward, terminated, trunc, info, done = step_res
                 del done
+            elif len(step_res) == 5:
+                observation, reward, terminated, trunc, info = step_res
             else:
                 raise ValueError("Unexpected size of step result tuple")
             if self.step_counts[i] >= self.max_episode_length:
