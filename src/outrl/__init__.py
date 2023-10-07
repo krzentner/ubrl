@@ -1,10 +1,11 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import torch
 import warnings
 import outrl.agent as agent
 import outrl.fragment_buffer as fragment_buffer
 import outrl.nn as nn
 import outrl.env as env
+from dataclasses import dataclass
 
 FragmentBuffer = fragment_buffer.FragmentBuffer
 

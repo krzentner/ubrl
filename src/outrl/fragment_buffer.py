@@ -90,6 +90,7 @@ class FragmentBuffer:
         # Changing these fields does not cause expected results, make them read-only
         self._n_episodes: int = n_episodes
         self._max_episode_length: int = max_episode_length
+        self._valid_mask_cached = None
 
     @property
     def n_episodes(self):
@@ -100,6 +101,7 @@ class FragmentBuffer:
         return self._max_episode_length
 
     def clear_episode(self, episode_index: int):
+        self._valid_mask_cached = None
         self.episode_length_so_far[episode_index] = 0
         self.episode_data[episode_index] = {}
         self.episode_complete[episode_index] = False
@@ -154,6 +156,7 @@ class FragmentBuffer:
                 raise ValueError(f"Invalid eviction_policy {self.eviction_policy}")
 
     def clear_all(self):
+        self._valid_mask_cached = None
         self._free_episodes = deque(range(self._n_episodes))
         self.episode_length_so_far[:] = 0
         self.episode_complete[:] = False
@@ -166,10 +169,14 @@ class FragmentBuffer:
         self.episode_data = [{} for _ in range(self._n_episodes)]
 
     def valid_mask(self):
-        mask = torch.zeros((self.n_episodes, self.max_episode_length), dtype=torch.bool)
-        for i, episode_length in enumerate(self.episode_length_so_far):
-            mask[i, :episode_length] = True
-        return mask
+        if self._valid_mask_cached is not None:
+            return self._valid_mask_cached
+        else:
+            mask = torch.zeros((self.n_episodes, self.max_episode_length), dtype=torch.bool)
+            for i, episode_length in enumerate(self.episode_length_so_far):
+                mask[i, :episode_length] = True
+            self._valid_mask_cached = True
+            return mask
 
     def get_full_episodes(self, key: str) -> Union[torch.Tensor, List[Any]]:
         buf = self.buffers[key]
@@ -193,6 +200,7 @@ class FragmentBuffer:
     def end_episode(
         self, episode_index: int, episode_data_update: Optional[Dict[str, Any]] = None
     ):
+        self._valid_mask_cached = None
         if episode_data_update:
             self.episode_data[episode_index].update(episode_data_update)
         self.episode_complete[episode_index] = True
@@ -201,6 +209,7 @@ class FragmentBuffer:
         self, episode_index: int, timestep: Dict[str, Union[torch.Tensor, Any]]
     ):
         assert not self.episode_complete[episode_index]
+        self._valid_mask_cached = None
         start_step = self.episode_length_so_far[episode_index]
         for k, v in timestep.items():
             if isinstance(v, list):
@@ -249,6 +258,7 @@ class FragmentBuffer:
     ):
         assert timesteps
         assert not self.episode_complete[episode_index]
+        self._valid_mask_cached = None
         start_step = self.episode_length_so_far[episode_index]
         n_steps = None
         for k, v in timesteps.items():
@@ -302,6 +312,7 @@ class FragmentBuffer:
         timesteps: Dict[str, Union[torch.Tensor, List[List[Any]]]],
     ):
         assert timesteps
+        self._valid_mask_cached = None
         for episode_index in episode_indices:
             assert not self.episode_complete[episode_index]
             start_step = self.episode_length_so_far[episode_index]

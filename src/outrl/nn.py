@@ -10,6 +10,7 @@ import outrl
 SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], torch.nn.Module]
 Initializer = Callable[[torch.Tensor], None]
 Shape = Union[int, Tuple[int, ...]]
+Sizes = Union[int, Tuple[int, ...], List[int]]
 
 
 def as_2d(x):
