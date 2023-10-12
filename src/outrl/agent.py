@@ -4,12 +4,15 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
+import outrl
+from outrl.dists import DistConstructor
+from outrl.utils import copy_default
+
 
 @dataclass(frozen=True)
 class Step:
-    action_dists: Any
+
     actions: torch.Tensor
-    actions_encoded: torch.Tensor
 
     # prev actions encoded should go in here
     hidden_states: torch.Tensor
@@ -17,8 +20,10 @@ class Step:
     # Should be -log pi(a|s) / Z for some constant Z
     action_energy: torch.Tensor
 
-    # Used by actor-critic algorithms
+    # Either V(s) or Q(s, *)
     predicted_returns: Optional[torch.Tensor]
+
+    action_logits: Dict[str, torch.Tensor] = copy_default({})
 
     infos: Dict[str, torch.Tensor] = field(default_factory=dict)
 
@@ -27,6 +32,7 @@ class Step:
 
 
 class Agent(nn.Module):
+
     def initial_hidden_states(self, batch_size: int):
         del batch_size
         raise NotImplementedError()
@@ -35,14 +41,12 @@ class Agent(nn.Module):
         del observations, hidden_states
         raise NotImplementedError()
 
-    def action_energy(self, action_dists: Any, actions: torch.Tensor) -> torch.Tensor:
-        del action_dists, actions
-        """Should return -log pi(a|s) / Z for some constant Z"""
-        raise NotImplementedError()
 
-    def cross_energy(self, pi1: Any, pi2: Any, actions: torch.Tensor) -> torch.Tensor:
-        """Should return a value that approximates log (pi_1(a|s) / pi_2(a|s)).
+class StochasticAgent(Agent):
 
-        This should be D_{KL}(pi_1, pi_2) when possible.
-        """
-        return self.action_energy(pi1, actions) - self.action_energy(pi2, actions)
+    def __init__(self, action_dist_cons: DistConstructor):
+        super().__init__()
+        if isinstance(action_dist_cons, type):
+            action_dist_cons = action_dist_cons()
+        assert isinstance(action_dist_cons, outrl.dists.DistConstructor)
+        self.action_dist_cons = action_dist_cons

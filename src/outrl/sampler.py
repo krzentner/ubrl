@@ -96,9 +96,8 @@ class Sampler:
                 if agent_step.predicted_returns is not None:
                     data["predicted_returns"] = agent_step.predicted_returns
                 data["action_energy"] = agent_step.action_energy
-                data["actions_encoded"] = agent_step.actions_encoded
-                # TODO: Find some way of saving the distributions
-                # data["action_dists"] = agent_step.action_dists
+                for k, v in agent_step.action_logits.items():
+                    data[f"action_logits.{k}"] = v
                 data["hidden_states"] = agent_step.hidden_states
                 for k, v in agent_step.infos.items():
                     data[f"agent_info.{k}"] = v

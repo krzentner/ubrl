@@ -1,34 +1,29 @@
 import math
 from typing import Optional
-import copy
 
 import torch
 import torch.nn.functional as F
 from lightning.pytorch import LightningModule, seed_everything, Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from omegaconf import OmegaConf
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
 import outrl
 from outrl.fragment_buffer import FragmentDataloader
 from outrl.nn import compute_advantages, discount_cumsum
-
-
-def copy_default(x):
-    return field(default_factory=lambda: copy.deepcopy(x))
+from outrl.utils import get_config, to_yaml, save_yaml, Serializable, copy_default, RunningMeanVar
 
 
 @dataclass
-class AlgoConfig:
+class AlgoConfig(Serializable):
 
-    seed: int = field(default=0, init=False)
-    exp_name: Optional[str] = field(default=None, init=False)
-    log_dir: Optional[str] = field(default=None, init=False)
-    max_episode_length: Optional[int] = field(default=None, init=False)
+    seed: int = 0
+    exp_name: Optional[str] = None
+    log_dir: Optional[str] = None
+    max_episode_length: Optional[int] = None
 
 
 @dataclass
@@ -46,7 +41,9 @@ class PPOConfig(AlgoConfig):
     clip_ratio: float = 0.2
     fragment_length: int = 1
     epochs_per_policy_step: int = 20
-    vf_loss_coeff: float = 0.5
+    vf_loss_coeff: float = 0.1
+    norm_rewards: bool = True
+    norm_observations: bool = True
 
 
 class PPO(LightningModule):
@@ -70,10 +67,14 @@ class PPO(LightningModule):
             hidden_sizes=self.cfg.preprocess_hidden_sizes,
             vf_hidden_sizes=self.cfg.vf_hidden_sizes,
             pi_hidden_sizes=self.cfg.pi_hidden_sizes,
-            action_dist=outrl.nn.DEFAULT_DIST_TYPES[self.env_spec.action_type],
+            action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[self.env_spec.action_type],
         )
 
         self.save_hyperparameters(ignore=["buffer", "sampler", "env_cons"])
+        self.obs_normalizer = RunningMeanVar(
+            mean=torch.zeros(self.env_spec.observation_shape),
+            var=torch.ones(self.env_spec.observation_shape))
+        self.reward_normalizer = RunningMeanVar()
 
     def training_step(self, batch: dict[str, torch.Tensor]):
         advantages = batch["advantages"].squeeze()
@@ -86,7 +87,7 @@ class PPO(LightningModule):
         log_prob = -log_pi
         minibatch_size = batch["observations"].shape[0]
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -batch["log_pi"].squeeze()
+        old_log_prob = -batch["action_energy"].squeeze()
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
@@ -109,6 +110,7 @@ class PPO(LightningModule):
         clip_portion = (ratio_clipped != ratio).mean(dtype=torch.float32)
 
         actual_returns = batch["discounted_returns"].squeeze()
+        import ipdb; ipdb.set_trace()
         vf_loss = F.mse_loss(v_s, actual_returns)
 
         self.log_training(batch, locals())
@@ -177,6 +179,9 @@ class PPO(LightningModule):
                 ]
             except KeyError:
                 pass
+        self.obs_normalizer.update(all_obs)
+        if self.cfg.norm_observations:
+            all_obs = self.reward_normalizer.normalize_batch(all_obs)
 
         # Compute vf_returns, filter based on episode termination
         with torch.no_grad():
@@ -191,6 +196,9 @@ class PPO(LightningModule):
 
         rewards = self.buffer.buffers["rewards"].clone()
         rewards[~self.buffer.valid_mask()] = 0.0
+        self.reward_normalizer.update(rewards[self.buffer.valid_mask()])
+        if self.cfg.norm_rewards:
+            rewards = self.reward_normalizer.normalize_batch(rewards)
 
         advantages = compute_advantages(
             discount=self.cfg.discount,
@@ -219,14 +227,14 @@ class PPO(LightningModule):
 
 
 @dataclass
-class GymConfig:
-    env_name: str = "CartPole-v0"
+class GymConfig(Serializable):
+    env_name: str = "CartPole-v1"
     algorithm: str = "ppo"
-    algo_cfg: AlgoConfig = field(init=False)
+    algo_cfg: PPOConfig = copy_default(PPOConfig())
 
 
 def gym_ppo(cfg: GymConfig):
-    config_yaml = OmegaConf.to_yaml(cfg).strip()
+    config_yaml = to_yaml(cfg)
     print("CONFIG START")
     print(config_yaml)
     print("CONFIG END")
@@ -245,7 +253,7 @@ def gym_ppo(cfg: GymConfig):
 
     import os
     os.makedirs(cfg.algo_cfg.log_dir, exist_ok=True)
-    OmegaConf.save(cfg, f"{cfg.algo_cfg.log_dir}/cfg.yaml")
+    save_yaml(cfg, f"{cfg.algo_cfg.log_dir}/cfg.yaml")
 
     import outrl.gym_env
 
@@ -270,6 +278,4 @@ def gym_ppo(cfg: GymConfig):
 
 
 if __name__ == "__main__":
-    cfg = GymConfig()
-    cfg.algo_cfg = PPOConfig()
-    gym_ppo(cfg)
+    gym_ppo(get_config(GymConfig))

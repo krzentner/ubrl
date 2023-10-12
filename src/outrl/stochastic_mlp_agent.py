@@ -4,13 +4,12 @@ import torch
 import outrl
 
 
-class StochasticMLPAgent(outrl.agent.Agent):
+class StochasticMLPAgent(outrl.agent.StochasticAgent):
     def __init__(
         self,
         observation_shape: outrl.nn.Shape,
         action_shape: outrl.nn.Shape,
         hidden_sizes: List[int],
-        action_dist: outrl.nn.DistConstructor = outrl.nn.NormalConstructor(),
         *,
         vf_hidden_sizes: List[int] = [],
         pi_hidden_sizes: List[int] = [],
@@ -20,15 +19,9 @@ class StochasticMLPAgent(outrl.agent.Agent):
         output_w_init: outrl.nn.Initializer = torch.nn.init.xavier_normal_,
         output_b_init: outrl.nn.Initializer = torch.nn.init.zeros_,
         layer_normalization: bool = False,
+        action_dist_cons: outrl.dists.DistConstructor = outrl.dists.NormalConstructor(),
     ):
-        super().__init__()
-
-        if isinstance(action_dist, type):
-            action_dist = action_dist()
-
-        assert isinstance(action_dist, outrl.nn.DistConstructor)
-
-        self.distribution_constructor = action_dist
+        super().__init__(action_dist_cons=action_dist_cons)
 
         self.shared_layers = outrl.nn.make_mlp(
             input_size=outrl.nn.flatten_shape(observation_shape),
@@ -54,7 +47,7 @@ class StochasticMLPAgent(outrl.agent.Agent):
         self.pi_layers = outrl.nn.make_mlp(
             input_size=hidden_sizes[-1],
             hidden_sizes=pi_hidden_sizes,
-            output_size=self.distribution_constructor.get_input_size(action_shape),
+            output_size=self.action_dist_cons.get_input_size(action_shape),
             hidden_nonlinearity=hidden_nonlinearity,
             hidden_w_init=hidden_w_init,
             hidden_b_init=hidden_b_init,
@@ -75,18 +68,13 @@ class StochasticMLPAgent(outrl.agent.Agent):
         pi_x = self.pi_layers(shared_x)
         vf_x = self.vf_layers(shared_x).squeeze(-1)
 
-        dists = self.distribution_constructor(pi_x)
+        dists = self.action_dist_cons(pi_x)
         actions = dists.sample()
-
-        # Encode the actions that were actually taken
-        actions_encoded = self.distribution_constructor.encode_actions(actions, dists)
 
         return outrl.agent.Step(
             predicted_returns=vf_x,
-            action_dists=dists,
             actions=actions,
             action_energy=-dists.log_prob(actions),
-            actions_encoded=actions_encoded,
             hidden_states=hidden_states,
         )
 
@@ -103,7 +91,7 @@ class StochasticMLPAgent(outrl.agent.Agent):
         pi_x = self.pi_layers(shared_x)
         vf_x = self.vf_layers(shared_x).squeeze(-1)
 
-        dists = self.distribution_constructor(pi_x)
+        dists = self.action_dist_cons(pi_x)
 
         return self.action_energy(dists, actions.reshape(B * T, -1).squeeze(-1)), vf_x
 
@@ -142,7 +130,7 @@ def test_smoke():
         observation_shape=O,
         action_shape=A,
         hidden_sizes=[128, 128],
-        action_dist=outrl.nn.CategoricalConstructor,
+        action_dist_cons=outrl.dists.CategoricalConstructor,
     )
     energy = agent.action_energy(step.action_dists, step.actions)
     assert energy.shape == (B,)
