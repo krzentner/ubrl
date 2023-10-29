@@ -22,7 +22,7 @@ def _get_config_inner(config_type, default=None):
         nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT)
     parser.add_arguments(config_type, dest='config_arguments', default=default)
     parser.add_argument('--cfg-path', default=None, type=str)
-    print(parser.equivalent_argparse_code())
+    # print(parser.equivalent_argparse_code())
     args = parser.parse_args()
     if default is None and args.cfg_path is not None:
         # We haven't loaded defaults from a config, and we're being asked to.

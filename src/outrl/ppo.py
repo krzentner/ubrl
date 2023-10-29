@@ -11,15 +11,23 @@ from dataclasses import dataclass
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
+# import stick
+
 import outrl
 from outrl.fragment_buffer import FragmentDataloader
 from outrl.nn import compute_advantages, discount_cumsum
-from outrl.utils import get_config, to_yaml, save_yaml, Serializable, copy_default, RunningMeanVar
+from outrl.utils import (
+    get_config,
+    to_yaml,
+    save_yaml,
+    Serializable,
+    copy_default,
+    RunningMeanVar,
+)
 
 
 @dataclass
 class AlgoConfig(Serializable):
-
     seed: int = 0
     exp_name: Optional[str] = None
     log_dir: Optional[str] = None
@@ -28,22 +36,22 @@ class AlgoConfig(Serializable):
 
 @dataclass
 class PPOConfig(AlgoConfig):
-
     n_envs: int = 10
     steps_per_epoch: int = 4096
     preprocess_hidden_sizes: list[int] = copy_default([128])
     pi_hidden_sizes: list[int] = copy_default([64, 64])
     vf_hidden_sizes: list[int] = copy_default([64, 64])
     minibatch_size: int = 512
-    learning_rate: float = 2.5e-3
+    learning_rate: float = 2.5e-4
     discount: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     fragment_length: int = 1
     epochs_per_policy_step: int = 20
-    vf_loss_coeff: float = 0.1
-    norm_rewards: bool = True
-    norm_observations: bool = True
+    vf_loss_coeff: float = 0.25
+    vf_clip_ratio: Optional[float] = None
+    norm_rewards: bool = False
+    norm_observations: bool = False
 
 
 class PPO(LightningModule):
@@ -73,29 +81,29 @@ class PPO(LightningModule):
         self.save_hyperparameters(ignore=["buffer", "sampler", "env_cons"])
         self.obs_normalizer = RunningMeanVar(
             mean=torch.zeros(self.env_spec.observation_shape),
-            var=torch.ones(self.env_spec.observation_shape))
+            var=torch.ones(self.env_spec.observation_shape),
+        )
         self.reward_normalizer = RunningMeanVar()
+        self.automatic_optimization = False
 
-    def training_step(self, batch: dict[str, torch.Tensor]):
-        advantages = batch["advantages"].squeeze()
+    def training_step(self, mb: dict[str, torch.Tensor]):
+        advantages = mb["advantages"].squeeze()
         advantages -= advantages.mean()
         advantages /= advantages.std()
 
-        log_pi, v_s = self.agent.forward_both(
-            batch["observations"], batch["actions"]
+        actor_out, critic_out = self.agent.forward_both(
+            mb["observations"], mb["actions"]
         )
-        log_prob = -log_pi
-        minibatch_size = batch["observations"].shape[0]
+        log_prob = -actor_out
+        minibatch_size = mb["observations"].shape[0]
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -batch["action_energy"].squeeze()
+        old_log_prob = -mb["action_energy"].squeeze()
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
         ratio = torch.exp(log_prob - old_log_prob)
-        ratio_clipped = torch.clamp(ratio, 1 - self.cfg.clip_ratio, 1 + self.cfg.clip_ratio)
-
-        explained_var = outrl.nn.explained_variance(
-            v_s, batch["discounted_returns"]
+        ratio_clipped = torch.clamp(
+            ratio, 1 - self.cfg.clip_ratio, 1 + self.cfg.clip_ratio
         )
 
         assert ratio.shape == (minibatch_size,)
@@ -107,30 +115,61 @@ class PPO(LightningModule):
         assert clip_policy_gradient.shape == (minibatch_size,)
 
         pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
-        clip_portion = (ratio_clipped != ratio).mean(dtype=torch.float32)
 
-        actual_returns = batch["discounted_returns"].squeeze()
-        import ipdb; ipdb.set_trace()
-        vf_loss = F.mse_loss(v_s, actual_returns)
+        disc_returns = mb["discounted_returns"]
+        if self.cfg.vf_clip_ratio:
+            # This clipping logic matches the logic from Tianshou
+            # But it isn't scale invariant, so it's probably wrong?
+            # Maybe it's fine with reward scaling? But the return scale still
+            # depends on the discount even with reward norm?
+            # TODO(krzentner): Compare to paper: arXiv:1811.02553v3 Sec. 4.1
+            diff = (critic_out - mb["vf_returns"]).clamp(
+                -self.cfg.vf_clip_ratio, self.cfg.vf_clip_ratio
+            )
+            v_clip = mb["vf_returns"] + diff
+            vf_loss_1 = (disc_returns - critic_out) ** 2
+            vf_loss_2 = (disc_returns - v_clip) ** 2
+            # Mean *after* taking max over each element
+            vf_loss = torch.max(vf_loss_1, vf_loss_2).mean()
+        else:
+            vf_loss = F.mse_loss(critic_out, disc_returns)
 
-        self.log_training(batch, locals())
-        return pi_loss + self.cfg.vf_loss_coeff * vf_loss
+        self.log_training(
+            mb,
+            dict(
+                clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
+                mb_ev=outrl.nn.explained_variance(critic_out, mb["discounted_returns"]),
+            ) | locals(),
+        )
+
+        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
+        self.optimizers().zero_grad()
+        self.manual_backward(loss)
+        # stick.log(table='minibatch')
+        self.optimizers().step()
 
     def log_training(
-        self, batch: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
+        self, mb: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
     ):
         if not self.logged_dataset:
             self.log_dataset()
             self.logged_dataset = True
-        for k in ["vf_loss", "pi_loss", "explained_var", "clip_portion"]:
+        for k in [
+            "vf_loss",
+            # "pi_loss",
+            "mb_ev",
+            # "clip_portion"
+        ]:
             self.log(k, train_locals[k].item(), prog_bar=True)
 
-        for k in ["log_prob"]:
-            self.log(k, train_locals[k].mean().item(), prog_bar=True)
+        # for k in ["log_prob"]:
+        #     self.log(k, train_locals[k].mean().item(), prog_bar=True)
 
-        self.log(
-            "average_timestep_reward", batch["rewards"].mean().item(), on_epoch=True
-        )
+        self.log("average_timestep_reward", mb["rewards"].mean().item(), on_epoch=True)
+        # self.log(
+        #     "vf_bias", self.agent.vf_layers.output_linear.bias.item(), prog_bar=True)
+        self.log("disc_mean", train_locals["disc_returns"].mean(), prog_bar=True)
+        self.log("critic_out_mean", train_locals["critic_out"].mean(), prog_bar=True)
 
     def log_dataset(self):
         full_episode_rewards = self.buffer.get_full_episodes("rewards")
@@ -138,15 +177,31 @@ class PPO(LightningModule):
         discounted_returns = self.buffer_dataloader.extra_buffers["discounted_returns"]
         if len(full_episode_rewards):
             self.log(
-                "avg_return",
+                "ep_rew",
                 full_episode_rewards.sum(dim=-1).mean(dim=0),
                 prog_bar=True,
             )
+            # Firt timestep
+            # self.log(
+            #     "ep_disc_rew",
+            #     discounted_returns[:, 0].mean(dim=0),
+            #     prog_bar=True,
+            # )
             self.log(
-                "data_exp_var",
+                "disc_mean",
+                discounted_returns[self.buffer.valid_mask()].mean(),
+                prog_bar=True,
+            )
+            self.log(
+                "vf_mean",
+                vf_returns[self.buffer.valid_mask()].mean(),
+                prog_bar=True,
+            )
+            self.log(
+                "ev",
                 outrl.nn.explained_variance(
                     vf_returns[self.buffer.valid_mask()],
-                    discounted_returns[self.buffer.valid_mask()]
+                    discounted_returns[self.buffer.valid_mask()],
                 ),
                 prog_bar=True,
             )
@@ -174,9 +229,7 @@ class PPO(LightningModule):
         for i in range(self.buffer.n_episodes):
             eps_len = self.buffer.episode_length_so_far[i]
             try:
-                all_obs[i, eps_len] = self.buffer.episode_data[i][
-                    "last_observation"
-                ]
+                all_obs[i, eps_len] = self.buffer.episode_data[i]["last_observation"]
             except KeyError:
                 pass
         self.obs_normalizer.update(all_obs)
@@ -198,29 +251,33 @@ class PPO(LightningModule):
         rewards[~self.buffer.valid_mask()] = 0.0
         self.reward_normalizer.update(rewards[self.buffer.valid_mask()])
         if self.cfg.norm_rewards:
-            rewards = self.reward_normalizer.normalize_batch(rewards)
+            rewards_normed = self.reward_normalizer.normalize_batch(rewards)
+        else:
+            rewards_normed = rewards
 
         advantages = compute_advantages(
             discount=self.cfg.discount,
             gae_lambda=self.cfg.gae_lambda,
             vf_returns=vf_returns,
-            rewards=rewards,
+            rewards=rewards_normed,
         )
 
-        self.discounted_returns = discount_cumsum(
-            rewards.unsqueeze(-1), discount=self.cfg.discount
-        )
-        assert len(self.discounted_returns.shape) == 2
+        discounted_returns = discount_cumsum(rewards_normed, discount=self.cfg.discount)
+        # self.buffer.buffers["observations"][:, :, -1] = discounted_returns
+
+        assert len(discounted_returns.shape) == 2
         self.buffer_dataloader.extra_buffers = {
             "vf_returns": vf_returns[:, :-1],
             "advantages": advantages,
-            "discounted_returns": self.discounted_returns,
+            "discounted_returns": discounted_returns,
             "valid_rewards": rewards,
         }
 
     def train_dataloader(self) -> DataLoader:
         self.buffer_dataloader = FragmentDataloader(
-            self.buffer, batch_size=self.cfg.minibatch_size, callback=self.preprocess,
+            self.buffer,
+            batch_size=self.cfg.minibatch_size,
+            callback=self.preprocess,
             cycles=self.cfg.epochs_per_policy_step,
         )
         return self.buffer_dataloader
@@ -240,18 +297,19 @@ def gym_ppo(cfg: GymConfig):
     print("CONFIG END")
 
     if cfg.algo_cfg.exp_name is None:
-        cfg.algo_cfg.exp_name = 'gym_ppo'
+        cfg.algo_cfg.exp_name = "gym_ppo"
 
     if cfg.algo_cfg.log_dir is None:
         import hashlib
 
         hexdigest = hashlib.sha1(config_yaml.encode()).hexdigest()
-        cfg.algo_cfg.log_dir = f'outputs/{cfg.algorithm}/{hexdigest}'
+        cfg.algo_cfg.log_dir = f"outputs/{cfg.algorithm}/{hexdigest}"
 
     if cfg.algo_cfg.max_episode_length is None:
         cfg.algo_cfg.max_episode_length = 200
 
     import os
+
     os.makedirs(cfg.algo_cfg.log_dir, exist_ok=True)
     save_yaml(cfg, f"{cfg.algo_cfg.log_dir}/cfg.yaml")
 
@@ -259,8 +317,7 @@ def gym_ppo(cfg: GymConfig):
 
     seed_everything(cfg.algo_cfg.seed)
     env_cons = outrl.gym_env.GymEnvCons(
-        cfg.env_name,
-        max_episode_length=cfg.algo_cfg.max_episode_length
+        cfg.env_name, max_episode_length=cfg.algo_cfg.max_episode_length
     )
     checkpoint_callback = ModelCheckpoint(
         dirpath=f"{cfg.algo_cfg.log_dir}/checkpoints",
@@ -269,7 +326,7 @@ def gym_ppo(cfg: GymConfig):
         mode="max",
         every_n_epochs=10,
         monitor="avg_return",
-        save_on_train_epoch_end=False, # Actually want to checkpoint on start of epoch
+        save_on_train_epoch_end=False,  # Actually want to checkpoint on start of epoch
     )
     logger = CSVLogger(cfg.algo_cfg.log_dir)
     model = PPO(cfg.algo_cfg, env_cons)

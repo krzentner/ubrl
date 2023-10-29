@@ -175,7 +175,7 @@ class FragmentBuffer:
             mask = torch.zeros((self.n_episodes, self.max_episode_length), dtype=torch.bool)
             for i, episode_length in enumerate(self.episode_length_so_far):
                 mask[i, :episode_length] = True
-            self._valid_mask_cached = True
+            self._valid_mask_cached = mask
             return mask
 
     def get_full_episodes(self, key: str) -> Union[torch.Tensor, List[Any]]:
