@@ -213,16 +213,6 @@ def stack_dicts(infos: List[Dict[str, torch.Tensor]]):
     return {k: torch.stack([info[k] for info in infos]) for k in common_keys}
 
 
-class IterCallback(torch.utils.data.IterableDataset):
-    """Converts a function that returns an iterator into an iterator."""
-
-    def __init__(self, callback):
-        self.callback = callback
-
-    def __iter__(self):
-        return self.callback()
-
-
 def maybe_sample(dist: torch.distributions.Distribution, get_most_likely: bool = False):
     if get_most_likely:
         base_dist = getattr(dist, "base_dist", None)

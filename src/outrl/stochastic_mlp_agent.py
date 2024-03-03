@@ -1,7 +1,8 @@
 from typing import List, Any
 
 import torch
-import outrl
+import outrl.agent
+import outrl.nn
 from outrl.torch_utils import pack_tensors, pack_tensors_check
 import numpy as np
 

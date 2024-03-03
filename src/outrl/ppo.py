@@ -29,6 +29,7 @@ from outrl.torch_utils import (
     unpad_tensors,
 )
 from outrl.gym_utils import collect
+from outrl.stochastic_mlp_agent import StochasticMLPAgent
 
 
 @dataclass
@@ -77,7 +78,7 @@ class PPO(nn.Module):
             action_type = "discrete"
         else:
             raise NotImplementedError(f"Unsupported action space type {act_space}")
-        self.agent = outrl.StochasticMLPAgent(
+        self.agent = StochasticMLPAgent(
             observation_shape=self.env_spec.observation_space.shape,
             action_shape=act_shape,
             hidden_sizes=self.cfg.preprocess_hidden_sizes,
@@ -353,11 +354,6 @@ def gym_ppo(cfg: GymConfig):
 
     stick.add_output(PPrintOutputEngine("stdout"))
 
-    import outrl.gym_env
-
-    env_cons = outrl.gym_env.GymEnvCons(
-        cfg.env_name, max_episode_length=cfg.max_episode_length
-    )
     import gymnasium as gym
 
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
