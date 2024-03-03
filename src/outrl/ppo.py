@@ -2,16 +2,14 @@ import math
 from typing import Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from lightning.pytorch import LightningModule, seed_everything, Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
 from dataclasses import dataclass
+from tqdm import tqdm
 
-from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
 
-# import stick
+import stick
 
 import outrl
 from outrl.fragment_buffer import FragmentDataloader
@@ -54,7 +52,7 @@ class PPOConfig(AlgoConfig):
     norm_observations: bool = False
 
 
-class PPO(LightningModule):
+class PPO(nn.Module):
     def __init__(self, cfg: PPOConfig, env_cons):
         super().__init__()
         self.cfg = cfg
@@ -78,15 +76,15 @@ class PPO(LightningModule):
             action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[self.env_spec.action_type],
         )
 
-        self.save_hyperparameters(ignore=["buffer", "sampler", "env_cons"])
         self.obs_normalizer = RunningMeanVar(
             mean=torch.zeros(self.env_spec.observation_shape),
             var=torch.ones(self.env_spec.observation_shape),
         )
         self.reward_normalizer = RunningMeanVar()
-        self.automatic_optimization = False
 
-    def training_step(self, mb: dict[str, torch.Tensor]):
+        self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.cfg.learning_rate)
+
+    def _loss_function(self, mb: dict[str, torch.Tensor]) -> torch.Tensor:
         advantages = mb["advantages"].squeeze()
         advantages -= advantages.mean()
         advantages /= advantages.std()
@@ -143,71 +141,54 @@ class PPO(LightningModule):
         )
 
         loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
-        self.optimizers().zero_grad()
-        self.manual_backward(loss)
-        # stick.log(table='minibatch')
-        self.optimizers().step()
+        return loss
+
+    def train_step(self):
+        dataloader = self.train_dataloader()
+        for mb in tqdm(dataloader):
+            loss = self._loss_function(mb)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
     def log_training(
         self, mb: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
     ):
+        training_stats = {
+            k: train_locals[k].item()
+            for k in [
+                "vf_loss",
+                "pi_loss",
+                "mb_ev",
+                "clip_portion"
+                ]
+        }
+
+        training_stats["average_timestep_reward"] = mb["rewards"].mean().item()
+        training_stats["disc_mean"] = train_locals["disc_returns"].mean()
+        training_stats["critic_out_mean"] = train_locals["critic_out"].mean()
+
         if not self.logged_dataset:
             self.log_dataset()
             self.logged_dataset = True
-        for k in [
-            "vf_loss",
-            # "pi_loss",
-            "mb_ev",
-            # "clip_portion"
-        ]:
-            self.log(k, train_locals[k].item(), prog_bar=True)
-
-        # for k in ["log_prob"]:
-        #     self.log(k, train_locals[k].mean().item(), prog_bar=True)
-
-        self.log("average_timestep_reward", mb["rewards"].mean().item(), on_epoch=True)
-        # self.log(
-        #     "vf_bias", self.agent.vf_layers.output_linear.bias.item(), prog_bar=True)
-        self.log("disc_mean", train_locals["disc_returns"].mean(), prog_bar=True)
-        self.log("critic_out_mean", train_locals["critic_out"].mean(), prog_bar=True)
+            stick.log("training_stats", training_stats, level=stick.RESULTS)
+        else:
+            stick.log("training_stats", training_stats, level=stick.INFO)
 
     def log_dataset(self):
         full_episode_rewards = self.buffer.get_full_episodes("rewards")
         vf_returns = self.buffer_dataloader.extra_buffers["vf_returns"]
         discounted_returns = self.buffer_dataloader.extra_buffers["discounted_returns"]
         if len(full_episode_rewards):
-            self.log(
-                "ep_rew",
-                full_episode_rewards.sum(dim=-1).mean(dim=0),
-                prog_bar=True,
-            )
-            # Firt timestep
-            # self.log(
-            #     "ep_disc_rew",
-            #     discounted_returns[:, 0].mean(dim=0),
-            #     prog_bar=True,
-            # )
-            self.log(
-                "disc_mean",
-                discounted_returns[self.buffer.valid_mask()].mean(),
-                prog_bar=True,
-            )
-            self.log(
-                "vf_mean",
-                vf_returns[self.buffer.valid_mask()].mean(),
-                prog_bar=True,
-            )
-            self.log(
-                "ev",
-                outrl.nn.explained_variance(
+            stick.log('dataset_stats', {
+                "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
+                "disc_mean": discounted_returns[self.buffer.valid_mask()].mean(),
+                "vf_mean": vf_returns[self.buffer.valid_mask()].mean(),
+                "ev": outrl.nn.explained_variance(
                     vf_returns[self.buffer.valid_mask()],
                     discounted_returns[self.buffer.valid_mask()],
-                ),
-                prog_bar=True,
-            )
-
-    def configure_optimizers(self) -> list[Optimizer]:
-        return [torch.optim.Adam(self.agent.parameters(), lr=self.cfg.learning_rate)]
+                )
+            }, level=stick.RESULTS)
 
     def preprocess(self):
         self.logged_dataset = False
@@ -312,26 +293,24 @@ def gym_ppo(cfg: GymConfig):
 
     os.makedirs(cfg.algo_cfg.log_dir, exist_ok=True)
     save_yaml(cfg, f"{cfg.algo_cfg.log_dir}/cfg.yaml")
+    stick.init_extra(log_dir=cfg.algo_cfg.log_dir,
+                     run_name=cfg.algo_cfg.exp_name, config=cfg)
+
+    stick.seed_all_imported_modules(cfg.algo_cfg.seed)
+
+    # Log RESULTS level and higher to stdout
+    from stick.pprint_output import PPrintOutputEngine
+
+    stick.add_output(PPrintOutputEngine("stdout"))
 
     import outrl.gym_env
 
-    seed_everything(cfg.algo_cfg.seed)
     env_cons = outrl.gym_env.GymEnvCons(
         cfg.env_name, max_episode_length=cfg.algo_cfg.max_episode_length
     )
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=f"{cfg.algo_cfg.log_dir}/checkpoints",
-        save_top_k=10,
-        save_last=True,
-        mode="max",
-        every_n_epochs=10,
-        monitor="avg_return",
-        save_on_train_epoch_end=False,  # Actually want to checkpoint on start of epoch
-    )
-    logger = CSVLogger(cfg.algo_cfg.log_dir)
     model = PPO(cfg.algo_cfg, env_cons)
-    trainer = Trainer(max_epochs=-1, callbacks=[checkpoint_callback], logger=logger)
-    trainer.fit(model)
+    while True:
+        model.train_step()
 
 
 if __name__ == "__main__":

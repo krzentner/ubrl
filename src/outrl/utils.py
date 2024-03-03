@@ -1,7 +1,6 @@
 import copy
 from dataclasses import dataclass, field
 from typing import Optional, Dict
-from lightning.pytorch.profilers import simple
 
 import simple_parsing
 
