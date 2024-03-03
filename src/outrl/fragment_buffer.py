@@ -172,7 +172,9 @@ class FragmentBuffer:
         if self._valid_mask_cached is not None:
             return self._valid_mask_cached
         else:
-            mask = torch.zeros((self.n_episodes, self.max_episode_length), dtype=torch.bool)
+            mask = torch.zeros(
+                (self.n_episodes, self.max_episode_length), dtype=torch.bool
+            )
             for i, episode_length in enumerate(self.episode_length_so_far):
                 mask[i, :episode_length] = True
             self._valid_mask_cached = mask
@@ -363,16 +365,19 @@ class FragmentBuffer:
                 for i, episode_index in enumerate(episode_indices):
                     assert not self.episode_complete[episode_index]
                     start_step = self.episode_length_so_far[episode_index]
-                    buffer_tensor[episode_index][start_step : start_step + n_steps] = v[i]
+                    buffer_tensor[episode_index][start_step : start_step + n_steps] = v[
+                        i
+                    ]
             else:
                 raise TypeError("Unsupported timestep sequence type {}", type(v))
         for episode_index in episode_indices:
             self.episode_length_so_far[episode_index] += n_steps
             assert self.episode_length_so_far[episode_index] <= self.max_episode_length
 
-
     def valid_indices(self, fragment_length=1):
-        return valid_indices_jit(self._n_episodes, self.episode_length_so_far, fragment_length)
+        return valid_indices_jit(
+            self._n_episodes, self.episode_length_so_far, fragment_length
+        )
 
     def index_timesteps(
         self,
@@ -479,8 +484,18 @@ class FragmentBuffer:
                 fragments[k] = v[indices[:, 0], indices[:, 1]]
         return fragments
 
+    def as_padded(self):
+        n_episodes = (self.episode_length_so_far > 0).sum()
+        max_len = self.episode_length_so_far.max()
+        return {
+            k: b[:n_episodes, :max_len] for (k, b) in self.buffers.items()
+        }, self.episode_length_so_far[:n_episodes].tolist()
+
+
 @torch.jit.script
-def valid_indices_jit(n_episodes: int, episode_length_so_far: torch.Tensor, fragment_length: int):
+def valid_indices_jit(
+    n_episodes: int, episode_length_so_far: torch.Tensor, fragment_length: int
+):
     assert fragment_length >= 1
     all_allocations = []
     for episode_index in range(n_episodes):
@@ -501,7 +516,6 @@ def valid_indices_jit(n_episodes: int, episode_length_so_far: torch.Tensor, frag
         return torch.cat(all_allocations)
     else:
         return torch.zeros((0, 2), dtype=torch.int64)
-
 
 
 class FragmentDataset(torch.utils.data.IterableDataset):

@@ -1,18 +1,17 @@
 import math
 from typing import Optional
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from dataclasses import dataclass
 from tqdm import tqdm
-
-from torch.utils.data import DataLoader
 
 import stick
 
 import outrl
-from outrl.fragment_buffer import FragmentDataloader
 from outrl.nn import compute_advantages, discount_cumsum
 from outrl.utils import (
     get_config,
@@ -21,6 +20,14 @@ from outrl.utils import (
     Serializable,
     copy_default,
     RunningMeanVar,
+)
+from outrl.torch_utils import (
+    DictDataset,
+    pack_tensors,
+    pack_tensors_check,
+    pad_tensors,
+    unpack_tensors,
+    unpad_tensors,
 )
 
 
@@ -39,7 +46,7 @@ class PPOConfig(AlgoConfig):
     preprocess_hidden_sizes: list[int] = copy_default([128])
     pi_hidden_sizes: list[int] = copy_default([64, 64])
     vf_hidden_sizes: list[int] = copy_default([64, 64])
-    minibatch_size: int = 512
+    minibatch_size: int = 64
     learning_rate: float = 2.5e-4
     discount: float = 0.99
     gae_lambda: float = 0.95
@@ -82,20 +89,26 @@ class PPO(nn.Module):
         )
         self.reward_normalizer = RunningMeanVar()
 
-        self.optimizer = torch.optim.Adam(self.agent.parameters(), lr=self.cfg.learning_rate)
+        self.optimizer = torch.optim.Adam(
+            self.agent.parameters(), lr=self.cfg.learning_rate
+        )
 
-    def _loss_function(self, mb: dict[str, torch.Tensor]) -> torch.Tensor:
-        advantages = mb["advantages"].squeeze()
+    def _loss_function(self, mb: dict[str, list[torch.Tensor]]) -> torch.Tensor:
+        advantages, adv_len = pack_tensors(mb["advantages"])
         advantages -= advantages.mean()
         advantages /= advantages.std()
+
+        total_timesteps = sum(adv_len)
+
+        lr_adjustment = total_timesteps / self.cfg.minibatch_size
 
         actor_out, critic_out = self.agent.forward_both(
             mb["observations"], mb["actions"]
         )
         log_prob = -actor_out
-        minibatch_size = mb["observations"].shape[0]
+        minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -mb["action_energy"].squeeze()
+        old_log_prob = -pack_tensors_check(mb["action_energy"], adv_len)
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
@@ -114,7 +127,7 @@ class PPO(nn.Module):
 
         pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
 
-        disc_returns = mb["discounted_returns"]
+        disc_returns = pack_tensors_check(mb["discounted_returns"], adv_len)
         if self.cfg.vf_clip_ratio:
             # This clipping logic matches the logic from Tianshou
             # But it isn't scale invariant, so it's probably wrong?
@@ -136,105 +149,143 @@ class PPO(nn.Module):
             mb,
             dict(
                 clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
-                mb_ev=outrl.nn.explained_variance(critic_out, mb["discounted_returns"]),
-            ) | locals(),
+                mb_ev=outrl.nn.explained_variance(critic_out, disc_returns),
+            )
+            | locals(),
         )
 
         loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
-        return loss
+        return loss * lr_adjustment
 
     def train_step(self):
-        dataloader = self.train_dataloader()
-        for mb in tqdm(dataloader):
+        packed_data, lengths = self.collect()
+        packed_data["length"] = torch.as_tensor(lengths)
+        dataset = DictDataset(packed_data)
+        self.log_dataset(dataset)
+        for mb in tqdm(
+            dataset.episode_minibatches(self.cfg.minibatch_size, drop_last=False)
+        ):
             loss = self._loss_function(mb)
             self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
+            try:
+                clip_grad_norm_(
+                    self.agent.parameters(), max_norm=10.0, error_if_nonfinite=True
+                )
+                self.optimizer.step()
+            except RuntimeError as ex:
+                # This seems to only trigger if the batch is so small the loss
+                # is nan or so big we OOM
+                warnings.warn(ex)
 
     def log_training(
         self, mb: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
     ):
         training_stats = {
             k: train_locals[k].item()
-            for k in [
-                "vf_loss",
-                "pi_loss",
-                "mb_ev",
-                "clip_portion"
-                ]
+            for k in ["vf_loss", "pi_loss", "mb_ev", "clip_portion"]
         }
 
-        training_stats["average_timestep_reward"] = mb["rewards"].mean().item()
+        training_stats["lr_adjustment"] = train_locals["lr_adjustment"]
+
+        training_stats["average_timestep_reward"] = (
+            pack_tensors(mb["rewards"])[0].mean().item()
+        )
         training_stats["disc_mean"] = train_locals["disc_returns"].mean()
         training_stats["critic_out_mean"] = train_locals["critic_out"].mean()
 
         if not self.logged_dataset:
-            self.log_dataset()
             self.logged_dataset = True
             stick.log("training_stats", training_stats, level=stick.RESULTS)
         else:
             stick.log("training_stats", training_stats, level=stick.INFO)
 
-    def log_dataset(self):
-        full_episode_rewards = self.buffer.get_full_episodes("rewards")
-        vf_returns = self.buffer_dataloader.extra_buffers["vf_returns"]
-        discounted_returns = self.buffer_dataloader.extra_buffers["discounted_returns"]
+    def log_dataset(self, dataset: DictDataset):
+        full_episode_rewards = pad_tensors([ep["rewards"] for ep in dataset])
+        vf_returns = pack_tensors([ep["vf_returns"] for ep in dataset])[0]
+        discounted_returns = pack_tensors([ep["discounted_returns"] for ep in dataset])[
+            0
+        ]
         if len(full_episode_rewards):
-            stick.log('dataset_stats', {
-                "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
-                "disc_mean": discounted_returns[self.buffer.valid_mask()].mean(),
-                "vf_mean": vf_returns[self.buffer.valid_mask()].mean(),
-                "ev": outrl.nn.explained_variance(
-                    vf_returns[self.buffer.valid_mask()],
-                    discounted_returns[self.buffer.valid_mask()],
-                )
-            }, level=stick.RESULTS)
+            stick.log(
+                "dataset_stats",
+                {
+                    "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
+                    "disc_mean": discounted_returns.mean(),
+                    "vf_mean": vf_returns.mean(),
+                    "ev": outrl.nn.explained_variance(
+                        vf_returns,
+                        discounted_returns,
+                    ),
+                },
+                level=stick.RESULTS,
+            )
 
-    def preprocess(self):
+    def collect(self):
         self.logged_dataset = False
         self.buffer.clear_all()
         self.sampler.sample(
             self.buffer, self.agent, timestep_target=self.cfg.steps_per_epoch
         )
+        padded_data, episode_lengths = self.buffer.as_padded()
+        assert self.cfg.steps_per_epoch <= sum(episode_lengths)
+        if self.cfg.max_episode_length:
+            upper_bound = (
+                self.cfg.n_envs
+                * self.cfg.max_episode_length
+                * math.ceil(
+                    self.cfg.steps_per_epoch
+                    / (self.cfg.n_envs * self.cfg.max_episode_length)
+                )
+            )
+            assert upper_bound >= sum(episode_lengths)
 
-        all_obs = torch.cat(
-            [
-                self.buffer.buffers["observations"],
-                torch.zeros(
-                    (self.buffer.n_episodes, 1) + self.env_spec.observation_shape
-                ),
-            ],
-            dim=1,
-        )
-        # Fill in final (t + 1) observation
-        for i in range(self.buffer.n_episodes):
-            eps_len = self.buffer.episode_length_so_far[i]
+        obs_lens = list(episode_lengths)
+        full_obs = []
+        for i, obs in enumerate(
+            unpad_tensors(padded_data["observations"], episode_lengths)
+        ):
             try:
-                all_obs[i, eps_len] = self.buffer.episode_data[i]["last_observation"]
+                full_obs.append(
+                    torch.cat(
+                        [
+                            obs,
+                            self.buffer.episode_data[i]["last_observation"].unsqueeze(
+                                0
+                            ),
+                        ]
+                    )
+                )
             except KeyError:
-                pass
-        self.obs_normalizer.update(all_obs)
+                full_obs.append(obs)
+        padded_obs = pad_tensors(full_obs, target_len=1 + max(episode_lengths))
+        packed_obs = pack_tensors_check(unpad_tensors(padded_obs, obs_lens), obs_lens)
+
+        self.obs_normalizer.update(packed_obs)
         if self.cfg.norm_observations:
-            all_obs = self.reward_normalizer.normalize_batch(all_obs)
+            padded_obs = self.reward_normalizer.normalize_batch(padded_obs)
 
         # Compute vf_returns, filter based on episode termination
         with torch.no_grad():
-            vf_returns = self.agent.vf_forward(all_obs)
+            vf_returns = self.agent.vf_forward(padded_obs)
         # Can't use valids mask, since vf_returns goes to t + 1
-        for i, episode_length in enumerate(self.buffer.episode_length_so_far):
+        for i, episode_length in enumerate(episode_lengths):
+            episode_length = self.buffer.episode_length_so_far[i]
             # Everything after last valid observation should be empty
             vf_returns[i, episode_length + 1 :] = 0.0
             # zero vf_{t+1} in terminated episodes
             if self.buffer.episode_data[i].get("terminated", False):
                 vf_returns[i, episode_length] = 0.0
 
-        rewards = self.buffer.buffers["rewards"].clone()
-        rewards[~self.buffer.valid_mask()] = 0.0
-        self.reward_normalizer.update(rewards[self.buffer.valid_mask()])
+        padded_rewards = padded_data["rewards"]
+        packed_rewards = pack_tensors_check(
+            unpad_tensors(padded_rewards, episode_lengths), episode_lengths
+        )
+        self.reward_normalizer.update(packed_rewards)
         if self.cfg.norm_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(rewards)
+            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
-            rewards_normed = rewards
+            rewards_normed = padded_rewards
 
         advantages = compute_advantages(
             discount=self.cfg.discount,
@@ -243,25 +294,20 @@ class PPO(nn.Module):
             rewards=rewards_normed,
         )
 
-        discounted_returns = discount_cumsum(rewards_normed, discount=self.cfg.discount)
-        # self.buffer.buffers["observations"][:, :, -1] = discounted_returns
+        discounted_returns = discount_cumsum(padded_rewards, discount=self.cfg.discount)
 
-        assert len(discounted_returns.shape) == 2
-        self.buffer_dataloader.extra_buffers = {
-            "vf_returns": vf_returns[:, :-1],
-            "advantages": advantages,
-            "discounted_returns": discounted_returns,
-            "valid_rewards": rewards,
-        }
-
-    def train_dataloader(self) -> DataLoader:
-        self.buffer_dataloader = FragmentDataloader(
-            self.buffer,
-            batch_size=self.cfg.minibatch_size,
-            callback=self.preprocess,
-            cycles=self.cfg.epochs_per_policy_step,
+        padded_data.update(
+            {
+                "vf_returns": vf_returns[:, :-1],
+                "advantages": advantages,
+                "discounted_returns": discounted_returns,
+                "valid_rewards": padded_rewards,
+            }
         )
-        return self.buffer_dataloader
+        episode_data = {
+            k: unpad_tensors(b, episode_lengths) for (k, b) in padded_data.items()
+        }
+        return episode_data, episode_lengths
 
 
 @dataclass
@@ -292,8 +338,7 @@ def gym_ppo(cfg: GymConfig):
 
     os.makedirs(cfg.log_dir, exist_ok=True)
     save_yaml(cfg, f"{cfg.log_dir}/cfg.yaml")
-    stick.init_extra(log_dir=cfg.log_dir,
-                     run_name=cfg.exp_name, config=cfg)
+    stick.init_extra(log_dir=cfg.log_dir, run_name=cfg.exp_name, config=cfg)
 
     stick.seed_all_imported_modules(cfg.seed)
 

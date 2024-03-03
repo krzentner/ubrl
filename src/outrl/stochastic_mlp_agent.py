@@ -2,6 +2,7 @@ from typing import List
 
 import torch
 import outrl
+from outrl.torch_utils import pack_tensors, pack_tensors_check
 
 
 class StochasticMLPAgent(outrl.agent.StochasticAgent):
@@ -79,21 +80,17 @@ class StochasticMLPAgent(outrl.agent.StochasticAgent):
         )
 
     def forward_both(
-        self,
-        observations: torch.Tensor,
-        actions: torch.Tensor
+        self, observations: list[torch.Tensor], actions: list[torch.Tensor]
     ):
-        B = observations.shape[0]
-        T = observations.shape[1]
-        # At least B, T, X dimensions
-        assert len(observations.shape) >= 3
-        shared_x = self.shared_layers(observations.reshape(B * T, -1))
+        obs_packed, obs_lens = pack_tensors(observations)
+        act_packed = pack_tensors_check(actions, obs_lens)
+        shared_x = self.shared_layers(obs_packed)
         pi_x = self.pi_layers(shared_x)
         vf_x = self.vf_layers(shared_x).squeeze(-1)
 
         dists = self.action_dist_cons(pi_x)
 
-        return self.action_energy(dists, actions.reshape(B * T, -1).squeeze(-1)), vf_x
+        return self.action_energy(dists, act_packed), vf_x
 
     def vf_forward(self, observations: torch.Tensor):
         B = observations.shape[0]

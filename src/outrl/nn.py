@@ -84,7 +84,7 @@ def compute_advantages(
 
     delta = -vf_returns[:, :-1] + rewards + discount * vf_returns[:, 1:]
     adv_gae = torch.zeros((n_episodes, max_episode_length))
-    adv_gae[max_episode_length - 1] = delta[max_episode_length - 1]
+    adv_gae[:, max_episode_length - 1] = delta[:, max_episode_length - 1]
     for t in range(max_episode_length - 2, 0, -1):
         adv_gae[:, t] = delta[:, t] + discount * gae_lambda * adv_gae[:, t + 1]
     return adv_gae.squeeze()
