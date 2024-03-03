@@ -26,9 +26,9 @@ from outrl.torch_utils import (
     pack_tensors,
     pack_tensors_check,
     pad_tensors,
-    unpack_tensors,
     unpad_tensors,
 )
+from outrl.gym_utils import collect
 
 
 @dataclass
@@ -47,45 +47,48 @@ class PPOConfig(AlgoConfig):
     pi_hidden_sizes: list[int] = copy_default([64, 64])
     vf_hidden_sizes: list[int] = copy_default([64, 64])
     minibatch_size: int = 64
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 1e-3
     discount: float = 0.99
     gae_lambda: float = 0.95
     clip_ratio: float = 0.2
     fragment_length: int = 1
-    epochs_per_policy_step: int = 20
-    vf_loss_coeff: float = 0.25
+    epochs_per_policy_step: int = 10
+    vf_loss_coeff: float = 0.1
     vf_clip_ratio: Optional[float] = None
     norm_rewards: bool = False
     norm_observations: bool = False
 
 
 class PPO(nn.Module):
-    def __init__(self, cfg: PPOConfig, env_cons):
+    def __init__(self, cfg: PPOConfig, envs):
         super().__init__()
         self.cfg = cfg
-        self.sampler = outrl.Sampler(env_cons, self.cfg.n_envs)
+        self.envs = envs
+        # self.sampler = outrl.Sampler(env_cons, self.cfg.n_envs)
 
-        self.env_spec = self.sampler.env_spec
-        self.max_episode_length = self.env_spec.max_episode_length
-        self.max_episodes_per_epoch = int(
-            math.ceil(self.cfg.steps_per_epoch / self.env_spec.max_episode_length)
-        )
+        self.env_spec = self.envs[0]
 
-        self.buffer = outrl.FragmentBuffer(
-            self.cfg.steps_per_epoch, self.env_spec.max_episode_length
-        )
+        act_space = self.env_spec.action_space
+        if hasattr(act_space, "low") and hasattr(act_space, "high"):
+            act_shape = act_space.shape
+            action_type = "continuous"
+        elif hasattr(act_space, "n"):
+            act_shape = (act_space.n,)
+            action_type = "discrete"
+        else:
+            raise NotImplementedError(f"Unsupported action space type {act_space}")
         self.agent = outrl.StochasticMLPAgent(
-            observation_shape=self.env_spec.observation_shape,
-            action_shape=self.env_spec.action_shape,
+            observation_shape=self.env_spec.observation_space.shape,
+            action_shape=act_shape,
             hidden_sizes=self.cfg.preprocess_hidden_sizes,
             vf_hidden_sizes=self.cfg.vf_hidden_sizes,
             pi_hidden_sizes=self.cfg.pi_hidden_sizes,
-            action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[self.env_spec.action_type],
+            action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[action_type],
         )
 
         self.obs_normalizer = RunningMeanVar(
-            mean=torch.zeros(self.env_spec.observation_shape),
-            var=torch.ones(self.env_spec.observation_shape),
+            mean=torch.zeros(self.env_spec.observation_space.shape),
+            var=torch.ones(self.env_spec.observation_space.shape),
         )
         self.reward_normalizer = RunningMeanVar()
 
@@ -108,7 +111,7 @@ class PPO(nn.Module):
         log_prob = -actor_out
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -pack_tensors_check(mb["action_energy"], adv_len)
+        old_log_prob = -pack_tensors_check(mb["action_lls"], adv_len)
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
@@ -223,11 +226,26 @@ class PPO(nn.Module):
 
     def collect(self):
         self.logged_dataset = False
-        self.buffer.clear_all()
-        self.sampler.sample(
-            self.buffer, self.agent, timestep_target=self.cfg.steps_per_epoch
-        )
-        padded_data, episode_lengths = self.buffer.as_padded()
+        with torch.no_grad():
+            self._replay_buffer = collect(
+                self.cfg.steps_per_epoch,
+                self.envs,
+                self.agent,
+                max_episode_length=self.cfg.max_episode_length,
+            )
+
+        terminated = [ep["terminated"] for ep in self._replay_buffer]
+        keys = ["actions", "rewards", "action_lls"]
+        padded_data = {
+            k: pad_tensors(
+                [ep[k].to(dtype=torch.float32) for ep in self._replay_buffer]
+            )
+            for k in keys
+        }
+        episode_lengths = [len(ep["rewards"]) for ep in self._replay_buffer]
+        if padded_data["actions"].var() == 0:
+            warnings.warn("Action variance is zero")
+
         assert self.cfg.steps_per_epoch <= sum(episode_lengths)
         if self.cfg.max_episode_length:
             upper_bound = (
@@ -240,25 +258,11 @@ class PPO(nn.Module):
             )
             assert upper_bound >= sum(episode_lengths)
 
-        obs_lens = list(episode_lengths)
-        full_obs = []
-        for i, obs in enumerate(
-            unpad_tensors(padded_data["observations"], episode_lengths)
-        ):
-            try:
-                full_obs.append(
-                    torch.cat(
-                        [
-                            obs,
-                            self.buffer.episode_data[i]["last_observation"].unsqueeze(
-                                0
-                            ),
-                        ]
-                    )
-                )
-            except KeyError:
-                full_obs.append(obs)
-        padded_obs = pad_tensors(full_obs, target_len=1 + max(episode_lengths))
+        obs_lens = [len(ep["observations"]) for ep in self._replay_buffer]
+        padded_obs = pad_tensors(
+            [ep["observations"].to(dtype=torch.float32) for ep in self._replay_buffer]
+        )
+        padded_data["observations"] = padded_obs
         packed_obs = pack_tensors_check(unpad_tensors(padded_obs, obs_lens), obs_lens)
 
         self.obs_normalizer.update(packed_obs)
@@ -270,12 +274,14 @@ class PPO(nn.Module):
             vf_returns = self.agent.vf_forward(padded_obs)
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
-            episode_length = self.buffer.episode_length_so_far[i]
+            episode_length = episode_lengths[i]
             # Everything after last valid observation should be empty
             vf_returns[i, episode_length + 1 :] = 0.0
             # zero vf_{t+1} in terminated episodes
-            if self.buffer.episode_data[i].get("terminated", False):
+            if terminated[i]:
                 vf_returns[i, episode_length] = 0.0
+            else:
+                assert vf_returns[i, episode_length] != 0
 
         padded_rewards = padded_data["rewards"]
         packed_rewards = pack_tensors_check(
@@ -352,7 +358,10 @@ def gym_ppo(cfg: GymConfig):
     env_cons = outrl.gym_env.GymEnvCons(
         cfg.env_name, max_episode_length=cfg.max_episode_length
     )
-    model = PPO(cfg, env_cons)
+    import gymnasium as gym
+
+    envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
+    model = PPO(cfg, envs)
     while True:
         model.train_step()
 

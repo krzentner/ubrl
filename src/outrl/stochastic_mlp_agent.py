@@ -1,8 +1,9 @@
-from typing import List
+from typing import List, Any
 
 import torch
 import outrl
 from outrl.torch_utils import pack_tensors, pack_tensors_check
+import numpy as np
 
 
 class StochasticMLPAgent(outrl.agent.StochasticAgent):
@@ -56,6 +57,32 @@ class StochasticMLPAgent(outrl.agent.StochasticAgent):
             output_b_init=output_b_init,
             layer_normalization=layer_normalization,
         )
+
+    def get_actions(
+        self,
+        observations: np.ndarray,
+        reset_mask: np.ndarray,
+        best_action: bool = False,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        del reset_mask
+        del best_action
+        observations = torch.from_numpy(observations)
+        B = observations.shape[0]
+        shared_x = self.shared_layers(observations.reshape(B, -1))
+        pi_x = self.pi_layers(shared_x)
+
+        dists = self.action_dist_cons(pi_x)
+        actions = dists.sample()
+
+        action_ll = dists.log_prob(actions).unsqueeze(-1)
+        assert action_ll.shape == (observations.shape[0], 1)
+        action_mean = dists.mean
+        action_stddev = dists.stddev
+        return np.asarray(actions), {
+            "action_ll": action_ll,
+            "action_mean": action_mean,
+            "action_stddev": action_stddev,
+        }
 
     def step(
         self,
