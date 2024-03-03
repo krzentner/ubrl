@@ -265,10 +265,9 @@ class PPO(nn.Module):
 
 
 @dataclass
-class GymConfig(Serializable):
+class GymConfig(PPOConfig):
     env_name: str = "CartPole-v1"
     algorithm: str = "ppo"
-    algo_cfg: PPOConfig = copy_default(PPOConfig())
 
 
 def gym_ppo(cfg: GymConfig):
@@ -277,26 +276,26 @@ def gym_ppo(cfg: GymConfig):
     print(config_yaml)
     print("CONFIG END")
 
-    if cfg.algo_cfg.exp_name is None:
-        cfg.algo_cfg.exp_name = "gym_ppo"
+    if cfg.exp_name is None:
+        cfg.exp_name = "gym_ppo"
 
-    if cfg.algo_cfg.log_dir is None:
+    if cfg.log_dir is None:
         import hashlib
 
         hexdigest = hashlib.sha1(config_yaml.encode()).hexdigest()
-        cfg.algo_cfg.log_dir = f"outputs/{cfg.algorithm}/{hexdigest}"
+        cfg.log_dir = f"outputs/{cfg.algorithm}/{hexdigest}"
 
-    if cfg.algo_cfg.max_episode_length is None:
-        cfg.algo_cfg.max_episode_length = 200
+    if cfg.max_episode_length is None:
+        cfg.max_episode_length = 200
 
     import os
 
-    os.makedirs(cfg.algo_cfg.log_dir, exist_ok=True)
-    save_yaml(cfg, f"{cfg.algo_cfg.log_dir}/cfg.yaml")
-    stick.init_extra(log_dir=cfg.algo_cfg.log_dir,
-                     run_name=cfg.algo_cfg.exp_name, config=cfg)
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    save_yaml(cfg, f"{cfg.log_dir}/cfg.yaml")
+    stick.init_extra(log_dir=cfg.log_dir,
+                     run_name=cfg.exp_name, config=cfg)
 
-    stick.seed_all_imported_modules(cfg.algo_cfg.seed)
+    stick.seed_all_imported_modules(cfg.seed)
 
     # Log RESULTS level and higher to stdout
     from stick.pprint_output import PPrintOutputEngine
@@ -306,9 +305,9 @@ def gym_ppo(cfg: GymConfig):
     import outrl.gym_env
 
     env_cons = outrl.gym_env.GymEnvCons(
-        cfg.env_name, max_episode_length=cfg.algo_cfg.max_episode_length
+        cfg.env_name, max_episode_length=cfg.max_episode_length
     )
-    model = PPO(cfg.algo_cfg, env_cons)
+    model = PPO(cfg, env_cons)
     while True:
         model.train_step()
 
