@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from outrl.nn import flatten_shape, Shape
 
+
 class DistConstructor:
     def get_encoded_size(self, action_shape: Shape) -> int:
         return flatten_shape(action_shape)

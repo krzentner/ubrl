@@ -6,8 +6,8 @@ import simple_parsing
 
 import torch
 
-class Serializable(simple_parsing.Serializable):
 
+class Serializable(simple_parsing.Serializable):
     def state_dict(self):
         return self.to_dict()
 
@@ -18,14 +18,17 @@ def get_config(config_type):
 
 def _get_config_inner(config_type, default=None):
     parser = simple_parsing.ArgumentParser(
-        nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT)
-    parser.add_arguments(config_type, dest='config_arguments', default=default)
-    parser.add_argument('--cfg-path', default=None, type=str)
+        nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT
+    )
+    parser.add_arguments(config_type, dest="config_arguments", default=default)
+    parser.add_argument("--cfg-path", default=None, type=str)
     # print(parser.equivalent_argparse_code())
     args = parser.parse_args()
     if default is None and args.cfg_path is not None:
         # We haven't loaded defaults from a config, and we're being asked to.
-        cfg_loaded = simple_parsing.helpers.serialization.load(config_type, args.cfg_path)
+        cfg_loaded = simple_parsing.helpers.serialization.load(
+            config_type, args.cfg_path
+        )
         return _get_config_inner(config_type, default=cfg_loaded)
     else:
         return args.config_arguments
@@ -119,7 +122,6 @@ class RunningMeanVar(Serializable):
 
 def copy_default(x):
     return field(default_factory=lambda: copy.deepcopy(x))
-
 
 
 def test_running_mean_var():
