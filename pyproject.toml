@@ -44,7 +44,6 @@ simple-parsing = "^0.1.5"
 tensorboardx = {version = "^2.6.2.2", extras = ["tensorboardX"]}
 hydra-core = "^1.3.2"
 py-spy = "^0.3.14"
-lightning = { version = "^2.2.0.post0", optional = true }
 gymnasium = { version = "^0.29.1", optional = true }
 
 [tool.poetry.group.dev.dependencies]
@@ -57,7 +56,7 @@ visdom = "^0.2.4"
 stick = {path = "stick"}
 
 [tool.poetry.extras]
-torch = ["torch", "lightning"]
+torch = ["torch"]
 gym = ["gym", "mujoco-py"]
 gymnasium = ["gymnasium"]
 
