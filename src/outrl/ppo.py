@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Any, Optional
 import warnings
 
 import torch
@@ -30,6 +30,63 @@ from outrl.torch_utils import (
 )
 from outrl.gym_utils import collect
 from outrl.stochastic_mlp_agent import StochasticMLPAgent
+
+
+@dataclass(eq=False)
+class ActorOutput:
+    """Result from one episode when calling .forward() on an actor.
+
+    Differentiating both observation_latents and action_lls should affect
+    earlier layers in the actor.
+    """
+
+    observation_latents: torch.Tensor
+    """Differentiable representations of the observations in the episode."""
+
+    action_lls: torch.Tensor
+    """Differentiable log-likelihood of actions taken in the episode."""
+
+
+@dataclass(eq=False)
+class EpisodeData:
+    """Wrapper around an episode that maintains metadata and caches computed values."""
+
+    episode: Any
+    """The episode (treated as an opaque object)."""
+
+    episode_number: int
+    """Records with add_episode() call this episode came from."""
+
+    num_timesteps: int
+    """Number of steps in episode."""
+
+    terminated: bool
+    """Boolean indicating if the episode reached a terminal state. Always False
+    in infinite horizon MDPs or when and episode reaches a timeout."""
+
+    original_action_lls: torch.Tensor
+    """Original action lls provided when the episode was added."""
+
+    rewards: torch.Tensor
+    """Rewards provided when the episode was added."""
+
+    actions_possible: torch.Tensor
+    """Boolean actions_possible mask."""
+
+    sample_priority: float = 1.0
+    """Priority for sampling episode. Decreased every train_step()."""
+
+    def __lt__(self, other):
+        return self.sort_key() < other.sort_key()
+
+    def sort_key(self):
+        """Retain highest sampling priority episodes, tie-break to prefer newer episodes."""
+        return (self.sample_priority, self.episode_number)
+
+    def __post_init__(self):
+        assert self.original_action_lls.shape == (self.num_timesteps,)
+        assert self.rewards.shape == (self.num_timesteps,)
+        assert self.actions_possible.shape == (self.num_timesteps,)
 
 
 @dataclass
@@ -97,6 +154,11 @@ class PPO(nn.Module):
             self.agent.parameters(), lr=self.cfg.learning_rate
         )
 
+        self._replay_buffer: list[EpisodeData] = []
+        self.total_env_steps: int = 0
+        self._next_episode_number: int = 0
+        self._dtype = torch.float32
+
     def _loss_function(self, mb: dict[str, list[torch.Tensor]]) -> torch.Tensor:
         advantages, adv_len = pack_tensors(mb["advantages"])
         advantages -= advantages.mean()
@@ -112,7 +174,7 @@ class PPO(nn.Module):
         log_prob = -actor_out
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -pack_tensors_check(mb["action_lls"], adv_len)
+        old_log_prob = -pack_tensors_check(mb["original_action_lls"], adv_len)
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
@@ -162,7 +224,7 @@ class PPO(nn.Module):
         return loss * lr_adjustment
 
     def train_step(self):
-        packed_data, lengths = self.collect()
+        packed_data, lengths = self.preprocess()
         packed_data["length"] = torch.as_tensor(lengths)
         dataset = DictDataset(packed_data)
         self.log_dataset(dataset)
@@ -227,24 +289,30 @@ class PPO(nn.Module):
 
     def collect(self):
         self.logged_dataset = False
+        self._replay_buffer = []
         with torch.no_grad():
-            self._replay_buffer = collect(
+            collect_res = collect(
                 self.cfg.steps_per_epoch,
                 self.envs,
                 self.agent,
                 max_episode_length=self.cfg.max_episode_length,
             )
-
-        terminated = [ep["terminated"] for ep in self._replay_buffer]
-        keys = ["actions", "rewards", "action_lls"]
-        padded_data = {
-            k: pad_tensors(
-                [ep[k].to(dtype=torch.float32) for ep in self._replay_buffer]
+        for episode in collect_res:
+            self.add_episode(
+                episode,
+                rewards=episode["rewards"],
+                action_lls=episode["action_lls"],
+                terminated=episode["terminated"],
+                actions_possible=episode["actions_possible"],
             )
-            for k in keys
-        }
-        episode_lengths = [len(ep["rewards"]) for ep in self._replay_buffer]
-        if padded_data["actions"].var() == 0:
+
+    def preprocess(self):
+        terminated = [data.terminated for data in self._replay_buffer]
+        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        padded_actions = pad_tensors(
+            [data.episode["rewards"] for data in self._replay_buffer]
+        )
+        if padded_actions.var() == 0:
             warnings.warn("Action variance is zero")
 
         assert self.cfg.steps_per_epoch <= sum(episode_lengths)
@@ -259,11 +327,16 @@ class PPO(nn.Module):
             )
             assert upper_bound >= sum(episode_lengths)
 
-        obs_lens = [len(ep["observations"]) for ep in self._replay_buffer]
+        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
         padded_obs = pad_tensors(
-            [ep["observations"].to(dtype=torch.float32) for ep in self._replay_buffer]
+            [
+                data.episode["observations"].to(dtype=torch.float32)
+                for data in self._replay_buffer
+            ]
         )
-        padded_data["observations"] = padded_obs
+        padded_obs = pad_tensors(
+            [data.episode["observations"] for data in self._replay_buffer]
+        )
         packed_obs = pack_tensors_check(unpad_tensors(padded_obs, obs_lens), obs_lens)
 
         self.obs_normalizer.update(packed_obs)
@@ -284,7 +357,7 @@ class PPO(nn.Module):
             else:
                 assert vf_returns[i, episode_length] != 0
 
-        padded_rewards = padded_data["rewards"]
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
         packed_rewards = pack_tensors_check(
             unpad_tensors(padded_rewards, episode_lengths), episode_lengths
         )
@@ -303,18 +376,80 @@ class PPO(nn.Module):
 
         discounted_returns = discount_cumsum(padded_rewards, discount=self.cfg.discount)
 
-        padded_data.update(
-            {
-                "vf_returns": vf_returns[:, :-1],
-                "advantages": advantages,
-                "discounted_returns": discounted_returns,
-                "valid_rewards": padded_rewards,
-            }
-        )
+        padded_data = {
+            "vf_returns": vf_returns[:, :-1],
+            "advantages": advantages,
+            "discounted_returns": discounted_returns,
+            "valid_rewards": padded_rewards,
+        }
         episode_data = {
             k: unpad_tensors(b, episode_lengths) for (k, b) in padded_data.items()
         }
+        episode_data["original_action_lls"] = [
+            data.original_action_lls for data in self._replay_buffer
+        ]
+        episode_data["rewards"] = [data.rewards for data in self._replay_buffer]
+        episode_data["episodes"] = [data.episode for data in self._replay_buffer]
+        episode_data["observations"] = [
+            data.episode["observations"][:-1] for data in self._replay_buffer
+        ]
+        episode_data["actions"] = [
+            data.episode["actions"] for data in self._replay_buffer
+        ]
         return episode_data, episode_lengths
+
+    def add_episode(
+        self,
+        episode: Any,
+        rewards: torch.Tensor,
+        action_lls: torch.Tensor,
+        terminated: bool,
+        actions_possible: Optional[torch.Tensor] = None,
+        sample_priority: float = 1.0,
+    ):
+        """Add a new episode to the replay buffer.
+
+        Arguments:
+            rewards (torch.Tensor): Float Tensor containing rewards achieved
+                after taking each action.
+            terminated (bool): True if the episode ended in a terminal state,
+                and False if the episode timed-out, was abandoned, or is still
+                ongoing
+            actions_possible (torch.Tensor?): Boolean Tensor indicating if any
+                actions were possible to take at this state. This allows
+                ignoring states where no action was possible (e.g. the initial
+                prompt in an LLM, or intermediate frames in a video input when
+                using frame-skip). Assumes always true if not provided.
+            sample_priority (float): Optional initial sample priority weight.
+                Will be adjusted by the learner.
+
+        """
+        assert isinstance(rewards, torch.Tensor)
+        assert isinstance(action_lls, torch.Tensor)
+        assert not action_lls.requires_grad
+        num_timesteps = len(rewards)
+        self.total_env_steps += num_timesteps
+        if actions_possible is None:
+            actions_possible = torch.ones(num_timesteps, dtype=torch.bool)
+        else:
+            assert isinstance(actions_possible, torch.Tensor)
+
+        rewards = rewards.to(dtype=self._dtype)
+        self.reward_normalizer.update(rewards)
+
+        self._replay_buffer.append(
+            EpisodeData(
+                episode,
+                episode_number=self._next_episode_number,
+                num_timesteps=num_timesteps,
+                terminated=terminated,
+                original_action_lls=action_lls.to(dtype=self._dtype),
+                rewards=rewards,
+                actions_possible=actions_possible,
+                sample_priority=sample_priority,
+            )
+        )
+        self._next_episode_number += 1
 
 
 @dataclass
@@ -359,6 +494,7 @@ def gym_ppo(cfg: GymConfig):
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
     model = PPO(cfg, envs)
     while True:
+        model.collect()
         model.train_step()
 
 
