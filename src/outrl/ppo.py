@@ -23,6 +23,7 @@ from outrl.utils import (
 )
 from outrl.torch_utils import (
     DictDataset,
+    make_mlp,
     pack_tensors,
     pack_tensors_check,
     pad_tensors,
@@ -144,6 +145,10 @@ class PPO(nn.Module):
             action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[action_type],
         )
 
+        self.observation_latent_size = self.agent.observation_latent_size
+
+        self.vf = make_mlp(input_size=self.observation_latent_size, hidden_sizes=self.cfg.vf_hidden_sizes, output_size=0)
+
         self.obs_normalizer = RunningMeanVar(
             mean=torch.zeros(self.env_spec.observation_space.shape),
             var=torch.ones(self.env_spec.observation_space.shape),
@@ -151,7 +156,7 @@ class PPO(nn.Module):
         self.reward_normalizer = RunningMeanVar()
 
         self.optimizer = torch.optim.Adam(
-            self.agent.parameters(), lr=self.cfg.learning_rate
+            list(self.agent.parameters()) + list(self.vf.parameters()), lr=self.cfg.learning_rate
         )
 
         self._replay_buffer: list[EpisodeData] = []
@@ -168,9 +173,10 @@ class PPO(nn.Module):
 
         lr_adjustment = total_timesteps / self.cfg.minibatch_size
 
-        actor_out, critic_out = self.agent.forward_both(
+        actor_out, critic_out, obs_latents_packed = self.agent.forward_both(
             mb["observations"], mb["actions"]
         )
+        critic_out2 = self.vf(obs_latents_packed)
         log_prob = -actor_out
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
@@ -211,6 +217,8 @@ class PPO(nn.Module):
         else:
             vf_loss = F.mse_loss(critic_out, disc_returns)
 
+        vf_loss2 = F.mse_loss(critic_out2, disc_returns)
+
         self.log_training(
             mb,
             dict(
@@ -220,7 +228,8 @@ class PPO(nn.Module):
             | locals(),
         )
 
-        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
+        loss = (pi_loss + self.cfg.vf_loss_coeff * vf_loss +
+                self.cfg.vf_loss_coeff * vf_loss2)
         return loss * lr_adjustment
 
     def train_step(self):
@@ -237,6 +246,9 @@ class PPO(nn.Module):
             try:
                 clip_grad_norm_(
                     self.agent.parameters(), max_norm=10.0, error_if_nonfinite=True
+                )
+                clip_grad_norm_(
+                    self.vf.parameters(), max_norm=10.0, error_if_nonfinite=True
                 )
                 self.optimizer.step()
             except RuntimeError as ex:
@@ -345,7 +357,8 @@ class PPO(nn.Module):
 
         # Compute vf_returns, filter based on episode termination
         with torch.no_grad():
-            vf_returns = self.agent.vf_forward(padded_obs)
+            # vf_returns = self.agent.vf_forward(padded_obs)
+            vf_returns = self.vf(self.agent.shared_layers(padded_obs))
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
             episode_length = episode_lengths[i]

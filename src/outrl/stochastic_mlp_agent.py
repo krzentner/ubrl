@@ -59,6 +59,8 @@ class StochasticMLPAgent(outrl.agent.StochasticAgent):
             layer_normalization=layer_normalization,
         )
 
+        self.observation_latent_size = hidden_sizes[-1]
+
     def get_actions(
         self,
         observations: np.ndarray,
@@ -118,7 +120,7 @@ class StochasticMLPAgent(outrl.agent.StochasticAgent):
 
         dists = self.action_dist_cons(pi_x)
 
-        return self.action_energy(dists, act_packed), vf_x
+        return self.action_energy(dists, act_packed), vf_x, shared_x
 
     def vf_forward(self, observations: torch.Tensor):
         B = observations.shape[0]
