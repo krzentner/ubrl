@@ -28,6 +28,7 @@ from outrl.torch_utils import (
     pack_tensors_check,
     pad_tensors,
     unpad_tensors,
+    explained_variance,
 )
 from outrl.gym_utils import collect
 from outrl.stochastic_mlp_agent import StochasticMLPAgent
@@ -123,7 +124,6 @@ class PPO(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.envs = envs
-        # self.sampler = outrl.Sampler(env_cons, self.cfg.n_envs)
 
         self.env_spec = self.envs[0]
 
@@ -147,16 +147,17 @@ class PPO(nn.Module):
 
         self.observation_latent_size = self.agent.observation_latent_size
 
-        self.vf = make_mlp(input_size=self.observation_latent_size, hidden_sizes=self.cfg.vf_hidden_sizes, output_size=0)
-
-        self.obs_normalizer = RunningMeanVar(
-            mean=torch.zeros(self.env_spec.observation_space.shape),
-            var=torch.ones(self.env_spec.observation_space.shape),
+        self.vf = make_mlp(
+            input_size=self.observation_latent_size,
+            hidden_sizes=self.cfg.vf_hidden_sizes,
+            output_size=0,
         )
+
         self.reward_normalizer = RunningMeanVar()
 
         self.optimizer = torch.optim.Adam(
-            list(self.agent.parameters()) + list(self.vf.parameters()), lr=self.cfg.learning_rate
+            list(self.agent.parameters()) + list(self.vf.parameters()),
+            lr=self.cfg.learning_rate,
         )
 
         self._replay_buffer: list[EpisodeData] = []
@@ -173,10 +174,10 @@ class PPO(nn.Module):
 
         lr_adjustment = total_timesteps / self.cfg.minibatch_size
 
-        actor_out, critic_out, obs_latents_packed = self.agent.forward_both(
+        actor_out, _, obs_latents_packed = self.agent.forward_both(
             mb["observations"], mb["actions"]
         )
-        critic_out2 = self.vf(obs_latents_packed)
+        critic_out = self.vf(obs_latents_packed)
         log_prob = -actor_out
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
@@ -200,36 +201,18 @@ class PPO(nn.Module):
         pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
 
         disc_returns = pack_tensors_check(mb["discounted_returns"], adv_len)
-        if self.cfg.vf_clip_ratio:
-            # This clipping logic matches the logic from Tianshou
-            # But it isn't scale invariant, so it's probably wrong?
-            # Maybe it's fine with reward scaling? But the return scale still
-            # depends on the discount even with reward norm?
-            # TODO(krzentner): Compare to paper: arXiv:1811.02553v3 Sec. 4.1
-            diff = (critic_out - mb["vf_returns"]).clamp(
-                -self.cfg.vf_clip_ratio, self.cfg.vf_clip_ratio
-            )
-            v_clip = mb["vf_returns"] + diff
-            vf_loss_1 = (disc_returns - critic_out) ** 2
-            vf_loss_2 = (disc_returns - v_clip) ** 2
-            # Mean *after* taking max over each element
-            vf_loss = torch.max(vf_loss_1, vf_loss_2).mean()
-        else:
-            vf_loss = F.mse_loss(critic_out, disc_returns)
-
-        vf_loss2 = F.mse_loss(critic_out2, disc_returns)
+        vf_loss = F.mse_loss(critic_out, disc_returns)
 
         self.log_training(
             mb,
             dict(
                 clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
-                mb_ev=outrl.nn.explained_variance(critic_out, disc_returns),
+                mb_ev=explained_variance(critic_out, disc_returns),
             )
             | locals(),
         )
 
-        loss = (pi_loss + self.cfg.vf_loss_coeff * vf_loss +
-                self.cfg.vf_loss_coeff * vf_loss2)
+        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
         return loss * lr_adjustment
 
     def train_step(self):
@@ -291,10 +274,11 @@ class PPO(nn.Module):
                     "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
                     "disc_mean": discounted_returns.mean(),
                     "vf_mean": vf_returns.mean(),
-                    "ev": outrl.nn.explained_variance(
+                    "ev": explained_variance(
                         vf_returns,
                         discounted_returns,
                     ),
+                    "total_env_steps": self.total_env_steps,
                 },
                 level=stick.RESULTS,
             )
@@ -321,11 +305,6 @@ class PPO(nn.Module):
     def preprocess(self):
         terminated = [data.terminated for data in self._replay_buffer]
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
-        padded_actions = pad_tensors(
-            [data.episode["rewards"] for data in self._replay_buffer]
-        )
-        if padded_actions.var() == 0:
-            warnings.warn("Action variance is zero")
 
         assert self.cfg.steps_per_epoch <= sum(episode_lengths)
         if self.cfg.max_episode_length:
@@ -339,25 +318,12 @@ class PPO(nn.Module):
             )
             assert upper_bound >= sum(episode_lengths)
 
-        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
-        padded_obs = pad_tensors(
-            [
-                data.episode["observations"].to(dtype=torch.float32)
-                for data in self._replay_buffer
-            ]
-        )
         padded_obs = pad_tensors(
             [data.episode["observations"] for data in self._replay_buffer]
         )
-        packed_obs = pack_tensors_check(unpad_tensors(padded_obs, obs_lens), obs_lens)
-
-        self.obs_normalizer.update(packed_obs)
-        if self.cfg.norm_observations:
-            padded_obs = self.reward_normalizer.normalize_batch(padded_obs)
 
         # Compute vf_returns, filter based on episode termination
         with torch.no_grad():
-            # vf_returns = self.agent.vf_forward(padded_obs)
             vf_returns = self.vf(self.agent.shared_layers(padded_obs))
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
