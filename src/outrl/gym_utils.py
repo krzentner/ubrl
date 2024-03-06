@@ -22,6 +22,7 @@ class GymActor(nn.Module):
         self,
         env: "GymEnv",
         hidden_sizes: list[int],
+        pi_hidden_sizes: list[int],
     ):
         super().__init__()
 
@@ -35,6 +36,8 @@ class GymActor(nn.Module):
                 hidden_sizes=hidden_sizes,
             ),
         )
+
+        self.pi_layers = make_mlp(input_size=hidden_sizes[-1], hidden_sizes=pi_hidden_sizes)
 
         self.dtype = torch.float32
         self.device = "cpu"
@@ -101,17 +104,18 @@ class GymBoxActor(GymActor):
         self,
         env: "GymEnv",
         hidden_sizes: list[int],
+        pi_hidden_sizes: list[int],
         init_std: float = 0.5,
         min_std: float = 1e-6,
     ):
-        super().__init__(env, hidden_sizes=hidden_sizes)
+        super().__init__(env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes)
 
         self.action_mean = nn.Linear(
-            hidden_sizes[-1], flatten_shape(env.action_space.shape)
+            pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
         )
 
         self.action_logstd = nn.Linear(
-            hidden_sizes[-1], flatten_shape(env.action_space.shape)
+            pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
         )
         nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std).log().item())
         self.min_std = min_std
@@ -120,9 +124,10 @@ class GymBoxActor(GymActor):
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.distributions.Distribution]:
         observation_latents = self.shared_layers(as_2d(obs))
-        mean = self.action_mean(observation_latents)
+        pi_x = self.pi_layers(observation_latents)
+        mean = self.action_mean(pi_x)
         std = torch.clamp(
-            self.action_logstd(observation_latents).exp(), min=self.min_std
+            self.action_logstd(pi_x).exp(), min=self.min_std
         )
         dist = torch.distributions.Normal(mean, std)
         return observation_latents, dist
@@ -133,32 +138,34 @@ class GymBoxCategorialActor(GymActor):
         self,
         env: "GymEnv",
         hidden_sizes: list[int],
+        pi_hidden_sizes: list[int],
     ):
-        super().__init__(env, hidden_sizes=hidden_sizes)
+        super().__init__(env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes)
 
         self.action_logits = nn.Linear(
-            hidden_sizes[-1], flatten_shape(env.action_space.shape)
+            pi_hidden_sizes[-1], env.action_space.n
         )
 
     def _run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.distributions.Distribution]:
         observation_latents = self.shared_layers(as_2d(obs))
-        action_logits = self.action_logits(observation_latents)
+        pi_x = self.pi_layers(observation_latents)
+        action_logits = self.action_logits(pi_x)
         dist = torch.distributions.Categorical(logits=action_logits)
         return observation_latents, dist
 
 
-def make_gym_actor(env, hidden_sizes, **kwargs):
+def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
     while isinstance(env, list):
         env = env[0]
     act_space = type(env.action_space).__name__
     obs_space = type(env.observation_space).__name__
 
     if obs_space == "Box" and act_space == "Box":
-        return GymBoxActor(env, hidden_sizes, **kwargs)
+        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, **kwargs)
     elif obs_space == "Box" and act_space == "Discrete":
-        return GymBoxCategorialActor(env, hidden_sizes, **kwargs)
+        return GymBoxCategorialActor(env, hidden_sizes, pi_hidden_sizes, **kwargs)
     else:
         raise NotImplementedError(
             f"No GymActor for observation_space={env.observation_space}, "

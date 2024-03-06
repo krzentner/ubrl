@@ -29,8 +29,9 @@ from outrl.torch_utils import (
     pad_tensors,
     unpad_tensors,
     explained_variance,
+    unpack_tensors,
 )
-from outrl.gym_utils import collect
+from outrl.gym_utils import collect, make_gym_actor
 from outrl.stochastic_mlp_agent import StochasticMLPAgent
 
 
@@ -145,7 +146,9 @@ class PPO(nn.Module):
             action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[action_type],
         )
 
-        self.observation_latent_size = self.agent.observation_latent_size
+        self.new_agent = make_gym_actor(self.envs[0], self.cfg.preprocess_hidden_sizes, self.cfg.pi_hidden_sizes)
+
+        self.observation_latent_size = self.new_agent.observation_latent_size
 
         self.vf = make_mlp(
             input_size=self.observation_latent_size,
@@ -156,7 +159,7 @@ class PPO(nn.Module):
         self.reward_normalizer = RunningMeanVar()
 
         self.optimizer = torch.optim.Adam(
-            list(self.agent.parameters()) + list(self.vf.parameters()),
+            list(self.agent.parameters()) + list(self.vf.parameters()) + list(self.new_agent.parameters()),
             lr=self.cfg.learning_rate,
         )
 
@@ -174,9 +177,11 @@ class PPO(nn.Module):
 
         lr_adjustment = total_timesteps / self.cfg.minibatch_size
 
-        actor_out, _, obs_latents_packed = self.agent.forward_both(
+        actor_out, _, obs_latents_packed_old = self.agent.forward_both(
             mb["observations"], mb["actions"]
         )
+        agent_outputs = self.new_agent(mb["episodes"])
+        obs_latents_packed, obs_lens = pack_tensors([agent_out.observation_latents[:-1] for agent_out in agent_outputs])
         critic_out = self.vf(obs_latents_packed)
         log_prob = -actor_out
         minibatch_size = sum(adv_len)
@@ -220,6 +225,8 @@ class PPO(nn.Module):
         packed_data["length"] = torch.as_tensor(lengths)
         dataset = DictDataset(packed_data)
         self.log_dataset(dataset)
+        self.new_agent.train(mode=True)
+        self.vf.train(mode=True)
         for mb in tqdm(
             dataset.episode_minibatches(self.cfg.minibatch_size, drop_last=False)
         ):
@@ -238,6 +245,8 @@ class PPO(nn.Module):
                 # This seems to only trigger if the batch is so small the loss
                 # is nan or so big we OOM
                 warnings.warn(ex)
+        self.new_agent.train(mode=False)
+        self.vf.train(mode=False)
 
     def log_training(
         self, mb: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
@@ -318,13 +327,23 @@ class PPO(nn.Module):
             )
             assert upper_bound >= sum(episode_lengths)
 
+        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
         padded_obs = pad_tensors(
             [data.episode["observations"] for data in self._replay_buffer]
         )
 
         # Compute vf_returns, filter based on episode termination
+        self.new_agent.train(mode=False)
+        self.vf.train(mode=False)
         with torch.no_grad():
-            vf_returns = self.vf(self.agent.shared_layers(padded_obs))
+            agent_outputs = self.new_agent([data.episode for data in self._replay_buffer])
+            obs_latents_packed = pack_tensors_check([agent_out.observation_latents for agent_out in agent_outputs], obs_lens)
+            # vf_returns = self.vf(self.agent.shared_layers(padded_obs))
+            vf_returns_packed = self.vf(obs_latents_packed)
+        self.new_agent.train(mode=True)
+        self.vf.train(mode=True)
+
+        vf_returns = pad_tensors(unpack_tensors(vf_returns_packed, obs_lens))
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
             episode_length = episode_lengths[i]

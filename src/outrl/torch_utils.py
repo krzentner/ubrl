@@ -401,6 +401,8 @@ class DictDataset:
         else:
             assert len(kwargs) == 0
             self.elements = elements
+        # Check length consistencies
+        assert len(self) > 0
 
     def __len__(self):
         length = len(next(iter(self.elements.values())))
