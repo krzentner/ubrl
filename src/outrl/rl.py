@@ -1,6 +1,6 @@
 from dataclasses import dataclass, replace
 from textwrap import dedent
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar, Generator
 import copy
 import os
 import random
@@ -36,6 +36,8 @@ from outrl.torch_utils import (
     RunningMeanVar,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
+
+T = TypeVar("T")
 
 
 @dataclass(eq=False)
@@ -161,11 +163,6 @@ class TrainerConfig(Config):
     normalize_rewards: bool = tunable(True, CategoricalDistribution([True, False]))
     """Normalize rewards to have zero mean and unit variance."""
 
-    normalize_minibatch_advantages: bool = tunable(
-        False, CategoricalDistribution([True, False])
-    )
-    """Normalize advantages of each minibatch."""
-
     # TODO: Add cosine schedule, etc.
     # TODO: Implement policy LR scheduling.
     actor_lr_schedule: str = tunable(
@@ -225,12 +222,26 @@ class TrainerConfig(Config):
         False, CategoricalDistribution([True, False])
     )
 
+    grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e3, log=True))
+
     def fill_defaults(self):
         """Fill in values with non-constant defaults. Called after construction."""
         if self.seed < -1:
             raise ValueError("seed should be positive or exactly -1")
         log_dir = os.path.abspath(self.log_dir)
         return replace(self, log_dir=log_dir)
+
+
+@dataclass
+class PolicyTrainingInputs:
+    """Values used to train the policy that are not present in EpisodeData.
+
+    An instance of this class accompanies each EpisodeData during policy optimization.
+
+    These values are recomputed every train_step()."""
+
+    advantages: torch.Tensor
+    vf_targets: torch.Tensor
 
 
 class Trainer(nn.Module):
@@ -265,17 +276,16 @@ class Trainer(nn.Module):
 
         self.last_training_stats = {}
 
-    def _loss_function(self, mb: dict[str, list[torch.Tensor]]) -> torch.Tensor:
-        advantages, adv_len = pack_tensors(mb["advantages"])
-        if self.cfg.normalize_minibatch_advantages:
-            advantages -= advantages.mean()
-            advantages /= advantages.std()
+    def _loss_function(self, mb: dict[str, list[Any]]) -> torch.Tensor:
+        episode_data: list[EpisodeData] = mb["episode_data"]
+        train_inputs: list[PolicyTrainingInputs] = mb["train_inputs"]
 
-        this_minibatch_size = sum(adv_len)
+        episodes = [data.episode for data in episode_data]
+        agent_outputs = self.agent(episodes)
 
-        lr_adjustment = this_minibatch_size / self.cfg.minibatch_size
+        advantages, adv_len = pack_tensors([train_input.advantages
+                                            for train_input in train_inputs])
 
-        agent_outputs = self.agent(mb["episodes"])
         obs_latents_packed = pack_tensors_check(
             [agent_out.observation_latents[:-1] for agent_out in agent_outputs], adv_len
         )
@@ -286,9 +296,10 @@ class Trainer(nn.Module):
         log_prob = action_ll_packed
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = pack_tensors_check(mb["original_action_lls"], adv_len)
+        old_log_prob = pack_tensors_check([data.original_action_lls for data in episode_data],
+                                          adv_len)
         assert old_log_prob.shape == (minibatch_size,)
-        assert not old_log_prob.grad_fn
+        assert not old_log_prob.requires_grad
 
         ratio = torch.exp(log_prob - old_log_prob)
         ratio_clipped = torch.clamp(
@@ -303,33 +314,110 @@ class Trainer(nn.Module):
         assert policy_gradient.shape == (minibatch_size,)
         assert clip_policy_gradient.shape == (minibatch_size,)
 
-        pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
+        pi_loss = -torch.min(policy_gradient, clip_policy_gradient).sum() / self.cfg.minibatch_size
 
-        disc_returns = pack_tensors_check(mb["discounted_returns"], adv_len)
-        vf_loss = F.mse_loss(critic_out, disc_returns)
+        vf_targets = pack_tensors_check([train_input.vf_targets for train_input in train_inputs], adv_len)
+        vf_loss = F.mse_loss(critic_out, vf_targets, reduction='sum') / self.cfg.minibatch_size
+
+        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
 
         self.log_training(
-            mb,
             dict(
                 clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
-                mb_ev=explained_variance(critic_out, disc_returns),
+                mb_ev=explained_variance(critic_out, vf_targets),
             )
             | locals(),
         )
+        return loss
 
-        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
-        return loss * lr_adjustment
+    def _minibatch(
+        self, episodes: list[EpisodeData], extra_data: list[T], max_minibatch_size: Optional[int] = None, desc: Optional[str] = None, epochs: int = 1, shuffle: bool = False,
+    ) -> Generator[list[tuple[EpisodeData, T, ActorOutput]], None, None]:
+        """Split a large number of episodes into batches to avoid out of memory error.
+
+        Yields: list[tuple[EpisodeData, ForwardResult]]
+        """
+
+        assert len(extra_data) == len(episodes)
+
+        if shuffle:
+            shuffled_indices = torch.randperm(len(episodes))
+            episodes = [episodes[i] for i in shuffled_indices]
+            extra_data = [extra_data[i] for i in shuffled_indices]
+
+        if max_minibatch_size is None:
+            max_minibatch_size = 2**32
+
+        with tqdm(
+            total=epochs * sum([ep.num_timesteps for ep in episodes]), desc=desc
+        ) as pbar:
+            for _ in range(epochs):
+                next_ep_index = 0
+                while next_ep_index < len(episodes):
+                    start_batch_ep_index = next_ep_index
+                    batch = []
+                    num_batch_steps = 0
+                    # Accumulate episodes into batch until we run out of space
+                    while next_ep_index < len(episodes) and (
+                        self.cfg.max_timesteps_per_forward is None
+                        or num_batch_steps + episodes[next_ep_index].num_timesteps
+                        <= min(max_minibatch_size, self.cfg.max_timesteps_per_forward)
+                    ):
+                        batch.append((episodes[next_ep_index], extra_data[next_ep_index]))
+                        num_batch_steps += episodes[next_ep_index].num_timesteps
+                        next_ep_index += 1
+
+                    if len(batch) == 0:
+                        # We can't fit even a single forward pass in memory!
+                        # Crash in this case (maybe the user can decrease the episode
+                        # length, decrease the model size, enable gradient
+                        # checkpointing / implement BPT, or buy a bigger GPU).
+                        ep_steps = episodes[next_ep_index].num_timesteps
+                        max_steps = self.cfg.max_timesteps_per_forward
+                        raise RuntimeError(
+                            dedent(
+                                f"""\
+                            Cannot run .forward() on episode of length:
+                            f{ep_steps} > f{max_steps} = cfg.max_timesteps_per_forward
+                            Increase cfg.max_timesteps_per_forward, decrease model size,
+                            or find another way of increasing available memory.
+                            """
+                            )
+                        )
+
+                    try:
+                        forward_result = self.actor([data[0].episode for data in batch])
+                        pbar.update(sum([data[0].num_timesteps for data in batch]))
+                        yield [(data[0], data[1], f_res) for (data, f_res) in zip(batch, forward_result)]
+                    except RuntimeError as ex:
+                        if "Cannot allocate memory" not in str(ex):
+                            raise ex
+                        # Decrease to just one below the current size, which will
+                        # prevent the last episode from being in the batch.
+                        # This avoids dropping the max_timesteps_per_forward too low
+                        # from one unusually large trailing episode.
+                        # Note that this may still decrease by a large number of steps
+                        # (or set max_timesteps_per_forward when it was previously
+                        # None).
+                        self.cfg.max_timesteps_per_forward = num_batch_steps - 1
+                        warnings.warn(
+                            f"Decreasing cfg.max_timesteps_per_forward to "
+                            f"{self.cfg.max_timesteps_per_forward}",
+                        )
+                        # Retry the batch
+                        next_ep_index = start_batch_ep_index
 
     def train_step(self):
-        packed_data, lengths = self.preprocess()
-        packed_data["length"] = torch.as_tensor(lengths)
-        dataset = DictDataset(packed_data)
+        data, train_inputs = self.preprocess()
+        data["train_inputs"] = train_inputs
+        data["episode_data"] = self._replay_buffer
+        dataset = DictDataset(data)
         self.log_dataset(dataset)
         self.agent.train(mode=True)
         self.vf.train(mode=True)
         with tqdm(
             desc="train_step",
-            total=packed_data["length"].sum().item()
+            total=data["length"].sum().item()
             * self.cfg.policy_epochs_per_train_step,
         ) as pbar:
             for _ in range(self.cfg.policy_epochs_per_train_step):
@@ -342,11 +430,11 @@ class Trainer(nn.Module):
                     try:
                         clip_grad_norm_(
                             self.agent.parameters(),
-                            max_norm=10.0,
+                            max_norm=self.cfg.grad_norm_max,
                             error_if_nonfinite=True,
                         )
                         clip_grad_norm_(
-                            self.vf.parameters(), max_norm=10.0, error_if_nonfinite=True
+                            self.vf.parameters(), max_norm=self.cfg.grad_norm_max, error_if_nonfinite=True
                         )
                         self.optimizer.step()
                     except RuntimeError as ex:
@@ -361,20 +449,15 @@ class Trainer(nn.Module):
         self._replay_buffer = []
 
     def log_training(
-        self, mb: dict[str, torch.Tensor], train_locals: dict[str, torch.Tensor]
+        self, train_locals: dict[str, Any]
     ):
         training_stats = {
             k: train_locals[k].item()
             for k in ["vf_loss", "pi_loss", "mb_ev", "clip_portion"]
         }
 
-        training_stats["lr_adjustment"] = train_locals["lr_adjustment"]
         training_stats["ratio"] = train_locals["ratio"]
-
-        training_stats["average_timestep_reward"] = (
-            pack_tensors(mb["rewards"])[0].mean().item()
-        )
-        training_stats["disc_mean"] = train_locals["disc_returns"].mean()
+        training_stats["vf_targets_mean"] = train_locals["vf_targets"].mean()
         training_stats["critic_out_mean"] = train_locals["critic_out"].mean()
 
         self.last_training_stats = training_stats
@@ -408,12 +491,11 @@ class Trainer(nn.Module):
             )
 
     def preprocess(self):
-        terminated = [data.terminated for data in self._replay_buffer]
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
-
         obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
+        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
 
-        # Compute vf_returns, filter based on episode termination
+        # Compute vf_returns
         self.agent.train(mode=False)
         self.vf.train(mode=False)
         with torch.no_grad():
@@ -428,20 +510,14 @@ class Trainer(nn.Module):
         vf_returns = pad_tensors(unpack_tensors(vf_returns_packed, obs_lens))
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
-            episode_length = episode_lengths[i]
-            # Everything after last valid observation should be empty
-            vf_returns[i, episode_length + 1 :] = 0.0
+            # Everything after last valid observation should have been padded to zero
+            assert (vf_returns[i, episode_length + 1 :] == 0.0).all()
+
             # zero vf_{t+1} in terminated episodes
-            if terminated[i]:
+            if self._replay_buffer[i].terminated:
                 vf_returns[i, episode_length] = 0.0
-            else:
-                assert vf_returns[i, episode_length] != 0
 
         padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
-        packed_rewards = pack_tensors_check(
-            unpad_tensors(padded_rewards, episode_lengths), episode_lengths
-        )
-        self.reward_normalizer.update(packed_rewards)
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
@@ -457,11 +533,19 @@ class Trainer(nn.Module):
 
         discounted_returns = discount_cumsum(padded_rewards, discount=discount)
 
+        train_inputs = [
+            PolicyTrainingInputs(advantages=adv, vf_targets=disc_ret)
+            for (adv, disc_ret) in zip(unpad_tensors(advantages, episode_lengths),
+                                       unpad_tensors(discounted_returns, episode_lengths))
+        ]
+        assert len(train_inputs) == len(self._replay_buffer)
+        assert [len(train_input.advantages) for train_input in train_inputs] == episode_lengths
+        assert [len(train_input.vf_targets) for train_input in train_inputs] == episode_lengths
+
         padded_data = {
             "vf_returns": vf_returns[:, :-1],
             "advantages": advantages,
             "discounted_returns": discounted_returns,
-            "valid_rewards": padded_rewards,
         }
         episode_data = {
             k: unpad_tensors(b, episode_lengths) for (k, b) in padded_data.items()
@@ -471,13 +555,8 @@ class Trainer(nn.Module):
         ]
         episode_data["rewards"] = [data.rewards for data in self._replay_buffer]
         episode_data["episodes"] = [data.episode for data in self._replay_buffer]
-        episode_data["observations"] = [
-            data.episode["observations"][:-1] for data in self._replay_buffer
-        ]
-        episode_data["actions"] = [
-            data.episode["actions"] for data in self._replay_buffer
-        ]
-        return episode_data, episode_lengths
+        episode_data["length"] = torch.as_tensor(episode_lengths)
+        return episode_data, train_inputs
 
     def add_episode(
         self,
