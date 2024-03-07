@@ -10,7 +10,7 @@ from tqdm import tqdm
 import stick
 from outrl.gym_utils import make_gym_actor, collect, episode_stats
 from outrl.rl import Trainer, TrainerConfig
-from outrl.config import Config, ExperimentInvocation
+from outrl.config import ExperimentInvocation, tunable, IntListDistribution
 
 
 @dataclass
@@ -19,15 +19,34 @@ class GymConfig(TrainerConfig):
     n_envs: int = 10
     max_episode_length: int = 200
     episodes_per_train_step: int = 30
-    encoder_hidden_sizes: tuple[int, ...] = (64, 64)
-    pi_hidden_sizes: tuple[int, ...] = (64, 64)
+    encoder_hidden_sizes: list[int] = tunable(
+        [64, 64],
+        IntListDistribution(
+            [
+                16,
+            ],
+            [256, 256, 256],
+        ),
+    )
+    pi_hidden_sizes: list[int] = tunable(
+        [64, 64],
+        IntListDistribution(
+            [
+                16,
+            ],
+            [256, 256, 256],
+        ),
+    )
+
     n_train_steps: int = 5000
-    train_steps_per_eval: int = 5
+    train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
     def fill_defaults(self):
         return replace(
-            super().fill_defaults(), max_buffer_episodes=self.episodes_per_train_step
+            super().fill_defaults(),
+            max_buffer_episodes=self.episodes_per_train_step,
+            expected_train_steps=self.n_train_steps,
         )
 
 

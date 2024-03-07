@@ -518,3 +518,24 @@ def concat(elements):
             return torch.cat(elements)
     else:
         return elements
+
+
+class NOPLRScheduler(torch.optim.lr_scheduler.LRScheduler):
+    def get_lr(self):
+        return [group["lr"] for group in self.optimizer.param_groups]
+
+    def _get_closed_form_lr(self):
+        return list(self.base_lrs)
+
+
+def make_scheduler(
+    opt, name: Optional[str], start: float, end: float, expected_steps: int
+) -> torch.optim.lr_scheduler.LRScheduler:
+    if name is None:
+        return NOPLRScheduler(opt)
+    elif name == "linear":
+        return torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=1.0, end_factor=end / start, total_iters=expected_steps
+        )
+    else:
+        raise NotImplementedError(f"LR scheduling of type {name} is not implemented")

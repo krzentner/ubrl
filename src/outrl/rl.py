@@ -31,6 +31,7 @@ from outrl.torch_utils import (
     explained_variance,
     unpack_tensors,
     RunningMeanVar,
+    make_scheduler,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
 
@@ -165,6 +166,9 @@ class TrainerConfig(Config):
     normalize_rewards: bool = tunable(True, CategoricalDistribution([True, False]))
     """Normalize rewards to have zero mean and unit variance."""
 
+    expected_train_steps: int = 1000
+    """Expected number of training steps. Used for controlling scheduled parameters."""
+
     # TODO: Add cosine schedule, etc.
     # TODO: Implement policy LR scheduling.
     actor_lr_schedule: str = tunable(
@@ -172,18 +176,22 @@ class TrainerConfig(Config):
     )
     actor_lr_start: float = tunable(1e-3, FloatDistribution(1e-6, 1e-2, log=True))
     actor_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
+
     actor_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
     actor_grad_max_norm: float = tunable(1.0, FloatDistribution(0.01, 10.0, log=True))
+
     actor_clip_ratio: float = tunable(0.2, FloatDistribution(1e-3, 10.0, log=True))
 
     # TODO: Implement VF LR scheduling.
     vf_lr_schedule: str = tunable("linear", CategoricalDistribution([None, "linear"]))
-    vf_lr_start: float = tunable(3e-4, FloatDistribution(1e-6, 1e-2, log=True))
+    vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-6, 1e-2, log=True))
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
+
     vf_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
-    vf_grad_max_norm: float = tunable(1.0, FloatDistribution(0.01, 10.0, log=True))
-    vf_minibatch_size: int = tunable(512, IntDistribution(16, 10000))
-    vf_training_epochs: int = tunable(5, IntDistribution(1, 100))
+
+    vf_minibatch_size: int = tunable(512, IntDistribution(1, 2**32, log=True))
+    vf_pre_training_epochs: int = tunable(0, IntDistribution(0, 100))
+    vf_post_training_epochs: int = tunable(0, IntDistribution(0, 100))
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
@@ -266,16 +274,38 @@ class Trainer(nn.Module):
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
         self.reward_normalizer = RunningMeanVar()
-
-        self.optimizer = torch.optim.Adam(
-            list(self.vf.parameters()) + list(self.agent.parameters()),
+        self.actor_optimizer = torch.optim.Adam(
+            self.agent.parameters(),
             lr=self.cfg.actor_lr_start,
+            weight_decay=self.cfg.actor_weight_decay,
+        )
+        self.actor_lr_scheduler = make_scheduler(
+            self.actor_optimizer,
+            self.cfg.actor_lr_schedule,
+            self.cfg.actor_lr_start,
+            self.cfg.actor_lr_end,
+            self.cfg.expected_train_steps,
+        )
+
+        self.vf_optimizer = torch.optim.Adam(
+            self.vf.parameters(),
+            lr=self.cfg.vf_lr_start,
+            weight_decay=self.cfg.vf_weight_decay,
+        )
+        self.vf_lr_scheduler = make_scheduler(
+            self.vf_optimizer,
+            self.cfg.vf_lr_schedule,
+            self.cfg.vf_lr_start,
+            self.cfg.vf_lr_end,
+            self.cfg.expected_train_steps,
         )
 
         self._replay_buffer: list[EpisodeData] = []
-        self.total_env_steps: int = 0
         self._next_episode_number: int = 0
         self._dtype = torch.float32
+
+        self.total_env_steps: int = 0
+        self.train_steps_so_far: int = 0
 
         self.last_training_stats = {}
 
@@ -446,7 +476,8 @@ class Trainer(nn.Module):
             minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
         ):
             loss = self._loss_function(batch)
-            self.optimizer.zero_grad()
+            self.vf_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad()
             loss.backward()
             try:
                 clip_grad_norm_(
@@ -459,15 +490,19 @@ class Trainer(nn.Module):
                     max_norm=self.cfg.grad_norm_max,
                     error_if_nonfinite=True,
                 )
-                self.optimizer.step()
+                self.vf_optimizer.step()
+                self.actor_optimizer.step()
             except RuntimeError as ex:
                 # This seems to only trigger if the batch is so small the loss
                 # is nan or so big we OOM
                 warnings.warn(ex)
+        self.actor_lr_scheduler.step()
+        self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
         self.vf.train(mode=False)
         stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
         self._replay_buffer = []
+        self.train_steps_so_far += 1
 
     def log_training(self, train_locals: dict[str, Any]):
         training_stats = {
