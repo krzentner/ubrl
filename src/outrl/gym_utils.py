@@ -39,8 +39,9 @@ class GymActor(nn.Module):
             ),
         )
 
-        self.pi_layers = make_mlp(input_size=hidden_sizes[-1],
-                                  hidden_sizes=pi_hidden_sizes, use_dropout=False)
+        self.pi_layers = make_mlp(
+            input_size=hidden_sizes[-1], hidden_sizes=pi_hidden_sizes, use_dropout=False
+        )
 
         self.dtype = torch.float32
         self.device = "cpu"
@@ -67,9 +68,11 @@ class GymActor(nn.Module):
             )
         action = maybe_sample(dist, best_action)
         action_ll = dist.log_prob(action)
-        infos.update({
-            "action_ll": action_ll,
-        })
+        infos.update(
+            {
+                "action_ll": action_ll,
+            }
+        )
         return np.asarray(action), infos
 
     def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[ActorOutput]:
@@ -109,7 +112,9 @@ class GymBoxActor(GymActor):
         init_std: float = 0.5,
         min_std: float = 1e-6,
     ):
-        super().__init__(env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes)
+        super().__init__(
+            env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes
+        )
 
         self.action_mean = nn.Linear(
             pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
@@ -119,8 +124,9 @@ class GymBoxActor(GymActor):
             pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
         )
         nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std).log().item())
-        nn.init.orthogonal_(self.action_logstd.weight,
-                            gain=torch.tensor(init_std).log().item())
+        nn.init.orthogonal_(
+            self.action_logstd.weight, gain=torch.tensor(init_std).log().item()
+        )
         nn.init.zeros_(self.action_logstd.weight)
         nn.init.zeros_(self.action_mean.bias)
         self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
@@ -132,15 +138,17 @@ class GymBoxActor(GymActor):
         observation_latents = self.shared_layers(as_2d(obs))
         pi_x = self.pi_layers(observation_latents)
         mean = self.action_mean(pi_x)
-        std = torch.clamp(
-            self.action_logstd(pi_x).exp(), min=self.min_std
-        )
+        std = torch.clamp(self.action_logstd(pi_x).exp(), min=self.min_std)
         dist = torch.distributions.Normal(mean, std)
         dist = torch.distributions.Independent(dist, 1)
-        return observation_latents, dist, {
-            'action_mean': dist.mean.mean(dim=-1),
-            'action_stddev': dist.stddev.mean(dim=-1),
-        }
+        return (
+            observation_latents,
+            dist,
+            {
+                "action_mean": dist.mean.mean(dim=-1),
+                "action_stddev": dist.stddev.mean(dim=-1),
+            },
+        )
 
 
 class GymBoxCategorialActor(GymActor):
@@ -150,11 +158,11 @@ class GymBoxCategorialActor(GymActor):
         hidden_sizes: list[int],
         pi_hidden_sizes: list[int],
     ):
-        super().__init__(env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes)
-
-        self.action_logits = nn.Linear(
-            pi_hidden_sizes[-1], env.action_space.n
+        super().__init__(
+            env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes
         )
+
+        self.action_logits = nn.Linear(pi_hidden_sizes[-1], env.action_space.n)
 
     def _run_net(
         self, obs: torch.Tensor
@@ -164,9 +172,10 @@ class GymBoxCategorialActor(GymActor):
         action_logits = self.action_logits(pi_x)
         dist = torch.distributions.Categorical(logits=action_logits)
         infos = {
-            f'action_{i}_prob': prob for (i, prob) in enumerate(dist.probs.transpose(0, 1))
+            f"action_{i}_prob": prob
+            for (i, prob) in enumerate(dist.probs.transpose(0, 1))
         }
-        assert len(infos['action_0_prob']) == len(dist.probs)
+        assert len(infos["action_0_prob"]) == len(dist.probs)
         return observation_latents, dist, infos
 
 
@@ -189,13 +198,18 @@ def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
 
 def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
     agent_info_keys = episode["agent_infos"][0].keys()
-    agent_infos = {k: concat(agent_i[k] for agent_i in episode["agent_infos"])
-                   for k in agent_info_keys}
+    agent_infos = {
+        k: concat(agent_i[k] for agent_i in episode["agent_infos"])
+        for k in agent_info_keys
+    }
     env_info_keys = episode["env_infos"][0].keys()
-    env_infos = {k: concat(env_i[k] for env_i in episode["env_infos"])
-                   for k in env_info_keys}
+    env_infos = {
+        k: concat(env_i[k] for env_i in episode["env_infos"]) for k in env_info_keys
+    }
 
-    action_lls = torch.stack([agent_i["action_ll"] for agent_i in episode["agent_infos"]])
+    action_lls = torch.stack(
+        [agent_i["action_ll"] for agent_i in episode["agent_infos"]]
+    )
     return {
         "observations": torch.from_numpy(np.array(episode["observations"])),
         "env_infos": env_infos,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from dataclasses import dataclass, replace
+
 try:
     import gymnasium as gym
 except ImportError:
@@ -33,9 +34,10 @@ class GymConfig(TrainerConfig):
 def train(cfg: GymConfig):
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
 
-    actor = make_gym_actor(envs, hidden_sizes=cfg.encoder_hidden_sizes,
-                           pi_hidden_sizes=cfg.pi_hidden_sizes)
-    print('actor', actor)
+    actor = make_gym_actor(
+        envs, hidden_sizes=cfg.encoder_hidden_sizes, pi_hidden_sizes=cfg.pi_hidden_sizes
+    )
+    print("actor", actor)
 
     trainer = Trainer(cfg, actor)
 

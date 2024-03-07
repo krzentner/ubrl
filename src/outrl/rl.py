@@ -161,7 +161,9 @@ class TrainerConfig(Config):
     normalize_rewards: bool = tunable(True, CategoricalDistribution([True, False]))
     """Normalize rewards to have zero mean and unit variance."""
 
-    normalize_minibatch_advantages: bool = tunable(False, CategoricalDistribution([True, False]))
+    normalize_minibatch_advantages: bool = tunable(
+        False, CategoricalDistribution([True, False])
+    )
     """Normalize advantages of each minibatch."""
 
     # TODO: Add cosine schedule, etc.
@@ -274,9 +276,13 @@ class Trainer(nn.Module):
         lr_adjustment = this_minibatch_size / self.cfg.minibatch_size
 
         agent_outputs = self.agent(mb["episodes"])
-        obs_latents_packed = pack_tensors_check([agent_out.observation_latents[:-1] for agent_out in agent_outputs], adv_len)
+        obs_latents_packed = pack_tensors_check(
+            [agent_out.observation_latents[:-1] for agent_out in agent_outputs], adv_len
+        )
         critic_out = self.vf(obs_latents_packed)
-        action_ll_packed = pack_tensors_check([agent_out.action_lls for agent_out in agent_outputs], adv_len)
+        action_ll_packed = pack_tensors_check(
+            [agent_out.action_lls for agent_out in agent_outputs], adv_len
+        )
         log_prob = action_ll_packed
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
@@ -321,15 +327,23 @@ class Trainer(nn.Module):
         self.log_dataset(dataset)
         self.agent.train(mode=True)
         self.vf.train(mode=True)
-        with tqdm(desc="train_step", total=packed_data["length"].sum().item() * self.cfg.policy_epochs_per_train_step) as pbar:
+        with tqdm(
+            desc="train_step",
+            total=packed_data["length"].sum().item()
+            * self.cfg.policy_epochs_per_train_step,
+        ) as pbar:
             for _ in range(self.cfg.policy_epochs_per_train_step):
-                for mb in dataset.episode_minibatches(self.cfg.minibatch_size, drop_last=False):
+                for mb in dataset.episode_minibatches(
+                    self.cfg.minibatch_size, drop_last=False
+                ):
                     loss = self._loss_function(mb)
                     self.optimizer.zero_grad()
                     loss.backward()
                     try:
                         clip_grad_norm_(
-                            self.agent.parameters(), max_norm=10.0, error_if_nonfinite=True
+                            self.agent.parameters(),
+                            max_norm=10.0,
+                            error_if_nonfinite=True,
                         )
                         clip_grad_norm_(
                             self.vf.parameters(), max_norm=10.0, error_if_nonfinite=True
@@ -387,7 +401,8 @@ class Trainer(nn.Module):
                 dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
 
             stick.log(
-                "dataset_stats", dataset_stats,
+                "dataset_stats",
+                dataset_stats,
                 level=stick.RESULTS,
                 step=self.total_env_steps,
             )
@@ -403,7 +418,9 @@ class Trainer(nn.Module):
         self.vf.train(mode=False)
         with torch.no_grad():
             agent_outputs = self.agent([data.episode for data in self._replay_buffer])
-            obs_latents_packed = pack_tensors_check([agent_out.observation_latents for agent_out in agent_outputs], obs_lens)
+            obs_latents_packed = pack_tensors_check(
+                [agent_out.observation_latents for agent_out in agent_outputs], obs_lens
+            )
             vf_returns_packed = self.vf(obs_latents_packed)
         self.agent.train(mode=True)
         self.vf.train(mode=True)
@@ -470,7 +487,7 @@ class Trainer(nn.Module):
         terminated: bool,
         actions_possible: Optional[torch.Tensor] = None,
         sample_priority: float = 1.0,
-        infos: Optional[dict[str, Any]] = None
+        infos: Optional[dict[str, Any]] = None,
     ):
         """Add a new episode to the replay buffer.
 
