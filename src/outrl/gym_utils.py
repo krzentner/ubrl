@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from outrl.rl import ActorOutput
 from outrl.torch_utils import (
+    concat,
     make_mlp,
     flatten_shape,
     as_2d,
@@ -47,7 +48,7 @@ class GymActor(nn.Module):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution]:
+    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
         raise NotImplementedError()
 
     def get_actions(
@@ -59,20 +60,17 @@ class GymActor(nn.Module):
         del reset_mask
         assert len(observations.shape) == 2
         with torch.no_grad():
-            dist = self._run_net(
+            latents, dist, infos = self._run_net(
                 torch.from_numpy(observations)
                 .to(dtype=self.dtype)
                 .to(device=self.device)
-            )[1]
+            )
         action = maybe_sample(dist, best_action)
         action_ll = dist.log_prob(action)
-        action_mean = dist.mean
-        action_stddev = dist.stddev
-        return np.asarray(action), {
+        infos.update({
             "action_ll": action_ll,
-            "action_mean": action_mean,
-            "action_stddev": action_stddev,
-        }
+        })
+        return np.asarray(action), infos
 
     def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[ActorOutput]:
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
@@ -86,7 +84,8 @@ class GymActor(nn.Module):
         )
         actions = actions.to(dtype=self.dtype).to(device=self.device)
         assert action_pack_lens == pack_lens
-        observation_latents, dist = self._run_net(observations)
+        observation_latents, dist, infos = self._run_net(observations)
+        del infos
         observation_latents = unpack_tensors(observation_latents, pack_lens)
         packed_action_ll = dist.log_prob(actions).squeeze(-1)
         action_lls = [
@@ -129,7 +128,7 @@ class GymBoxActor(GymActor):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution]:
+    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
         observation_latents = self.shared_layers(as_2d(obs))
         pi_x = self.pi_layers(observation_latents)
         mean = self.action_mean(pi_x)
@@ -138,7 +137,10 @@ class GymBoxActor(GymActor):
         )
         dist = torch.distributions.Normal(mean, std)
         dist = torch.distributions.Independent(dist, 1)
-        return observation_latents, dist
+        return observation_latents, dist, {
+            'action_mean': dist.mean.mean(dim=-1),
+            'action_stddev': dist.stddev.mean(dim=-1),
+        }
 
 
 class GymBoxCategorialActor(GymActor):
@@ -156,12 +158,16 @@ class GymBoxCategorialActor(GymActor):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution]:
+    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
         observation_latents = self.shared_layers(as_2d(obs))
         pi_x = self.pi_layers(observation_latents)
         action_logits = self.action_logits(pi_x)
         dist = torch.distributions.Categorical(logits=action_logits)
-        return observation_latents, dist
+        infos = {
+            f'action_{i}_prob': prob for (i, prob) in enumerate(dist.probs.transpose(0, 1))
+        }
+        assert len(infos['action_0_prob']) == len(dist.probs)
+        return observation_latents, dist, infos
 
 
 def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
@@ -182,11 +188,18 @@ def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
 
 
 def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    agent_info_keys = episode["agent_infos"][0].keys()
+    agent_infos = {k: concat(agent_i[k] for agent_i in episode["agent_infos"])
+                   for k in agent_info_keys}
+    env_info_keys = episode["env_infos"][0].keys()
+    env_infos = {k: concat(env_i[k] for env_i in episode["env_infos"])
+                   for k in env_info_keys}
+
     action_lls = torch.stack([agent_i["action_ll"] for agent_i in episode["agent_infos"]])
     return {
         "observations": torch.from_numpy(np.array(episode["observations"])),
-        "env_infos": episode["env_infos"],
-        "agent_infos": episode["agent_infos"],
+        "env_infos": env_infos,
+        "agent_infos": agent_infos,
         "actions": torch.from_numpy(np.array(episode["actions"])),
         "rewards": torch.from_numpy(np.array(episode["rewards"])),
         "terminated": any(episode["terminals"]),

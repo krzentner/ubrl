@@ -503,3 +503,18 @@ def average_state_dicts(m1_sd, m2_sd):
         #     out_dict[k] = [
         #     ]
     return out_dict
+
+
+def concat(elements):
+    if isinstance(elements, dict):
+        return {k: concat(v) for (k, v) in elements.items()}
+
+    if not isinstance(elements, list):
+        elements = list(elements)
+    if isinstance(elements[0], torch.Tensor):
+        if not elements[0].shape:
+            return torch.stack(elements)
+        else:
+            return torch.cat(elements)
+    else:
+        return elements

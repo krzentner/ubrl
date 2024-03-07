@@ -19,10 +19,10 @@ from outrl.utils import (
     save_yaml,
     Serializable,
     copy_default,
-    RunningMeanVar,
 )
 from outrl.torch_utils import (
     DictDataset,
+    concat,
     make_mlp,
     pack_tensors,
     pack_tensors_check,
@@ -30,6 +30,7 @@ from outrl.torch_utils import (
     unpad_tensors,
     explained_variance,
     unpack_tensors,
+    RunningMeanVar,
 )
 from outrl.gym_utils import collect, make_gym_actor
 from outrl.stochastic_mlp_agent import StochasticMLPAgent
@@ -76,6 +77,9 @@ class EpisodeData:
     actions_possible: torch.Tensor
     """Boolean actions_possible mask."""
 
+    infos: dict[str, Any]
+    """User infos. Will be logged if possible."""
+
     sample_priority: float = 1.0
     """Priority for sampling episode. Decreased every train_step()."""
 
@@ -116,7 +120,7 @@ class PPOConfig(AlgoConfig):
     epochs_per_policy_step: int = 10
     vf_loss_coeff: float = 0.1
     vf_clip_ratio: Optional[float] = None
-    norm_rewards: bool = False
+    norm_rewards: bool = True
     norm_observations: bool = False
 
 
@@ -176,7 +180,7 @@ class PPO(nn.Module):
 
         ratio = torch.exp(log_prob - old_log_prob)
         ratio_clipped = torch.clamp(
-            ratio, 1 - self.cfg.clip_ratio, 1 + self.cfg.clip_ratio
+            ratio, 1 / (1 + self.cfg.clip_ratio), 1 + self.cfg.clip_ratio
         )
 
         assert ratio.shape == (minibatch_size,)
@@ -241,6 +245,7 @@ class PPO(nn.Module):
         }
 
         training_stats["lr_adjustment"] = train_locals["lr_adjustment"]
+        training_stats["ratio"] = train_locals["ratio"]
 
         training_stats["average_timestep_reward"] = (
             pack_tensors(mb["rewards"])[0].mean().item()
@@ -261,19 +266,23 @@ class PPO(nn.Module):
             0
         ]
         if len(full_episode_rewards):
+            dataset_stats = {
+                "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
+                "disc_mean": discounted_returns.mean(),
+                "vf_mean": vf_returns.mean(),
+                "ev": explained_variance(
+                    vf_returns,
+                    discounted_returns,
+                ),
+                "total_env_steps": self.total_env_steps,
+            }
+            for k in self._replay_buffer[0].infos.keys():
+                dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
+
             stick.log(
-                "dataset_stats",
-                {
-                    "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
-                    "disc_mean": discounted_returns.mean(),
-                    "vf_mean": vf_returns.mean(),
-                    "ev": explained_variance(
-                        vf_returns,
-                        discounted_returns,
-                    ),
-                    "total_env_steps": self.total_env_steps,
-                },
+                "dataset_stats", dataset_stats,
                 level=stick.RESULTS,
+                step=self.total_env_steps,
             )
 
     def collect(self):
@@ -295,6 +304,7 @@ class PPO(nn.Module):
                 action_lls=episode["action_lls"],
                 terminated=episode["terminated"],
                 actions_possible=episode["actions_possible"],
+                infos=episode["env_infos"] | episode["agent_infos"],
             )
 
     def preprocess(self):
@@ -389,6 +399,7 @@ class PPO(nn.Module):
         terminated: bool,
         actions_possible: Optional[torch.Tensor] = None,
         sample_priority: float = 1.0,
+        infos: Optional[dict[str, Any]] = None
     ):
         """Add a new episode to the replay buffer.
 
@@ -419,6 +430,8 @@ class PPO(nn.Module):
 
         rewards = rewards.to(dtype=self._dtype)
         self.reward_normalizer.update(rewards)
+        if infos is None:
+            infos = {}
 
         self._replay_buffer.append(
             EpisodeData(
@@ -430,6 +443,7 @@ class PPO(nn.Module):
                 rewards=rewards,
                 actions_possible=actions_possible,
                 sample_priority=sample_priority,
+                infos=infos,
             )
         )
         self._next_episode_number += 1
