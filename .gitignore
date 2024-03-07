@@ -166,3 +166,4 @@ cython_debug/
 /lightning_logs
 /outputs
 /python*.svg
+/runs

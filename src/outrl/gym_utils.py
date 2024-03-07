@@ -216,6 +216,7 @@ def collect(
     full_episodes_only: bool = True,
     max_episode_length: Optional[int] = None,
 ):
+    actor.train(mode=False)
     n_envs = len(envs)
 
     # Wrap around gym inconsistencies
