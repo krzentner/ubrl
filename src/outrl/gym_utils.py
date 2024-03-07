@@ -34,10 +34,12 @@ class GymActor(nn.Module):
             make_mlp(
                 input_size=obs_dim,
                 hidden_sizes=hidden_sizes,
+                use_dropout=False,
             ),
         )
 
-        self.pi_layers = make_mlp(input_size=hidden_sizes[-1], hidden_sizes=pi_hidden_sizes)
+        self.pi_layers = make_mlp(input_size=hidden_sizes[-1],
+                                  hidden_sizes=pi_hidden_sizes, use_dropout=False)
 
         self.dtype = torch.float32
         self.device = "cpu"
@@ -174,7 +176,7 @@ def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
 
 
 def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
-    action_lls = torch.cat([agent_i["action_ll"] for agent_i in episode["agent_infos"]])
+    action_lls = torch.stack([agent_i["action_ll"] for agent_i in episode["agent_infos"]])
     return {
         "observations": torch.from_numpy(np.array(episode["observations"])),
         "env_infos": episode["env_infos"],

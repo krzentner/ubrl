@@ -115,7 +115,7 @@ def make_mlp(
     hidden_b_init: Initializer = nn.init.zeros_,
     output_w_init: Initializer = nn.init.xavier_normal_,
     output_b_init: Initializer = nn.init.zeros_,
-    add_dropout: bool = True,
+    use_dropout: bool = True,
     layer_normalization: bool = False,
     squeeze_out: bool = False,
 ) -> nn.Sequential:
@@ -123,7 +123,7 @@ def make_mlp(
     prev_size = input_size
     for size in hidden_sizes:
         step_layers = nn.Sequential()
-        if add_dropout:
+        if use_dropout:
             step_layers.add_module("dropout", nn.Dropout())
         if layer_normalization:
             step_layers.add_module("layer_normalization", nn.LayerNorm(prev_size))

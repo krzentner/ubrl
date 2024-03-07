@@ -137,16 +137,9 @@ class PPO(nn.Module):
             action_type = "discrete"
         else:
             raise NotImplementedError(f"Unsupported action space type {act_space}")
-        self.agent = StochasticMLPAgent(
-            observation_shape=self.env_spec.observation_space.shape,
-            action_shape=act_shape,
-            hidden_sizes=self.cfg.preprocess_hidden_sizes,
-            vf_hidden_sizes=self.cfg.vf_hidden_sizes,
-            pi_hidden_sizes=self.cfg.pi_hidden_sizes,
-            action_dist_cons=outrl.dists.DEFAULT_DIST_TYPES[action_type],
-        )
-
         self.new_agent = make_gym_actor(self.envs[0], self.cfg.preprocess_hidden_sizes, self.cfg.pi_hidden_sizes)
+
+        print('new_agent', self.new_agent)
 
         self.observation_latent_size = self.new_agent.observation_latent_size
 
@@ -159,7 +152,7 @@ class PPO(nn.Module):
         self.reward_normalizer = RunningMeanVar()
 
         self.optimizer = torch.optim.Adam(
-            list(self.agent.parameters()) + list(self.vf.parameters()) + list(self.new_agent.parameters()),
+            list(self.vf.parameters()) + list(self.new_agent.parameters()),
             lr=self.cfg.learning_rate,
         )
 
@@ -177,16 +170,15 @@ class PPO(nn.Module):
 
         lr_adjustment = total_timesteps / self.cfg.minibatch_size
 
-        actor_out, _, obs_latents_packed_old = self.agent.forward_both(
-            mb["observations"], mb["actions"]
-        )
         agent_outputs = self.new_agent(mb["episodes"])
         obs_latents_packed, obs_lens = pack_tensors([agent_out.observation_latents[:-1] for agent_out in agent_outputs])
         critic_out = self.vf(obs_latents_packed)
-        log_prob = -actor_out
+        action_ll_packed = pack_tensors_check([agent_out.action_lls for agent_out in agent_outputs], adv_len)
+        # log_prob = -actor_out
+        log_prob = action_ll_packed
         minibatch_size = sum(adv_len)
         assert log_prob.shape == (minibatch_size,)
-        old_log_prob = -pack_tensors_check(mb["original_action_lls"], adv_len)
+        old_log_prob = pack_tensors_check(mb["original_action_lls"], adv_len)
         assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.grad_fn
 
@@ -235,7 +227,7 @@ class PPO(nn.Module):
             loss.backward()
             try:
                 clip_grad_norm_(
-                    self.agent.parameters(), max_norm=10.0, error_if_nonfinite=True
+                    self.new_agent.parameters(), max_norm=10.0, error_if_nonfinite=True
                 )
                 clip_grad_norm_(
                     self.vf.parameters(), max_norm=10.0, error_if_nonfinite=True
@@ -296,12 +288,14 @@ class PPO(nn.Module):
         self.logged_dataset = False
         self._replay_buffer = []
         with torch.no_grad():
+            self.new_agent.train(mode=False)
             collect_res = collect(
                 self.cfg.steps_per_epoch,
                 self.envs,
-                self.agent,
+                self.new_agent,
                 max_episode_length=self.cfg.max_episode_length,
             )
+            self.new_agent.train(mode=True)
         for episode in collect_res:
             self.add_episode(
                 episode,
@@ -338,7 +332,6 @@ class PPO(nn.Module):
         with torch.no_grad():
             agent_outputs = self.new_agent([data.episode for data in self._replay_buffer])
             obs_latents_packed = pack_tensors_check([agent_out.observation_latents for agent_out in agent_outputs], obs_lens)
-            # vf_returns = self.vf(self.agent.shared_layers(padded_obs))
             vf_returns_packed = self.vf(obs_latents_packed)
         self.new_agent.train(mode=True)
         self.vf.train(mode=True)
