@@ -126,17 +126,6 @@ class PPO(nn.Module):
         self.cfg = cfg
         self.envs = envs
 
-        self.env_spec = self.envs[0]
-
-        act_space = self.env_spec.action_space
-        if hasattr(act_space, "low") and hasattr(act_space, "high"):
-            act_shape = act_space.shape
-            action_type = "continuous"
-        elif hasattr(act_space, "n"):
-            act_shape = (act_space.n,)
-            action_type = "discrete"
-        else:
-            raise NotImplementedError(f"Unsupported action space type {act_space}")
         self.new_agent = make_gym_actor(self.envs[0], self.cfg.preprocess_hidden_sizes, self.cfg.pi_hidden_sizes)
 
         print('new_agent', self.new_agent)
@@ -147,7 +136,10 @@ class PPO(nn.Module):
             input_size=self.observation_latent_size,
             hidden_sizes=self.cfg.vf_hidden_sizes,
             output_size=0,
+            use_dropout=True,
         )
+        vf_output = self.vf.get_submodule("output_linear")
+        vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
         self.reward_normalizer = RunningMeanVar()
 

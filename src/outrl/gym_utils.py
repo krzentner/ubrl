@@ -120,6 +120,11 @@ class GymBoxActor(GymActor):
             pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
         )
         nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std).log().item())
+        nn.init.orthogonal_(self.action_logstd.weight,
+                            gain=torch.tensor(init_std).log().item())
+        nn.init.zeros_(self.action_logstd.weight)
+        nn.init.zeros_(self.action_mean.bias)
+        self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
         self.min_std = min_std
 
     def _run_net(
@@ -132,6 +137,7 @@ class GymBoxActor(GymActor):
             self.action_logstd(pi_x).exp(), min=self.min_std
         )
         dist = torch.distributions.Normal(mean, std)
+        dist = torch.distributions.Independent(dist, 1)
         return observation_latents, dist
 
 
