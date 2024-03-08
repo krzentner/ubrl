@@ -25,13 +25,6 @@ Shape = Union[int, Tuple[int, ...]]
 Sizes = Union[int, Tuple[int, ...], List[int]]
 
 
-def as_2d(x):
-    x = x.squeeze()
-    if len(x.shape) == 1:
-        x = x.unsqueeze(0)
-    return x
-
-
 def soft_update_model(target_model: nn.Module, source_model: nn.Module, tau: float):
     """Update model parameter of target and source model.
 

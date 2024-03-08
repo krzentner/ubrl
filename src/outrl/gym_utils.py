@@ -10,7 +10,6 @@ from outrl.torch_utils import (
     concat,
     make_mlp,
     flatten_shape,
-    as_2d,
     maybe_sample,
     RunningMeanVar,
     pack_tensors,
@@ -135,7 +134,7 @@ class GymBoxActor(GymActor):
     def _run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
-        observation_latents = self.shared_layers(as_2d(obs))
+        observation_latents = self.shared_layers(obs)
         pi_x = self.pi_layers(observation_latents)
         mean = self.action_mean(pi_x)
         std = torch.clamp(self.action_logstd(pi_x).exp(), min=self.min_std)
@@ -167,7 +166,7 @@ class GymBoxCategorialActor(GymActor):
     def _run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
-        observation_latents = self.shared_layers(as_2d(obs))
+        observation_latents = self.shared_layers(obs)
         pi_x = self.pi_layers(observation_latents)
         action_logits = self.action_logits(pi_x)
         dist = torch.distributions.Categorical(logits=action_logits)

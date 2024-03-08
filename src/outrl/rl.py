@@ -1,6 +1,6 @@
 from dataclasses import dataclass, replace
 from textwrap import dedent
-from typing import Any, Optional, TypeVar, Generator
+from typing import Any, Optional, TypeVar, Generator, Union
 import os
 import random
 import warnings
@@ -163,14 +163,12 @@ class TrainerConfig(Config):
     """Number of times to iterate over all data in replay buffer each time
     train_step() is called."""
 
-    normalize_rewards: bool = tunable(True, CategoricalDistribution([True, False]))
+    normalize_rewards: bool = tunable(False, CategoricalDistribution([True, False]))
     """Normalize rewards to have zero mean and unit variance."""
 
     expected_train_steps: int = 1000
     """Expected number of training steps. Used for controlling scheduled parameters."""
 
-    # TODO: Add cosine schedule, etc.
-    # TODO: Implement policy LR scheduling.
     actor_lr_schedule: str = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
@@ -178,11 +176,9 @@ class TrainerConfig(Config):
     actor_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
 
     actor_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
-    actor_grad_max_norm: float = tunable(1.0, FloatDistribution(0.01, 10.0, log=True))
 
     actor_clip_ratio: float = tunable(0.2, FloatDistribution(1e-3, 10.0, log=True))
 
-    # TODO: Implement VF LR scheduling.
     vf_lr_schedule: str = tunable("linear", CategoricalDistribution([None, "linear"]))
     vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-6, 1e-2, log=True))
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
@@ -253,6 +249,7 @@ class PolicyTrainingInputs:
     advantages: torch.Tensor
     discounted_returns: torch.Tensor
     vf_returns: torch.Tensor
+    vf_targets: torch.Tensor
 
 
 class Trainer(nn.Module):
@@ -309,6 +306,8 @@ class Trainer(nn.Module):
 
         self.last_training_stats = {}
 
+        self._observation_latent_cache: dict[int, torch.Tensor] = {}
+
     def _loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> torch.Tensor:
@@ -351,12 +350,16 @@ class Trainer(nn.Module):
 
         pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
 
+        vf_targets_packed = pack_tensors_check(
+            [train_input.vf_targets for train_input in train_inputs], adv_len
+        )
+        vf_loss = F.mse_loss(critic_out, vf_targets_packed)
+
+        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
+
         discounted_returns = pack_tensors_check(
             [train_input.discounted_returns for train_input in train_inputs], adv_len
         )
-        vf_loss = F.mse_loss(critic_out, discounted_returns)
-
-        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
 
         self.log_training(
             dict(
@@ -527,26 +530,39 @@ class Trainer(nn.Module):
         discounted_returns = pack_tensors_check(
             [train_input.discounted_returns for train_input in train_inputs], vf_lens
         )
-        if len(full_episode_rewards):
-            dataset_stats = {
-                "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
-                "disc_mean": discounted_returns.mean(),
-                "vf_mean": vf_returns.mean(),
-                "ev": explained_variance(
-                    vf_returns,
-                    discounted_returns,
-                ),
-                "total_env_steps": self.total_env_steps,
-            }
-            for k in self._replay_buffer[0].infos.keys():
-                dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
+        vf_targets = pack_tensors_check(
+            [train_input.vf_targets for train_input in train_inputs], vf_lens
+        )
+        dataset_stats = {
+            "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
+            "ev": explained_variance(
+                vf_returns,
+                discounted_returns,
+            ),
+            "disc_mean": discounted_returns.mean(),
+            "vf_mean": vf_returns.mean(),
+            "vf_target_mean": vf_targets.mean(),
+            "total_env_steps": self.total_env_steps,
+        }
+        # for k in self._replay_buffer[0].infos.keys():
+        #     dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
 
-            stick.log(
-                "dataset_stats",
-                dataset_stats,
-                level=stick.RESULTS,
-                step=self.total_env_steps,
-            )
+        stick.log(
+            "dataset_stats",
+            dataset_stats,
+            level=stick.RESULTS,
+            step=self.total_env_steps,
+        )
+
+        for k in self._replay_buffer[0].infos.keys():
+            dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
+
+        stick.log(
+            "dataset_stats_trace",
+            dataset_stats,
+            level=stick.TRACE,
+            step=self.total_env_steps,
+        )
 
     def preprocess(self):
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
@@ -565,6 +581,14 @@ class Trainer(nn.Module):
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
+        action_lls_now = pad_tensors(
+            [agent_out.action_lls for agent_out in agent_outputs]
+        )
+        original_action_lls = pad_tensors(
+            [data.original_action_lls for data in self._replay_buffer]
+        )
+        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
+
         vf_returns = pad_tensors(unpack_tensors(vf_returns_packed, obs_lens))
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
@@ -574,6 +598,7 @@ class Trainer(nn.Module):
             # zero vf_{t+1} in terminated episodes
             if self._replay_buffer[i].terminated:
                 vf_returns[i, episode_length] = 0.0
+                terminated[i] = True
 
         padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
         if self.cfg.normalize_rewards:
@@ -582,23 +607,36 @@ class Trainer(nn.Module):
             rewards_normed = padded_rewards
 
         discount = 1 - self.cfg.discount_inv
-        advantages = compute_advantages(
-            discount=discount,
-            gae_lambda=self.cfg.v_trace_lambda,
-            vf_returns=vf_returns,
+        gammas = discount * torch.ones_like(rewards_normed)
+
+        advantages, vf_targets = v_trace_estimation(
+            lmbda=self.cfg.v_trace_lambda,
+            rho_max=self.cfg.v_trace_rho_max,
+            c_max=self.cfg.v_trace_c_max,
+            gammas=gammas,
+            vf_x=vf_returns,
             rewards=rewards_normed,
+            action_lls=action_lls_now,
+            original_action_lls=original_action_lls,
+            terminated=terminated,
+            episode_lengths=torch.tensor(episode_lengths),
         )
 
         discounted_returns = discount_cumsum(padded_rewards, discount=discount)
 
         train_inputs = [
             PolicyTrainingInputs(
-                advantages=adv, discounted_returns=disc_ret, vf_returns=vf_ret
+                advantages=adv,
+                discounted_returns=disc_ret,
+                vf_returns=vf_ret,
+                vf_targets=vf_target,
             )
-            for (adv, disc_ret, vf_ret) in zip(
+            for (adv, disc_ret, vf_ret, vf_target) in zip(
                 unpad_tensors(advantages, episode_lengths),
                 unpad_tensors(discounted_returns, episode_lengths),
                 unpad_tensors(vf_returns, episode_lengths),
+                unpad_tensors(vf_targets, episode_lengths),
+                # unpad_tensors(discounted_returns, episode_lengths),
             )
         ]
         assert len(train_inputs) == len(self._replay_buffer)
@@ -761,3 +799,95 @@ def discount_cumsum(x: torch.Tensor, discount: float):
     returns = F.conv1d(x_pad, weights, stride=1)
     assert returns.shape == (B, 1, L)
     return returns.squeeze()
+
+
+@torch.jit.script
+def v_trace_estimation(
+    *,
+    lmbda: float,
+    rho_max: float,
+    c_max: float,
+    gammas: torch.Tensor,
+    vf_x: torch.Tensor,
+    rewards: torch.Tensor,
+    action_lls: torch.Tensor,
+    original_action_lls: torch.Tensor,
+    terminated: torch.Tensor,
+    episode_lengths: torch.Tensor,
+):
+    """Calculate value function targets using a V-Trace like estimator.
+
+    Most inputs are 2D tensors.
+    All 2D tensor inputs have batch as first dimension and time as second dimension.
+
+    When rho_max and c_max are set infinitely high (or the data is "completely
+    on-policy"), this function is equivalent to TD(lambda).
+
+    See page 3 of "IMPALA" from https://arxiv.org/abs/1802.01561
+
+    Args:
+        lmbda (float): Lambda parameter that controls the bias-variance tradeoff.
+        rho_max (float): The "VF truncation" importance weight clip.
+        c_max (float): The "trace-cutting" importance weight clip.
+        gammas (torch.Tensor): A 2D tensor of per-timestep discount factors.
+            Used to avoid discounting across states where no action was
+            possible.
+        vf_x (torch.Tensor): A 2D tensor of value function estimates with shape
+            (N, T + 1), where N is the batch dimension (number of episodes) and
+            T is the maximum episode length experienced by the agent. If an
+            episode terminates in fewer than T time steps, the remaining
+            elements in that episode should be set to 0.
+        rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
+            (N, T), where N is the batch dimension (number of episodes) and T
+            is the maximum episode length experienced by the agent.
+        episode_lengths (torch.Tensor) A 1D tensor indicating the episode length.
+        terminated (torch.Tensor): A 1D tensor indicating if the episode
+            ended in a terminal state.
+    Returns:
+        A tuple containing:
+            torch.Tensor: A 2D tensor of estimated advantages.
+            torch.Tensor: A 2D tensor of VF targets.
+
+    """
+    # The paper says to assume rho_max >= c_max, but the math should still work
+    # either way.
+
+    assert len(rewards.shape) == 2
+    n_episodes = rewards.shape[0]
+    max_episode_length = rewards.shape[1]
+    assert vf_x.shape == (n_episodes, max_episode_length + 1)
+    assert action_lls.shape == (n_episodes, max_episode_length)
+    assert original_action_lls.shape == (n_episodes, max_episode_length)
+    assert gammas.shape == (n_episodes, max_episode_length)
+
+    importance_weight = (action_lls - original_action_lls).exp()
+    rho = importance_weight.clamp_max(rho_max)
+
+    # Set gamma = 0 on the last timestep of terminated episodes
+    ep_indices = torch.arange(n_episodes)
+    gammas[ep_indices, episode_lengths - 1] *= (~terminated).to(dtype=gammas.dtype)
+    assert bool(gammas[0, episode_lengths[0] - 1]) == (not terminated[0])
+
+    # Multiply in the lambda term (not present in standard V-Trace, but matches
+    # TD(lambda)).
+    c = lmbda * importance_weight.clamp_max(c_max)
+
+    gamma_c = gammas * c
+
+    delta_V = rho * (rewards + gammas * vf_x[:, 1:] - vf_x[:, :-1])
+
+    # In the paper: v_{s_t} - V(x_t)
+    # Will be modified in-place except for last time index
+    v_diff = torch.zeros_like(vf_x)
+
+    # Can't use reversed in torchscript :(
+    # Start at max_episode_length - 1 and go down to 0
+    for t in range(max_episode_length - 1, -1, -1):
+        # Main V-Trace update
+        v_diff[:, t] = delta_V[:, t] + gamma_c[:, t] * v_diff[:, t + 1]
+
+    v_s = v_diff + vf_x
+
+    # Note the time offset. Can't use v_diff here!
+    advantages = rho * (rewards * gammas * v_s[:, 1:] - vf_x[:, :-1])
+    return advantages, v_s
