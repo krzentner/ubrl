@@ -60,7 +60,7 @@ class GymActor(nn.Module):
         del reset_mask
         assert len(observations.shape) == 2
         with torch.no_grad():
-            latents, dist, infos = self._run_net(
+            _, dist, infos = self._run_net(
                 torch.from_numpy(observations)
                 .to(dtype=self.dtype)
                 .to(device=self.device)

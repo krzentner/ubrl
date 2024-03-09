@@ -53,6 +53,12 @@ class ActorOutput:
     action_lls: torch.Tensor
     """Differentiable log-likelihood of actions taken in the episode."""
 
+    distribution: Optional[torch.distributions.Distribution] = None
+    """Distribution used to generate actions.
+
+    Will be used for the KL penalty if cfg.kl_dist_penalty > 0.
+    """
+
 
 @dataclass(eq=False)
 class EpisodeData:
@@ -834,74 +840,6 @@ class Trainer(nn.Module):
         for k, v in stats.items():
             hparams[k] = v
         log("hparams", hparams, step=self.total_env_steps)
-
-
-@torch.jit.script
-def compute_advantages(
-    *,
-    discount: float,
-    gae_lambda: float,
-    vf_returns: torch.Tensor,
-    rewards: torch.Tensor,
-):
-    """Calculate advantages.
-
-    Advantages are a discounted cumulative sum.
-
-    Calculate advantages using a baseline according to Generalized Advantage
-    Estimation (GAE)
-
-    The discounted cumulative sum can be computed using conv2d with filter.
-    filter:
-        [1, (discount * gae_lambda), (discount * gae_lambda) ^ 2, ...]
-        where the length is same with max_episode_length.
-
-    expected_returns and rewards should have the same shape.
-        expected_returns:
-        [ [b_11, b_12, b_13, ... b_1n],
-          [b_21, b_22, b_23, ... b_2n],
-          ...
-          [b_m1, b_m2, b_m3, ... b_mn] ]
-        rewards:
-        [ [r_11, r_12, r_13, ... r_1n],
-          [r_21, r_22, r_23, ... r_2n],
-          ...
-          [r_m1, r_m2, r_m3, ... r_mn] ]
-
-    Args:
-        discount (float): RL discount factor (i.e. gamma).
-        gae_lambda (float): Lambda, as used for Generalized Advantage
-            Estimation (GAE).
-        vf_returns (torch.Tensor): A 2D tensor of value function
-            estimates with shape (N, T + 1), where N is the batch dimension
-            (number of episodes) and T is the maximum episode length
-            experienced by the agent. If an episode terminates in fewer than T
-            time steps, the remaining elements in that episode should be set to
-            0.
-        rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
-            (N, T), where N is the batch dimension (number of episodes) and T
-            is the maximum episode length experienced by the agent. If an
-            episode terminates in fewer than T time steps, the remaining
-            elements in that episode should be set to 0.
-        episode_lengths (torch.Tensor): A 1D vector of episode lengths.
-    Returns:
-        torch.Tensor: A 2D vector of calculated advantage values with shape
-            (N, T), where N is the batch dimension (number of episodes) and T
-            is the maximum episode length experienced by the agent. If an
-            episode terminates in fewer than T time steps, the remaining values
-            in that episode should be set to 0.
-
-    """
-    n_episodes = rewards.shape[0]
-    max_episode_length = rewards.shape[1]
-    assert vf_returns.shape == (n_episodes, max_episode_length + 1)
-
-    delta = -vf_returns[:, :-1] + rewards + discount * vf_returns[:, 1:]
-    adv_gae = torch.zeros((n_episodes, max_episode_length))
-    adv_gae[:, max_episode_length - 1] = delta[:, max_episode_length - 1]
-    for t in range(max_episode_length - 2, 0, -1):
-        adv_gae[:, t] = delta[:, t] + discount * gae_lambda * adv_gae[:, t + 1]
-    return adv_gae.squeeze()
 
 
 def discount_cumsum(x: torch.Tensor, discount: float):
