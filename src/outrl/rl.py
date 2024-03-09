@@ -1,6 +1,6 @@
 from dataclasses import dataclass, replace
 from textwrap import dedent
-from typing import Any, Optional, TypeVar, Generator, Union
+from typing import Any, Callable, Optional, TypeVar, Generator, Union
 import os
 import random
 import warnings
@@ -32,6 +32,7 @@ from outrl.torch_utils import (
     unpack_tensors,
     RunningMeanVar,
     make_scheduler,
+    DictDataset,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
 
@@ -187,7 +188,7 @@ class TrainerConfig(Config):
 
     vf_minibatch_size: int = tunable(512, IntDistribution(1, 2**32, log=True))
     vf_pre_training_epochs: int = tunable(0, IntDistribution(0, 100))
-    vf_post_training_epochs: int = tunable(0, IntDistribution(0, 100))
+    vf_post_training_epochs: int = tunable(10, IntDistribution(0, 100))
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
@@ -306,8 +307,6 @@ class Trainer(nn.Module):
 
         self.last_training_stats = {}
 
-        self._observation_latent_cache: dict[int, torch.Tensor] = {}
-
     def _loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> torch.Tensor:
@@ -372,18 +371,23 @@ class Trainer(nn.Module):
 
     def _minibatch(
         self,
-        episodes: list[EpisodeData],
-        extra_data: list[T],
+        episodes: Optional[list[EpisodeData]] = None,
+        extra_data: Optional[list[T]] = None,
         minibatch_target_timesteps: Optional[int] = None,
         desc: Optional[str] = None,
         epochs: int = 1,
         shuffle: bool = False,
+        start_of_epoch_callback: Optional[Callable[[int], None]] = None,
     ) -> Generator[list[tuple[EpisodeData, T, ActorOutput]], None, None]:
         """Split a large number of episodes into batches to avoid out of memory error.
 
         Yields: list[tuple[EpisodeData, ForwardResult]]
         """
+        if episodes is None:
+            episodes = self._replay_buffer
 
+        if len(extra_data) == 0 or extra_data is None:
+            extra_data = [None for _ in episodes]
         assert len(extra_data) == len(episodes)
 
         if shuffle:
@@ -402,7 +406,9 @@ class Trainer(nn.Module):
         with tqdm(
             total=epochs * sum([ep.num_timesteps for ep in episodes]), desc=desc
         ) as pbar:
-            for _ in range(epochs):
+            for epoch in range(epochs):
+                if start_of_epoch_callback is not None:
+                    start_of_epoch_callback(epoch)
                 next_ep_index = 0
                 while next_ep_index < len(episodes):
                     start_batch_ep_index = next_ep_index
@@ -470,14 +476,34 @@ class Trainer(nn.Module):
         self.log_dataset(train_inputs)
         self.agent.train(mode=True)
         self.vf.train(mode=True)
+        observation_latent_cache = {}
+        action_lls_cache = {}
+        if self.cfg.vf_pre_training_epochs > 0:
+            with torch.no_grad():
+                for batch in self._minibatch(desc="Caching latents"):
+                    for ep_data, _, actor_res in batch:
+                        observation_latent_cache[
+                            ep_data.episode_number
+                        ] = actor_res.observation_latents
+                        action_lls_cache[ep_data.episode_number] = actor_res.action_lls
+            self._train_vf(
+                observation_latent_cache,
+                action_lls_cache,
+                self.cfg.vf_pre_training_epochs,
+                desc="Pre Training VF",
+            )
         for batch in self._minibatch(
             desc="Training Actor",
-            episodes=self._replay_buffer,
             extra_data=train_inputs,
             epochs=self.cfg.policy_epochs_per_train_step,
             shuffle=True,
             minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
         ):
+            for ep_data, _, actor_res in batch:
+                observation_latent_cache[
+                    ep_data.episode_number
+                ] = actor_res.observation_latents.detach()
+                action_lls_cache[ep_data.episode_number] = actor_res.action_lls.detach()
             loss = self._loss_function(batch)
             self.vf_optimizer.zero_grad()
             self.actor_optimizer.zero_grad()
@@ -499,6 +525,13 @@ class Trainer(nn.Module):
                 # This seems to only trigger if the batch is so small the loss
                 # is nan or so big we OOM
                 warnings.warn(ex)
+        if self.cfg.vf_post_training_epochs > 0:
+            self._train_vf(
+                observation_latent_cache,
+                action_lls_cache,
+                self.cfg.vf_post_training_epochs,
+                desc="Post Training VF",
+            )
         self.actor_lr_scheduler.step()
         self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
@@ -506,6 +539,93 @@ class Trainer(nn.Module):
         stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
         self._replay_buffer = []
         self.train_steps_so_far += 1
+
+    def _train_vf(
+        self,
+        observation_latents: dict[int, torch.Tensor],
+        action_lls: dict[int, torch.Tensor],
+        training_epochs: int,
+        desc: str,
+    ):
+        obs_latents_packed, obs_lens = pack_tensors(
+            [
+                observation_latents[ep_data.episode_number]
+                for ep_data in self._replay_buffer
+            ]
+        )
+        assert not obs_latents_packed.requires_grad
+
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
+        if self.cfg.normalize_rewards:
+            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
+        else:
+            rewards_normed = padded_rewards
+
+        action_lls_now = pad_tensors(
+            [action_lls[ep_data.episode_number] for ep_data in self._replay_buffer]
+        )
+        assert not action_lls_now.requires_grad
+
+        original_action_lls = pad_tensors(
+            [data.original_action_lls for data in self._replay_buffer]
+        )
+
+        discount = 1 - self.cfg.discount_inv
+        gammas = discount * torch.ones_like(rewards_normed)
+
+        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
+
+        with tqdm(desc=desc, total=training_epochs * sum(episode_lengths)) as pbar:
+            for epoch in range(training_epochs):
+                if (
+                    epoch == 0
+                    or epoch == training_epochs
+                    or self.cfg.vf_recompute_targets
+                ):
+                    vf_x_packed = self.vf(obs_latents_packed)
+                    vf_x = pad_tensors(unpack_tensors(vf_x_packed, obs_lens))
+
+                    for i, episode_length in enumerate(episode_lengths):
+                        # zero vf_{t+1} in terminated episodes
+                        if self._replay_buffer[i].terminated:
+                            vf_x[i, episode_length] = 0.0
+                            terminated[i] = True
+
+                    with torch.no_grad():
+                        _, vf_targets = v_trace_estimation(
+                            lmbda=self.cfg.v_trace_lambda,
+                            rho_max=self.cfg.v_trace_rho_max,
+                            c_max=self.cfg.v_trace_c_max,
+                            gammas=gammas,
+                            vf_x=vf_x,
+                            rewards=rewards_normed,
+                            action_lls=action_lls_now,
+                            original_action_lls=original_action_lls,
+                            terminated=terminated,
+                            episode_lengths=torch.tensor(episode_lengths),
+                        )
+
+                    vf_targets_packed = pack_tensors_check(
+                        unpad_tensors(vf_targets, obs_lens), obs_lens
+                    )
+
+                dataset = DictDataset(
+                    observation_latents=obs_latents_packed, vf_targets=vf_targets_packed
+                )
+                for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
+                    self.vf_optimizer.zero_grad()
+                    vf_out = self.vf(batch["observation_latents"])
+                    vf_loss = F.mse_loss(vf_out, batch["vf_targets"])
+                    vf_loss.backward()
+                    clip_grad_norm_(
+                        self.vf.parameters(),
+                        max_norm=self.cfg.grad_norm_max,
+                        error_if_nonfinite=True,
+                    )
+                    self.vf_optimizer.step()
+                    pbar.n += len(batch["observation_latents"])
+                    pbar.refresh()
 
     def log_training(self, train_locals: dict[str, Any]):
         training_stats = {
