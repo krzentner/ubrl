@@ -841,6 +841,16 @@ class Trainer(nn.Module):
             hparams[k] = v
         log("hparams", hparams, step=self.total_env_steps)
 
+    def state_dict(self):
+        data = super().state_dict()
+        assert 'actor' in data
+        assert 'vf' in data
+        assert 'actor_optimizer' in data
+        assert 'vf_optimizer' in data
+        assert 'vf_lr_schedule' in data
+        assert 'actor_lr_scheduler' in data
+        return data
+
 
 def discount_cumsum(x: torch.Tensor, discount: float):
     B, L = x.shape
