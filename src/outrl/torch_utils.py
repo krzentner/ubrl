@@ -103,7 +103,7 @@ def make_mlp(
     input_size: int,
     hidden_sizes: List[int],
     output_size: Optional[int] = None,
-    hidden_nonlinearity: SupportsNonlinearity = nn.GELU,
+    hidden_nonlinearity: SupportsNonlinearity = nn.SiLU,
     hidden_w_init: Initializer = nn.init.xavier_normal_,
     hidden_b_init: Initializer = nn.init.zeros_,
     output_w_init: Initializer = nn.init.xavier_normal_,

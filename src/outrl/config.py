@@ -192,7 +192,7 @@ class ExperimentInvocation:
         parser_copy = copy.deepcopy(self.parser)
         args, _ = parser_copy.parse_known_args()
 
-        if getattr(args, "config"):
+        if getattr(args, "config", None):
             # Command line arguments should override config file entries
             loaded_config = load_yaml(config_type, args.config)
             loaded_config = loaded_config.fill_defaults()

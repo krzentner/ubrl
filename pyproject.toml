@@ -53,10 +53,20 @@ visdom = "^0.2.4"
 [tool.poetry.group.local.dependencies]
 stick = {path = "stick", extras = ["recommended"]}
 
+
+[tool.poetry.group.torch.dependencies]
+torch = {version = "^2.2.1+cpu", source = "pytorch_cpu"}
+torchvision = {version = "^0.17.1+cpu", source = "pytorch_cpu"}
+
 [tool.poetry.extras]
 torch = ["torch"]
 gym = ["gym", "mujoco-py"]
 gymnasium = ["gymnasium"]
+
+[[tool.poetry.source]]
+name = "pytorch_cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
 
 [tool.pyright]
 include = ["src"]

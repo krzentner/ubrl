@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+#
+# Usage: examples/gym_example.py train --n_train_steps=2 --seed=7
+#
+
 from dataclasses import dataclass, replace
 
 try:
@@ -38,7 +42,7 @@ class GymConfig(TrainerConfig):
         ),
     )
 
-    n_train_steps: int = 5000
+    n_train_steps: int = 100
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
@@ -56,7 +60,7 @@ def train(cfg: GymConfig):
     actor = make_gym_actor(
         envs, hidden_sizes=cfg.encoder_hidden_sizes, pi_hidden_sizes=cfg.pi_hidden_sizes
     )
-    print("actor", actor)
+    print("actor:", actor)
 
     trainer = Trainer(cfg, actor)
 
@@ -73,7 +77,8 @@ def train(cfg: GymConfig):
                 max_episode_length=cfg.max_episode_length,
                 full_episodes_only=True,
             )
-            trainer.add_eval_stats(episode_stats(eval_episodes), "AverageReturn")
+            eval_stats = episode_stats(eval_episodes)
+            trainer.add_eval_stats(eval_stats, "AverageReturn")
             # TODO: Checkpoint, resume
             # trainer.maybe_checkpoint()
         if step == cfg.n_train_steps:
@@ -103,6 +108,8 @@ def train(cfg: GymConfig):
             )
         trainer.train_step()
         step += 1
+    if cfg.env_name == "CartPole-v1":
+        assert eval_stats["AverageReturn"] >= 200, "Should have trained optimal policy"
 
 
 if __name__ == "__main__":

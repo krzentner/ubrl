@@ -833,7 +833,7 @@ class Trainer(nn.Module):
         self._next_episode_number += 1
 
     def add_eval_stats(self, stats: dict[str, float], primary: str):
-        logging.info(f"Eval primary stat ({primary}):", stats[primary])
+        logging.info(f"Eval primary stat ({primary}): {stats[primary]}")
         log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
         hparams = self.cfg.to_dict()
         hparams["metric-primary"] = stats[primary]
@@ -843,12 +843,12 @@ class Trainer(nn.Module):
 
     def state_dict(self):
         data = super().state_dict()
-        assert 'actor' in data
-        assert 'vf' in data
-        assert 'actor_optimizer' in data
-        assert 'vf_optimizer' in data
-        assert 'vf_lr_schedule' in data
-        assert 'actor_lr_scheduler' in data
+        assert "actor" in data
+        assert "vf" in data
+        assert "actor_optimizer" in data
+        assert "vf_optimizer" in data
+        assert "vf_lr_schedule" in data
+        assert "actor_lr_scheduler" in data
         return data
 
 
