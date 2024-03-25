@@ -5,6 +5,8 @@ import os
 import random
 import warnings
 import logging
+import pickle
+from glob import glob
 
 import torch
 import torch.nn as nn
@@ -35,6 +37,8 @@ from outrl.torch_utils import (
     DictDataset,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
+
+LOGGER = logging.getLogger("outrl")
 
 T = TypeVar("T")
 
@@ -132,6 +136,8 @@ class TrainerConfig(Config):
     """Directory to log into. Full path will be {log_dir}/{run_name}.
 
     Set to None to disable logging."""
+
+    stderr_log_level: stick.LogLevels = stick.LogLevels.INFO
 
     pprint_logging: bool = True
     """Log to stdout using pprint. Because the pprint output engine defaults to
@@ -237,12 +243,30 @@ class TrainerConfig(Config):
 
     grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e3, log=True))
 
+    checkpoint_interval: int = 1
+    """Number of train_step calls between checkpoints when calling maybe_checkpoint().
+
+    Disable checkpointing by setting to a negative value."""
+
+    checkpoint_best: bool = True
+    """Whether to checkpoint in maybe_checkpoint() after an improvement in the
+    primary performance statistic passed to add_eval_stats."""
+
+    checkpoint_replay_buffer: bool = True
+    """Whether to checkpoint the replay_buffer."""
+
     def fill_defaults(self):
         """Fill in values with non-constant defaults. Called after construction."""
         if self.seed < -1:
             raise ValueError("seed should be positive or exactly -1")
+        if self.checkpoint_interval < -1:
+            raise ValueError("checkpoint_interval should be positive or exactly -1")
         log_dir = os.path.abspath(self.log_dir)
-        return replace(self, log_dir=log_dir)
+        if isinstance(self.stderr_log_level, str):
+            stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
+        else:
+            stderr_log_level = self.stderr_log_level
+        return replace(self, log_dir=log_dir, stderr_log_level=stderr_log_level)
 
 
 @dataclass
@@ -259,14 +283,27 @@ class PolicyTrainingInputs:
     vf_targets: torch.Tensor
 
 
+SUB_STATE_DICT_FIELDS = [
+    "actor",
+    "vf",
+    "reward_normalizer",
+    "actor_optimizer",
+    "vf_optimizer",
+    "vf_lr_scheduler",
+    "actor_lr_scheduler",
+]
+
+IGNORED_FIELDS = ["_is_full_backward_hook"]
+
+
 class Trainer(nn.Module):
-    def __init__(self, cfg: TrainerConfig, agent):
+    def __init__(self, cfg: TrainerConfig, actor):
         super().__init__()
         self.cfg = cfg
 
-        self.agent = agent
+        self.actor = actor
 
-        self.observation_latent_size = self.agent.observation_latent_size
+        self.observation_latent_size = self.actor.observation_latent_size
 
         self.vf = make_mlp(
             input_size=self.observation_latent_size,
@@ -279,7 +316,7 @@ class Trainer(nn.Module):
 
         self.reward_normalizer = RunningMeanVar()
         self.actor_optimizer = torch.optim.Adam(
-            self.agent.parameters(),
+            self.actor.parameters(),
             lr=self.cfg.actor_lr_start,
             weight_decay=self.cfg.actor_weight_decay,
         )
@@ -312,24 +349,28 @@ class Trainer(nn.Module):
         self.train_steps_so_far: int = 0
 
         self.last_training_stats = {}
+        self.last_eval_stats = {}
+        self.primary_performance: float = float("-inf")
+        self.primary_performance_at_last_checkpoint: float = float("-inf")
+        self.train_steps_so_far_at_last_checkpoint = 0
 
     def _loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> torch.Tensor:
         episode_data: list[EpisodeData] = [b[0] for b in batch]
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
-        agent_outputs: list[ActorOutput] = [b[2] for b in batch]
+        actor_outputs: list[ActorOutput] = [b[2] for b in batch]
 
         advantages, adv_len = pack_tensors(
             [train_input.advantages for train_input in train_inputs]
         )
 
         obs_latents_packed = pack_tensors_check(
-            [agent_out.observation_latents[:-1] for agent_out in agent_outputs], adv_len
+            [actor_out.observation_latents[:-1] for actor_out in actor_outputs], adv_len
         )
         critic_out = self.vf(obs_latents_packed)
         action_ll_packed = pack_tensors_check(
-            [agent_out.action_lls for agent_out in agent_outputs], adv_len
+            [actor_out.action_lls for actor_out in actor_outputs], adv_len
         )
         log_prob = action_ll_packed
         minibatch_size = sum(adv_len)
@@ -452,7 +493,7 @@ class Trainer(nn.Module):
                         )
 
                     try:
-                        forward_result = self.agent([data[0].episode for data in batch])
+                        forward_result = self.actor([data[0].episode for data in batch])
                         yield [
                             (data[0], data[1], f_res)
                             for (data, f_res) in zip(batch, forward_result)
@@ -480,7 +521,7 @@ class Trainer(nn.Module):
     def train_step(self):
         train_inputs = self.preprocess()
         self.log_dataset(train_inputs)
-        self.agent.train(mode=True)
+        self.actor.train(mode=True)
         self.vf.train(mode=True)
         observation_latent_cache = {}
         action_lls_cache = {}
@@ -516,7 +557,7 @@ class Trainer(nn.Module):
             loss.backward()
             try:
                 clip_grad_norm_(
-                    self.agent.parameters(),
+                    self.actor.parameters(),
                     max_norm=self.cfg.grad_norm_max,
                     error_if_nonfinite=True,
                 )
@@ -540,7 +581,7 @@ class Trainer(nn.Module):
             )
         self.actor_lr_scheduler.step()
         self.vf_lr_scheduler.step()
-        self.agent.train(mode=False)
+        self.actor.train(mode=False)
         self.vf.train(mode=False)
         stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
         self._replay_buffer = []
@@ -696,19 +737,19 @@ class Trainer(nn.Module):
         assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
 
         # Compute vf_returns
-        self.agent.train(mode=False)
+        self.actor.train(mode=False)
         self.vf.train(mode=False)
         with torch.no_grad():
-            agent_outputs = self.agent([data.episode for data in self._replay_buffer])
+            actor_outputs = self.actor([data.episode for data in self._replay_buffer])
             obs_latents_packed = pack_tensors_check(
-                [agent_out.observation_latents for agent_out in agent_outputs], obs_lens
+                [actor_out.observation_latents for actor_out in actor_outputs], obs_lens
             )
             vf_returns_packed = self.vf(obs_latents_packed)
-        self.agent.train(mode=True)
+        self.actor.train(mode=True)
         self.vf.train(mode=True)
 
         action_lls_now = pad_tensors(
-            [agent_out.action_lls for agent_out in agent_outputs]
+            [actor_out.action_lls for actor_out in actor_outputs]
         )
         original_action_lls = pad_tensors(
             [data.original_action_lls for data in self._replay_buffer]
@@ -835,6 +876,8 @@ class Trainer(nn.Module):
     def add_eval_stats(self, stats: dict[str, float], primary: str):
         logging.info(f"Eval primary stat ({primary}): {stats[primary]}")
         log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
+        self.primary_performance = stats[primary]
+        self.last_eval_stats = stats
         hparams = self.cfg.to_dict()
         hparams["metric-primary"] = stats[primary]
         for k, v in stats.items():
@@ -842,14 +885,114 @@ class Trainer(nn.Module):
         log("hparams", hparams, step=self.total_env_steps)
 
     def state_dict(self):
-        data = super().state_dict()
-        assert "actor" in data
-        assert "vf" in data
-        assert "actor_optimizer" in data
-        assert "vf_optimizer" in data
-        assert "vf_lr_schedule" in data
-        assert "actor_lr_scheduler" in data
-        return data
+        state = {}
+        for k in SUB_STATE_DICT_FIELDS:
+            state[k] = getattr(self, k).state_dict()
+        for k, v in self.__dict__.items():
+            if k in IGNORED_FIELDS or k in SUB_STATE_DICT_FIELDS:
+                continue
+            elif k == "cfg":
+                state[k] = v.to_dict()
+            elif k == "replay_buffer":
+                if self.cfg.checkpoint_replay_buffer:
+                    state[k] = v
+            else:
+                if hasattr(v, "state_dict"):
+                    LOGGER.error(
+                        f"Field {k} was not expected to have a state_dict method"
+                    )
+                state[k] = v
+        return state
+
+    def load_state_dict(self, state_dict):
+        state = state_dict
+        for k in SUB_STATE_DICT_FIELDS:
+            assert k in state, f"Missing {k!r} from state dict"
+        for k, v in state.items():
+            if k == "cfg":
+                self.cfg = type(self.cfg).from_dict(v)
+            elif k in SUB_STATE_DICT_FIELDS:
+                getattr(self, k).load_state_dict(v)
+            else:
+                field_now = getattr(self, k, None)
+                if field_now is None:
+                    LOGGER.error(f"Attempting to set unknown field {k}")
+                else:
+                    if hasattr(field_now, "load_state_dict"):
+                        LOGGER.error(
+                            f"Field {k} was not expected to have a load_state_dict method"
+                        )
+                setattr(self, k, v)
+
+    def maybe_checkpoint(self):
+        checkpoint_interval = (
+            self.cfg.checkpoint_interval >= 0
+            and self.train_steps_so_far - self.train_steps_so_far_at_last_checkpoint
+            >= self.cfg.checkpoint_interval
+        )
+        # log({
+        #     'train_steps_so_far': self.train_steps_so_far,
+        #     'train_steps_so_far_at_last_checkpoint': self.train_steps_so_far_at_last_checkpoint,
+        # }, level=stick.CRITICAL)
+        # assert checkpoint_interval
+        checkpoint_best = (
+            self.cfg.checkpoint_best
+            and self.primary_performance > self.primary_performance_at_last_checkpoint
+        )
+        if checkpoint_interval or checkpoint_best:
+            state_dict = self.state_dict()
+            if checkpoint_interval:
+                f_name = os.path.join(
+                    self.cfg.log_dir,
+                    self.cfg.run_name,
+                    f"train_step_{self.train_steps_so_far}.pkl",
+                )
+                LOGGER.info(f"Checkpointing to {f_name!r}")
+                with open(
+                    f_name,
+                    "wb",
+                ) as f:
+                    pickle.dump(state_dict, f)
+                self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
+            if checkpoint_best:
+                f_name = os.path.join(self.cfg.log_dir, self.cfg.run_name, f"best.pkl")
+                LOGGER.info(f"Checkpointing to {f_name!r}")
+                with open(f_name, "wb") as f:
+                    pickle.dump(state_dict, f)
+            return True
+        else:
+            return False
+
+    def attempt_resume(
+        self, prefer_best: bool = False, checkpoint_dir: Optional[str] = None
+    ):
+        if checkpoint_dir is None:
+            checkpoint_dir = os.path.join(self.cfg.log_dir, self.cfg.run_name)
+        best_ckpt = os.path.join(checkpoint_dir, "best.pkl")
+        if prefer_best and os.path.exists(best_ckpt):
+            try:
+                with open(best_ckpt, "rb") as f:
+                    state = pickle.load(f)
+                    self.load_state_dict(state)
+                    LOGGER.critical(f"Resuming from checkpoint {best_ckpt}")
+                    return True
+            except (pickle.UnpicklingError, ValueError) as ex:
+                LOGGER.error(f"Could not load {best_ckpt}: {ex}")
+        checkpoints = glob(f"{checkpoint_dir}/train_step_*.pkl")
+        with_idx = [
+            (int(f_name.rsplit("_", 1)[-1].split(".", 1)[0]), f_name)
+            for f_name in checkpoints
+        ]
+        for idx, f_name in sorted(with_idx, reverse=True):
+            try:
+                with open(f_name, "rb") as f:
+                    state = pickle.load(f)
+                    self.load_state_dict(state)
+                    LOGGER.critical(f"Resuming from checkpoint {f_name}")
+                    return True
+            except (pickle.UnpicklingError, ValueError) as ex:
+                LOGGER.error(f"Could not load {f_name}: {ex}")
+        return False
 
 
 def discount_cumsum(x: torch.Tensor, discount: float):
@@ -902,12 +1045,12 @@ def v_trace_estimation(
             possible.
         vf_x (torch.Tensor): A 2D tensor of value function estimates with shape
             (N, T + 1), where N is the batch dimension (number of episodes) and
-            T is the maximum episode length experienced by the agent. If an
+            T is the maximum episode length experienced by the actor. If an
             episode terminates in fewer than T time steps, the remaining
             elements in that episode should be set to 0.
         rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
             (N, T), where N is the batch dimension (number of episodes) and T
-            is the maximum episode length experienced by the agent.
+            is the maximum episode length experienced by the actor.
         episode_lengths (torch.Tensor) A 1D tensor indicating the episode length.
         terminated (torch.Tensor): A 1D tensor indicating if the episode
             ended in a terminal state.

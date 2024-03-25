@@ -64,7 +64,7 @@ def train(cfg: GymConfig):
 
     trainer = Trainer(cfg, actor)
 
-    # trainer.attempt_resume()
+    trainer.attempt_resume(prefer_best=False)
 
     step = 0
     while True:
@@ -80,7 +80,7 @@ def train(cfg: GymConfig):
             eval_stats = episode_stats(eval_episodes)
             trainer.add_eval_stats(eval_stats, "AverageReturn")
             # TODO: Checkpoint, resume
-            # trainer.maybe_checkpoint()
+            trainer.maybe_checkpoint()
         if step == cfg.n_train_steps:
             break
         train_episodes = collect(
