@@ -1,5 +1,5 @@
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, fields
 from textwrap import dedent
 from typing import (
     Any,
@@ -12,12 +12,15 @@ from typing import (
     Callable,
     Tuple,
     Optional,
+    TypeVar
 )
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+T = TypeVar("T")
 
 SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], nn.Module]
 Initializer = Callable[[torch.Tensor], None]
@@ -326,6 +329,61 @@ class RunningMeanVar(nn.Module):
         dst[f"{prefix}.var"] = self.var.mean().item()
         dst[f"{prefix}.mean"] = self.mean.mean().item()
         dst[f"{prefix}.count"] = self.count
+
+
+@dataclass
+class Shaper:
+
+    lengths: list[int]
+
+    @classmethod
+    def from_example(cls, elements):
+        return cls([len(el) for el in elements])
+
+    def pack(self, tensors: list[torch.Tensor]) -> torch.Tensor:
+        """Equivelant to pack_tensors_check."""
+        if force_lengths:
+            assert len(self.lengths) == len(tensors)
+            tensors = [t[:length] for (t, length) in zip(tensors, self.lengths)]
+        return pack_tensors_check(tensors, self.lengths)
+
+    def pad(self, tensors: list[torch.Tensor], force_lengths: bool=False) -> torch.Tensor:
+        if force_lengths:
+            assert len(self.lengths) == len(tensors)
+            tensors = [t[:length] for (t, length) in zip(tensors, self.lengths)]
+        return pad_tensors(tensors, expected_lengths=self.lengths)
+
+    def unpack(self, padded: torch.Tensor) -> list[torch.Tensor]:
+        """Equivelant to unpack_tensors(...)."""
+        return unpack_tensors(padded, self.lengths)
+
+    def unpad(self, padded: torch.Tensor) -> list[torch.Tensor]:
+        """Equivelant to unpad_tensors(...)."""
+        return unpad_tensors(padded, self.lengths)
+
+    def pack_padded(self, padded: torch.Tensor) -> torch.Tensor:
+        """Equivelant to pack_tensors_check(unpad_tensors(...))."""
+        return pack_tensors_check(unpad_tensors(padded, self.lengths), self.lengths)
+
+    def pad_packed(self, packed: torch.Tensor) -> torch.Tensor:
+        """Equivelant to pad_tensors(unpack_tensors(...))."""
+        return pad_tensors(unpack_tensors(padded, self.lengths), self.lengths)
+
+
+def pack_recursive(data: Union[list[T], T]) -> T:
+    if isinstance(data[0], torch.Tensor):
+        return pack_tensors(data)[0]
+    elif isinstance(data, tuple):
+        return tuple(pack_recursive(d) for d in data)
+    elif isinstance(data, list):
+        return [pack_recursive(d) for d in data]
+    elif is_dataclass(data):
+        return replace(data, **{
+            field.name: pack_recursive(getattr(data, field.name))
+            for field in fields(data)
+        })
+    else:
+        return data
 
 
 def pack_tensors(tensor_list: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:

@@ -42,6 +42,10 @@ LOGGER = logging.getLogger("outrl")
 
 T = TypeVar("T")
 
+ActionDist = Union[
+    torch.distributions.Distribution, list[torch.distributions.Distribution]
+]
+
 
 @dataclass(eq=False)
 class ActorOutput:
@@ -57,10 +61,12 @@ class ActorOutput:
     action_lls: torch.Tensor
     """Differentiable log-likelihood of actions taken in the episode."""
 
-    distribution: Optional[torch.distributions.Distribution] = None
+    distribution: Optional[ActionDist] = None
     """Distribution used to generate actions.
 
-    Will be used for the KL penalty if cfg.kl_dist_penalty > 0.
+    Will be used for the KL penalty if not None, cfg.kl_dist_penalty > 0, and cfg.use_approx_kl is False.
+
+    Will be used for entropy regularization if not None and cfg.approx_entropy is False.
     """
 
 
@@ -84,11 +90,14 @@ class EpisodeData:
     original_action_lls: torch.Tensor
     """Original action lls provided when the episode was added."""
 
+    original_action_dists: Optional[ActionDist]
+    """Original action distributions provided when the episode was added."""
+
     rewards: torch.Tensor
     """Rewards provided when the episode was added."""
 
-    actions_possible: torch.Tensor
-    """Boolean actions_possible mask."""
+    any_actions_possible: torch.Tensor
+    """Boolean any_actions_possible mask."""
 
     infos: dict[str, Any]
     """User infos. Will be logged if possible."""
@@ -106,8 +115,50 @@ class EpisodeData:
     def __post_init__(self):
         assert self.original_action_lls.shape == (self.num_timesteps,)
         assert self.rewards.shape == (self.num_timesteps,)
-        assert self.actions_possible.shape == (self.num_timesteps,)
+        assert self.any_actions_possible.shape == (self.num_timesteps,)
         assert self.num_timesteps > 0
+
+        requires_grad_msg = dedent(
+            """\
+            This will retain a gradient tape for as long as the
+            episode is in the replay buffer, and is almost
+            certainly not intended.
+            """
+        )
+
+        if self.rewards.requires_grad:
+            raise ValueError(
+                "rewards passed to replay buffer requires grad." + requires_grad_msg
+            )
+
+        if self.original_action_lls.requires_grad:
+            raise ValueError(
+                "action_lls passed to replay buffer requires grad." + requires_grad_msg
+            )
+
+        if self.any_actions_possible.requires_grad:
+            raise ValueError(
+                "any_actions_possible passed to replay buffer requires grad."
+                + requires_grad_msg
+            )
+
+        # Check if action_dists requires_grad
+        if self.original_action_dists is not None:
+            if isinstance(action_dists, list):
+                act_dist_list = self.original_action_dists
+            else:
+                act_dist_list = [action_dists]
+            for k, v in act_dist.__dict__.items():
+                if getattr(v, "requires_grad", None):
+                    raise ValueError(
+                        dedent(
+                            f"""\
+                        action_dists passed to replay buffer requires grad
+                        through field {k}.
+                        """
+                        )
+                        + requires_grad_msg
+                    )
 
 
 @dataclass
@@ -233,6 +284,12 @@ class TrainerConfig(Config):
     kl_coef_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
     kl_coef_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
 
+    use_approx_kl: bool = False
+    """Approximate the KL divergence using the log-likelihoods."""
+
+    use_approx_entropy: bool = False
+    """Approximate the action entropy using the log-likelihoods."""
+
     entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
     kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
     kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
@@ -354,67 +411,89 @@ class Trainer(nn.Module):
         self.primary_performance_at_last_checkpoint: float = float("-inf")
         self.train_steps_so_far_at_last_checkpoint = 0
 
-    def _loss_function(
+    def _primary_loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> torch.Tensor:
         episode_data: list[EpisodeData] = [b[0] for b in batch]
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
         actor_outputs: list[ActorOutput] = [b[2] for b in batch]
 
+        ppo_loss, ppo_infos = self._ppo_loss_function(
+            episode_data, train_inputs, actor_outputs
+        )
+        vf_loss, vf_infos = self._vf_loss_function(
+            episode_data, train_inputs, actor_outputs
+        )
+
+        loss = ppo_loss + vf_loss
+
+        self.log_training(
+            ppo_infos | vf_infos | locals(),
+        )
+        return loss
+
+    def _ppo_loss_function(
+        self,
+        episode_data: list[EpisodeData],
+        train_inputs: list[PolicyTrainingInputs],
+        actor_outputs: list[ActorOutput],
+    ) -> torch.Tensor:
         advantages, adv_len = pack_tensors(
             [train_input.advantages for train_input in train_inputs]
         )
-
-        obs_latents_packed = pack_tensors_check(
-            [actor_out.observation_latents[:-1] for actor_out in actor_outputs], adv_len
-        )
-        critic_out = self.vf(obs_latents_packed)
         action_ll_packed = pack_tensors_check(
             [actor_out.action_lls for actor_out in actor_outputs], adv_len
         )
-        log_prob = action_ll_packed
-        minibatch_size = sum(adv_len)
-        assert log_prob.shape == (minibatch_size,)
+
         old_log_prob = pack_tensors_check(
             [data.original_action_lls for data in episode_data], adv_len
         )
-        assert old_log_prob.shape == (minibatch_size,)
         assert not old_log_prob.requires_grad
 
-        ratio = torch.exp(log_prob - old_log_prob)
+        ratio = torch.exp(action_ll_packed - old_log_prob)
         ratio_clipped = torch.clamp(
             ratio, 1 / (1 + self.cfg.actor_clip_ratio), 1 + self.cfg.actor_clip_ratio
         )
 
-        assert ratio.shape == (minibatch_size,)
-        assert ratio_clipped.shape == (minibatch_size,)
-
         policy_gradient = ratio * advantages
         clip_policy_gradient = ratio_clipped * advantages
-        assert policy_gradient.shape == (minibatch_size,)
-        assert clip_policy_gradient.shape == (minibatch_size,)
 
         pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
-
-        vf_targets_packed = pack_tensors_check(
-            [train_input.vf_targets for train_input in train_inputs], adv_len
+        return (
+            pi_loss,
+            dict(
+                clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
+            )
+            | locals(),
         )
-        vf_loss = F.mse_loss(critic_out, vf_targets_packed)
 
-        loss = pi_loss + self.cfg.vf_loss_coeff * vf_loss
+    def _vf_loss_function(
+        self,
+        episode_data: list[EpisodeData],
+        train_inputs: list[PolicyTrainingInputs],
+        actor_outputs: list[ActorOutput],
+    ) -> torch.Tensor:
+        vf_targets_packed, adv_len = pack_tensors(
+            [train_input.vf_targets for train_input in train_inputs]
+        )
+        obs_latents_packed = pack_tensors_check(
+            [actor_out.observation_latents[:-1] for actor_out in actor_outputs], adv_len
+        )
+
+        critic_out = self.vf(obs_latents_packed)
+        vf_loss = F.mse_loss(critic_out, vf_targets_packed)
 
         discounted_returns = pack_tensors_check(
             [train_input.discounted_returns for train_input in train_inputs], adv_len
         )
 
-        self.log_training(
+        return (
+            self.cfg.vf_loss_coeff * vf_loss,
             dict(
-                clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
                 mb_ev=explained_variance(critic_out, discounted_returns),
             )
             | locals(),
         )
-        return loss
 
     def _minibatch(
         self,
@@ -551,7 +630,7 @@ class Trainer(nn.Module):
                     ep_data.episode_number
                 ] = actor_res.observation_latents.detach()
                 action_lls_cache[ep_data.episode_number] = actor_res.action_lls.detach()
-            loss = self._loss_function(batch)
+            loss = self._primary_loss_function(batch)
             self.vf_optimizer.zero_grad()
             self.actor_optimizer.zero_grad()
             loss.backward()
@@ -822,7 +901,8 @@ class Trainer(nn.Module):
         rewards: torch.Tensor,
         action_lls: torch.Tensor,
         terminated: bool,
-        actions_possible: Optional[torch.Tensor] = None,
+        action_dists: Optional[ActionDist] = None,
+        any_actions_possible: Optional[torch.Tensor] = None,
         sample_priority: float = 1.0,
         infos: Optional[dict[str, Any]] = None,
     ):
@@ -834,7 +914,7 @@ class Trainer(nn.Module):
             terminated (bool): True if the episode ended in a terminal state,
                 and False if the episode timed-out, was abandoned, or is still
                 ongoing
-            actions_possible (torch.Tensor?): Boolean Tensor indicating if any
+            any_actions_possible (torch.Tensor?): Boolean Tensor indicating if any
                 actions were possible to take at this state. This allows
                 ignoring states where no action was possible (e.g. the initial
                 prompt in an LLM, or intermediate frames in a video input when
@@ -848,10 +928,10 @@ class Trainer(nn.Module):
         assert not action_lls.requires_grad
         num_timesteps = len(rewards)
         self.total_env_steps += num_timesteps
-        if actions_possible is None:
-            actions_possible = torch.ones(num_timesteps, dtype=torch.bool)
+        if any_actions_possible is None:
+            any_actions_possible = torch.ones(num_timesteps, dtype=torch.bool)
         else:
-            assert isinstance(actions_possible, torch.Tensor)
+            assert isinstance(any_actions_possible, torch.Tensor)
 
         rewards = rewards.to(dtype=self._dtype)
         self.reward_normalizer.update(rewards)
@@ -865,8 +945,9 @@ class Trainer(nn.Module):
                 num_timesteps=num_timesteps,
                 terminated=terminated,
                 original_action_lls=action_lls.to(dtype=self._dtype),
+                original_action_dists=action_dists,
                 rewards=rewards,
-                actions_possible=actions_possible,
+                any_actions_possible=any_actions_possible,
                 sample_priority=sample_priority,
                 infos=infos,
             )

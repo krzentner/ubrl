@@ -217,7 +217,7 @@ def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
         "rewards": torch.from_numpy(np.array(episode["rewards"])),
         "terminated": any(episode["terminals"]),
         "action_lls": action_lls,
-        "actions_possible": torch.ones(len(action_lls), dtype=torch.bool),
+        "any_actions_possible": torch.ones(len(action_lls), dtype=torch.bool),
     }
 
 
