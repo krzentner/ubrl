@@ -1,6 +1,6 @@
 from dataclasses import dataclass, replace
 from textwrap import dedent
-from typing import Any, Callable, Optional, TypeVar, Generator, Union
+from typing import Any, Callable, Optional, TypeVar, Generator, Union, Literal
 import os
 import random
 import warnings
@@ -35,16 +35,15 @@ from outrl.torch_utils import (
     RunningMeanVar,
     make_scheduler,
     DictDataset,
+    ActionDist,
+    kl_div,
+    approx_kl_div,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
 
 LOGGER = logging.getLogger("outrl")
 
 T = TypeVar("T")
-
-ActionDist = Union[
-    torch.distributions.Distribution, list[torch.distributions.Distribution]
-]
 
 
 @dataclass(eq=False)
@@ -61,10 +60,11 @@ class ActorOutput:
     action_lls: torch.Tensor
     """Differentiable log-likelihood of actions taken in the episode."""
 
-    distribution: Optional[ActionDist] = None
+    action_dists: Optional[ActionDist] = None
     """Distribution used to generate actions.
 
-    Will be used for the KL penalty if not None, cfg.kl_dist_penalty > 0, and cfg.use_approx_kl is False.
+    Will be used for the KL penalty if not None, cfg.kl_dist_penalty > 0, and
+    cfg.use_approx_kl is False.
 
     Will be used for entropy regularization if not None and cfg.approx_entropy is False.
     """
@@ -144,21 +144,22 @@ class EpisodeData:
 
         # Check if action_dists requires_grad
         if self.original_action_dists is not None:
-            if isinstance(action_dists, list):
+            if isinstance(self.original_action_dists, list):
                 act_dist_list = self.original_action_dists
             else:
-                act_dist_list = [action_dists]
-            for k, v in act_dist.__dict__.items():
-                if getattr(v, "requires_grad", None):
-                    raise ValueError(
-                        dedent(
-                            f"""\
-                        action_dists passed to replay buffer requires grad
-                        through field {k}.
-                        """
+                act_dist_list = [self.original_action_dists]
+            for act_dist in act_dist_list:
+                for k, v in act_dist.__dict__.items():
+                    if getattr(v, "requires_grad", None):
+                        raise ValueError(
+                            dedent(
+                                f"""\
+                            action_dists passed to replay buffer requires grad
+                            through field {k}.
+                            """
+                            )
+                            + requires_grad_msg
                         )
-                        + requires_grad_msg
-                    )
 
 
 @dataclass
@@ -255,7 +256,7 @@ class TrainerConfig(Config):
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
-    vf_loss_coeff: float = tunable(0.1, FloatDistribution(0.01, 2.0))
+    vf_loss_coef: float = tunable(0.1, FloatDistribution(0.01, 2.0))
 
     vf_hidden_sizes: list[int] = tunable(
         [128, 128],
@@ -279,10 +280,16 @@ class TrainerConfig(Config):
     temperature_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
     temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
 
-    initial_kl_coef: float = tunable(10.0, FloatDistribution(0.0, 100.0))
+    kl_coef_init: float = tunable(0.0, FloatDistribution(0.0, 100.0))
     kl_coef_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
-    kl_coef_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
+    kl_coef_min: float = tunable(0.0, FloatDistribution(0.0, 1.0))
     kl_coef_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
+    kl_target_stat: Literal["max", "mean"] = tunable(
+        "max", CategoricalDistribution(["max", "mean"])
+    )
+    kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
+    kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
+    kl_use_fixup: bool = False
 
     use_approx_kl: bool = False
     """Approximate the KL divergence using the log-likelihoods."""
@@ -291,8 +298,6 @@ class TrainerConfig(Config):
     """Approximate the action entropy using the log-likelihoods."""
 
     entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
-    kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
-    kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
 
     use_top_half_advantages: bool = tunable(
         False, CategoricalDistribution([True, False])
@@ -348,6 +353,7 @@ SUB_STATE_DICT_FIELDS = [
     "vf_optimizer",
     "vf_lr_scheduler",
     "actor_lr_scheduler",
+    "kl_coef_opt",
 ]
 
 IGNORED_FIELDS = ["_is_full_backward_hook"]
@@ -411,6 +417,9 @@ class Trainer(nn.Module):
         self.primary_performance_at_last_checkpoint: float = float("-inf")
         self.train_steps_so_far_at_last_checkpoint = 0
 
+        self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
+        self.kl_coef_opt = torch.optim.Adam([self.kl_coef], lr=self.cfg.kl_coef_lr)
+
     def _primary_loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> torch.Tensor:
@@ -418,39 +427,36 @@ class Trainer(nn.Module):
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
         actor_outputs: list[ActorOutput] = [b[2] for b in batch]
 
-        ppo_loss, ppo_infos = self._ppo_loss_function(
-            episode_data, train_inputs, actor_outputs
-        )
-        vf_loss, vf_infos = self._vf_loss_function(
-            episode_data, train_inputs, actor_outputs
-        )
+        kl_loss, kl_info = self._kl_loss(episode_data, train_inputs, actor_outputs)
 
-        loss = ppo_loss + vf_loss
+        ppo_loss, ppo_info = self._ppo_loss(episode_data, train_inputs, actor_outputs)
+        vf_loss, vf_info = self._vf_loss(episode_data, train_inputs, actor_outputs)
 
-        self.log_training(
-            ppo_infos | vf_infos | locals(),
-        )
+        loss = ppo_loss + vf_loss + kl_loss
+
+        # kl_info, vf_info, and ppo_info will all get included in locals
+        self._log_training_infos(locals())
         return loss
 
-    def _ppo_loss_function(
+    def _ppo_loss(
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
         actor_outputs: list[ActorOutput],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         advantages, adv_len = pack_tensors(
             [train_input.advantages for train_input in train_inputs]
         )
-        action_ll_packed = pack_tensors_check(
+        log_probs = pack_tensors_check(
             [actor_out.action_lls for actor_out in actor_outputs], adv_len
         )
 
-        old_log_prob = pack_tensors_check(
+        old_log_probs = pack_tensors_check(
             [data.original_action_lls for data in episode_data], adv_len
         )
-        assert not old_log_prob.requires_grad
+        assert not old_log_probs.requires_grad
 
-        ratio = torch.exp(action_ll_packed - old_log_prob)
+        ratio = torch.exp(log_probs - old_log_probs)
         ratio_clipped = torch.clamp(
             ratio, 1 / (1 + self.cfg.actor_clip_ratio), 1 + self.cfg.actor_clip_ratio
         )
@@ -458,21 +464,24 @@ class Trainer(nn.Module):
         policy_gradient = ratio * advantages
         clip_policy_gradient = ratio_clipped * advantages
 
-        pi_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
+        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
         return (
-            pi_loss,
+            ppo_loss,
             dict(
                 clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
             )
             | locals(),
         )
 
-    def _vf_loss_function(
+    def _vf_loss(
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
         actor_outputs: list[ActorOutput],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # For consistency with other loss functions, we still take
+        # episode_data, but don't use it.
+        del episode_data
         vf_targets_packed, adv_len = pack_tensors(
             [train_input.vf_targets for train_input in train_inputs]
         )
@@ -488,14 +497,66 @@ class Trainer(nn.Module):
         )
 
         return (
-            self.cfg.vf_loss_coeff * vf_loss,
+            self.cfg.vf_loss_coef * vf_loss,
             dict(
                 mb_ev=explained_variance(critic_out, discounted_returns),
             )
             | locals(),
         )
 
-    def _minibatch(
+    def _kl_loss(
+        self,
+        episode_data: list[EpisodeData],
+        train_inputs: list[PolicyTrainingInputs],
+        actor_outputs: list[ActorOutput],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # For consistency with other loss functions, we still take
+        # train_inputs, but don't use it.
+        del train_inputs
+        # Computed for logging purposes
+        original_kl_coef = self.kl_coef.detach().item()
+
+        # Compute KL Divergence
+        if (
+            not self.cfg.use_approx_kl
+            and episode_data[0].original_action_dists is not None
+        ):
+            new_dists = [actor_out.action_dists for actor_out in actor_outputs]
+            assert new_dists[0] is not None
+            old_dists = [ep_data.original_action_dists for ep_data in episode_data]
+            assert old_dists[0] is not None
+            # TODO: Add options for other KL directions
+            kl = kl_div(old_dists, new_dists)
+        else:
+            log_probs, lengths = pack_tensors(
+                [actor_out.action_lls for actor_out in actor_outputs]
+            )
+            old_log_probs = pack_tensors_check(
+                [data.original_action_lls for data in episode_data], lengths
+            )
+            kl = approx_kl_div(old_log_probs, log_probs)
+
+        # Update KL loss coefficient
+        if self.cfg.kl_target_stat == "max":
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().max())
+        elif self.cfg.kl_target_stat == "mean":
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().mean())
+        else:
+            raise ValueError(f"Unknown kl_target_stat {self.cfg.kl_target_stat}")
+        self.kl_coef_opt.zero_grad()
+        kl_coef_loss.backward()
+        self.kl_coef_opt.step()
+        if self.kl_coef < self.cfg.kl_coef_min:
+            with torch.no_grad():
+                self.kl_coef.copy_(self.cfg.kl_coef_min)
+        if self.kl_coef > self.cfg.kl_coef_max:
+            with torch.no_grad():
+                self.kl_coef.copy_(self.cfg.kl_coef_max)
+        kl_coef = self.kl_coef.detach()
+
+        return kl_coef * kl, locals()
+
+    def _actor_minibatches(
         self,
         episodes: Optional[list[EpisodeData]] = None,
         extra_data: Optional[list[T]] = None,
@@ -505,9 +566,18 @@ class Trainer(nn.Module):
         shuffle: bool = False,
         start_of_epoch_callback: Optional[Callable[[int], None]] = None,
     ) -> Generator[list[tuple[EpisodeData, T, ActorOutput]], None, None]:
-        """Split a large number of episodes into batches to avoid out of memory error.
+        """Runs the actor forward pass on minibatches drawn from the replay buffer.
 
-        Yields: list[tuple[EpisodeData, ForwardResult]]
+        Minibatches are a list of tuples of EpisodeData from the input, data T
+        from the extra_data (None if not provided), and ActorOutput from the
+        actor forward pass.
+
+        This method handles sizing of minibatches to avoid OOM, shuffling of
+        episodes, rendering the progress bar, and running for multiple epochs.
+        Basically, this method plays a similar role to "Trainer" classes in
+        supervised learning libraries.
+
+        Yields: list[tuple[EpisodeData, T, ForwardResult]]
         """
         if episodes is None:
             episodes = self._replay_buffer
@@ -598,15 +668,32 @@ class Trainer(nn.Module):
                         next_ep_index = start_batch_ep_index
 
     def train_step(self):
+        """Runs one "policy step" of training.
+
+        This method should be called repeatedly until training is complete.
+        Unless training is completely off-policy, new episodes should be added
+        between each call to this method using add_episode().
+
+        All options for tuning this method are present in the TrainerConfig
+        passed on Trainer initialization.
+        """
+
         train_inputs = self.preprocess()
         self.log_dataset(train_inputs)
         self.actor.train(mode=True)
         self.vf.train(mode=True)
+
+        # Cached policy outputs for VF training.
+        # This avoids performing a full pass on the actor network when tuning
+        # the VF outside of the primary loss.
+        # The VF loss still tunes the full network in the primary loss.
         observation_latent_cache = {}
         action_lls_cache = {}
+
+        # Pre-train VF (usually only used for off-policy algorithms)
         if self.cfg.vf_pre_training_epochs > 0:
             with torch.no_grad():
-                for batch in self._minibatch(desc="Caching latents"):
+                for batch in self._actor_minibatches(desc="Caching latents"):
                     for ep_data, _, actor_res in batch:
                         observation_latent_cache[
                             ep_data.episode_number
@@ -618,7 +705,9 @@ class Trainer(nn.Module):
                 self.cfg.vf_pre_training_epochs,
                 desc="Pre Training VF",
             )
-        for batch in self._minibatch(
+
+        # Run primary training loop.
+        for batch in self._actor_minibatches(
             desc="Training Actor",
             extra_data=train_inputs,
             epochs=self.cfg.policy_epochs_per_train_step,
@@ -649,8 +738,19 @@ class Trainer(nn.Module):
                 self.actor_optimizer.step()
             except RuntimeError as ex:
                 # This seems to only trigger if the batch is so small the loss
-                # is nan or so big we OOM
-                warnings.warn(ex)
+                # is NaN or so big we OOM.
+                # Because we checked for non-finite in grad_norm, this should
+                # reliably prevent corrupting the network, at the cost of
+                # potentially extremely slowing training on e.g. an over-fit
+                # VF or excessively off-policy data.
+                # TODO: Crash if we catch too many errors here
+                LOGGER.error(f"RuntimeError in actor optimizations: {ex}")
+
+        # Extra VF tuning after the primary training loop.
+        # This achieves similar objectives to PPG by simply not doing updates
+        # on the actor network in this phase.
+        # Inputs are guaranteed to be cached, since we ran at least one full
+        # epoch in the primary loop.
         if self.cfg.vf_post_training_epochs > 0:
             self._train_vf(
                 observation_latent_cache,
@@ -658,6 +758,8 @@ class Trainer(nn.Module):
                 self.cfg.vf_post_training_epochs,
                 desc="Post Training VF",
             )
+
+        # Update all the statistics.
         self.actor_lr_scheduler.step()
         self.vf_lr_scheduler.step()
         self.actor.train(mode=False)
@@ -673,6 +775,18 @@ class Trainer(nn.Module):
         training_epochs: int,
         desc: str,
     ):
+        """Train just the VF using cached actor outputs.
+
+        observation_latents and action_lls are indexed by the `episode_number`
+        field of EpisodeData, and should contain non-differentiable cached
+        components from each episode's ActorOutput.
+
+        This method does not tune the parameters of the actor.
+
+        Because this training is only tuning the memoryless VF tail, it uses
+        smaller minibatches of shuffled timesteps from across multiple
+        episodes.
+        """
         obs_latents_packed, obs_lens = pack_tensors(
             [
                 observation_latents[ep_data.episode_number]
@@ -744,6 +858,9 @@ class Trainer(nn.Module):
                     vf_out = self.vf(batch["observation_latents"])
                     vf_loss = F.mse_loss(vf_out, batch["vf_targets"])
                     vf_loss.backward()
+                    # If we have a NaN in this update, it's probably best to
+                    # just crash, since something is very wrong with the
+                    # training run.
                     clip_grad_norm_(
                         self.vf.parameters(),
                         max_norm=self.cfg.grad_norm_max,
@@ -753,18 +870,15 @@ class Trainer(nn.Module):
                     pbar.n += len(batch["observation_latents"])
                     pbar.refresh()
 
-    def log_training(self, train_locals: dict[str, Any]):
+    def _log_training_infos(self, train_locals: dict[str, Any]):
         training_stats = {
-            k: train_locals[k].item()
-            for k in ["vf_loss", "pi_loss", "mb_ev", "clip_portion"]
+            k: train_locals[k].item() for k in ["vf_loss", "ppo_loss", "kl_loss"]
         }
-
-        training_stats["ratio"] = train_locals["ratio"]
-        training_stats["vf_targets_mean"] = train_locals["discounted_returns"].mean()
-        training_stats["critic_out_mean"] = train_locals["critic_out"].mean()
-
-        self.last_training_stats = training_stats
+        training_stats["clip_portion"] = train_locals["ppo_info"]["clip_portion"]
         stick.log("training_stats", training_stats, level=stick.INFO)
+        self.last_training_stats = training_stats
+
+        stick.log("train_locals", train_locals, level=stick.TRACE)
 
     def log_dataset(self, train_inputs: list[PolicyTrainingInputs]):
         full_episode_rewards = pad_tensors(
@@ -1005,17 +1119,21 @@ class Trainer(nn.Module):
                         )
                 setattr(self, k, v)
 
+        # Make sure optimizers are attached to parameters
+        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
+        assert self.vf_optimizer.param_groups[0]["params"][0] is next(
+            self.vf.parameters()
+        )
+        assert self.actor_optimizer.param_groups[0]["params"][0] is next(
+            self.actor.parameters()
+        )
+
     def maybe_checkpoint(self):
         checkpoint_interval = (
             self.cfg.checkpoint_interval >= 0
             and self.train_steps_so_far - self.train_steps_so_far_at_last_checkpoint
             >= self.cfg.checkpoint_interval
         )
-        # log({
-        #     'train_steps_so_far': self.train_steps_so_far,
-        #     'train_steps_so_far_at_last_checkpoint': self.train_steps_so_far_at_last_checkpoint,
-        # }, level=stick.CRITICAL)
-        # assert checkpoint_interval
         checkpoint_best = (
             self.cfg.checkpoint_best
             and self.primary_performance > self.primary_performance_at_last_checkpoint

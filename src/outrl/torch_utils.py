@@ -12,7 +12,7 @@ from typing import (
     Callable,
     Tuple,
     Optional,
-    TypeVar
+    TypeVar,
 )
 import math
 
@@ -26,6 +26,10 @@ SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], nn.Module]
 Initializer = Callable[[torch.Tensor], None]
 Shape = Union[int, Tuple[int, ...]]
 Sizes = Union[int, Tuple[int, ...], List[int]]
+
+ActionDist = Union[
+    torch.distributions.Distribution, list[torch.distributions.Distribution]
+]
 
 
 def soft_update_model(target_model: nn.Module, source_model: nn.Module, tau: float):
@@ -333,7 +337,6 @@ class RunningMeanVar(nn.Module):
 
 @dataclass
 class Shaper:
-
     lengths: list[int]
 
     @classmethod
@@ -347,7 +350,9 @@ class Shaper:
             tensors = [t[:length] for (t, length) in zip(tensors, self.lengths)]
         return pack_tensors_check(tensors, self.lengths)
 
-    def pad(self, tensors: list[torch.Tensor], force_lengths: bool=False) -> torch.Tensor:
+    def pad(
+        self, tensors: list[torch.Tensor], force_lengths: bool = False
+    ) -> torch.Tensor:
         if force_lengths:
             assert len(self.lengths) == len(tensors)
             tensors = [t[:length] for (t, length) in zip(tensors, self.lengths)]
@@ -378,10 +383,13 @@ def pack_recursive(data: Union[list[T], T]) -> T:
     elif isinstance(data, list):
         return [pack_recursive(d) for d in data]
     elif is_dataclass(data):
-        return replace(data, **{
-            field.name: pack_recursive(getattr(data, field.name))
-            for field in fields(data)
-        })
+        return replace(
+            data,
+            **{
+                field.name: pack_recursive(getattr(data, field.name))
+                for field in fields(data)
+            },
+        )
     else:
         return data
 
@@ -519,9 +527,22 @@ def split_shuffled_indices(total: int, p_right: float = 0.5):
     return indices[:split_i], indices[split_i:]
 
 
-def approx_kl_div(P_lls, Q_lls):
+def approx_kl_div(P_lls: torch.Tensor, Q_lls: torch.Tensor) -> torch.Tensor:
     Px = P_lls.exp()
-    return (Px * (P_lls - Q_lls)).sum()
+    return (Px * (P_lls - Q_lls))
+
+
+def kl_div(
+    p_dist: Union[ActionDist, list[ActionDist]],
+    q_dist: Union[ActionDist, list[ActionDist]],
+) -> torch.Tensor:
+    if isinstance(p_dist, list):
+        assert isinstance(q_dist, list)
+        assert len(p_dist) == len(q_dist)
+        return torch.cat([kl_div(p, q) for (p, q) in zip(p_dist, q_dist)])
+    else:
+        assert not isinstance(q_dist, list)
+        return torch.distributions.kl.kl_divergence(p_dist, q_dist)
 
 
 def average_modules(m1, m2):

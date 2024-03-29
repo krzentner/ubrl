@@ -111,7 +111,12 @@ def prepare_training_directory(cfg):
     stick.tb_output.DEFAULT_LOG_LEVEL = stick.LOG_LEVELS[cfg.tb_log_level]
 
     # stick will handle seeding for us
-    stick.init_extra(log_dir=cfg.log_dir, run_name=cfg.run_name, config=cfg.to_dict(), stderr_log_level=cfg.stderr_log_level)
+    stick.init_extra(
+        log_dir=cfg.log_dir,
+        run_name=cfg.run_name,
+        config=cfg.to_dict(),
+        stderr_log_level=cfg.stderr_log_level,
+    )
     if cfg.pprint_logging:
         from stick.pprint_output import PPrintOutputEngine
 
