@@ -95,11 +95,14 @@ class GymActor(nn.Module):
         assert action_pack_lens == pack_lens
         obs_latents, params, infos = self._run_net(observations)
         del infos
+
         batch_dist = self.construct_dist(params)
         obs_latents = unpack_tensors(obs_latents, pack_lens)
         packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
+        unpacked_params = {k: unpack_tensors(v, pack_lens)
+                           for (k, v) in params.items()}
         dists = [
-            self.construct_dist({k: v[i] for (k, v) in params.items()})
+            self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})
             for i in range(len(episodes))
         ]
         action_lls = [

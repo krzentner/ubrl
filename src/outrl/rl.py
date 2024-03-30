@@ -234,7 +234,7 @@ class TrainerConfig(Config):
     expected_train_steps: int = 1000
     """Expected number of training steps. Used for controlling scheduled parameters."""
 
-    actor_lr_schedule: str = tunable(
+    actor_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
     actor_lr_start: float = tunable(1e-3, FloatDistribution(1e-6, 1e-2, log=True))
@@ -244,7 +244,7 @@ class TrainerConfig(Config):
 
     actor_clip_ratio: float = tunable(0.2, FloatDistribution(1e-3, 10.0, log=True))
 
-    vf_lr_schedule: str = tunable("linear", CategoricalDistribution([None, "linear"]))
+    vf_lr_schedule: Optional[str] = tunable("linear", CategoricalDistribution([None, "linear"]))
     vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-6, 1e-2, log=True))
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
 
@@ -281,8 +281,8 @@ class TrainerConfig(Config):
     temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
 
     kl_coef_init: float = tunable(0.0, FloatDistribution(0.0, 100.0))
-    kl_coef_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
-    kl_coef_min: float = tunable(0.0, FloatDistribution(0.0, 1.0))
+    kl_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
+    kl_coef_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
     kl_coef_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
     kl_target_stat: Literal["mean", "max"] = tunable(
         "mean", CategoricalDistribution(["mean", "max"])
@@ -291,7 +291,7 @@ class TrainerConfig(Config):
     kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
     kl_use_fixup: bool = False
 
-    use_approx_kl: bool = True
+    use_approx_kl: bool = False
     """Approximate the KL divergence using the log-likelihoods."""
 
     use_approx_entropy: bool = False
@@ -317,7 +317,7 @@ class TrainerConfig(Config):
     checkpoint_replay_buffer: bool = True
     """Whether to checkpoint the replay_buffer."""
 
-    def fill_defaults(self):
+    def __post_init__(self):
         """Fill in values with non-constant defaults. Called after construction."""
         if self.seed < -1:
             raise ValueError("seed should be positive or exactly -1")
@@ -326,11 +326,10 @@ class TrainerConfig(Config):
         if self.kl_target_stat == "max" and self.use_approx_kl:
             raise ValueError("Cannot used kl_target_stat='max' with approximated KL.")
         log_dir = os.path.abspath(self.log_dir)
+        object.__setattr__(self, 'log_dir', log_dir)
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
-        else:
-            stderr_log_level = self.stderr_log_level
-        return replace(self, log_dir=log_dir, stderr_log_level=stderr_log_level)
+            object.__setattr__(self, 'stderr_log_level', stderr_log_level)
 
 
 @dataclass
@@ -424,7 +423,7 @@ class Trainer(nn.Module):
 
     def _primary_loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         episode_data: list[EpisodeData] = [b[0] for b in batch]
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
         actor_outputs: list[ActorOutput] = [b[2] for b in batch]
@@ -434,11 +433,11 @@ class Trainer(nn.Module):
         ppo_loss, ppo_info = self._ppo_loss(episode_data, train_inputs, actor_outputs)
         vf_loss, vf_info = self._vf_loss(episode_data, train_inputs, actor_outputs)
 
-        loss = ppo_loss + vf_loss + kl_loss
+        loss = (ppo_loss + vf_loss + kl_loss) / self.cfg.minibatch_target_timesteps
+        # loss = ppo_loss + vf_loss + kl_loss
 
         # kl_info, vf_info, and ppo_info will all get included in locals
-        self._log_training_infos(locals())
-        return loss
+        return loss, locals()
 
     def _ppo_loss(
         self,
@@ -563,6 +562,7 @@ class Trainer(nn.Module):
                 self.kl_coef.copy_(self.cfg.kl_coef_max)
         kl_coef = self.kl_coef.detach()
 
+        kl_mean = kl.mean()
         infos = locals()
         del infos["lengths"]
         return kl_coef * kl.sum(), infos
@@ -593,7 +593,7 @@ class Trainer(nn.Module):
         if episodes is None:
             episodes = self._replay_buffer
 
-        if len(extra_data) == 0 or extra_data is None:
+        if extra_data is None or len(extra_data) == 0:
             extra_data = [None for _ in episodes]
         assert len(extra_data) == len(episodes)
 
@@ -730,10 +730,11 @@ class Trainer(nn.Module):
                     ep_data.episode_number
                 ] = actor_res.observation_latents.detach()
                 action_lls_cache[ep_data.episode_number] = actor_res.action_lls.detach()
-            loss = self._primary_loss_function(batch)
+            loss, loss_infos = self._primary_loss_function(batch)
             self.vf_optimizer.zero_grad()
             self.actor_optimizer.zero_grad()
             loss.backward()
+            self._log_training_infos(loss_infos)
             try:
                 clip_grad_norm_(
                     self.actor.parameters(),
@@ -883,9 +884,10 @@ class Trainer(nn.Module):
 
     def _log_training_infos(self, train_locals: dict[str, Any]):
         training_stats = {
-            k: train_locals[k].item() for k in ["vf_loss", "ppo_loss", "kl_loss"]
+            k: train_locals[k].item() for k in ["loss", "vf_loss", "ppo_loss", "kl_loss"]
         }
         training_stats["clip_portion"] = train_locals["ppo_info"]["clip_portion"]
+        training_stats["kl_mean"] = train_locals["kl_info"]["kl_mean"]
         stick.log("training_stats", training_stats, level=stick.INFO)
         self.last_training_stats = training_stats
 
@@ -1080,6 +1082,8 @@ class Trainer(nn.Module):
         self._next_episode_number += 1
 
     def add_eval_stats(self, stats: dict[str, float], primary: str):
+        assert "primary" not in stats
+        stats["primary"] = stats[primary]
         log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats

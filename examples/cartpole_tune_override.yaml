@@ -1,0 +1,4 @@
+n_train_steps: 2
+policy_epochs_per_train_step: 3
+vf_pre_training_epochs: 0
+vf_post_training_epochs: 10
