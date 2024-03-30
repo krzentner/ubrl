@@ -43,6 +43,7 @@ mujoco-py = { version = ">=2.1,<2.2", optional = true }
 simple-parsing = "^0.1.5"
 tensorboardx = {version = "^2.6.2.2", extras = ["tensorboardX"]}
 gymnasium = { version = "^0.29.1", optional = true }
+optuna-dashboard = {version = "^0.15.1", extras = ["optuna"]}
 
 [tool.poetry.group.dev.dependencies]
 py-spy = "^0.3.14"

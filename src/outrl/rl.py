@@ -7,6 +7,7 @@ import warnings
 import logging
 import pickle
 from glob import glob
+import time
 
 import torch
 import torch.nn as nn
@@ -234,6 +235,8 @@ class TrainerConfig(Config):
     expected_train_steps: int = 1000
     """Expected number of training steps. Used for controlling scheduled parameters."""
 
+    train_step_timeout_seconds: Optional[int] = None
+
     actor_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
@@ -244,7 +247,9 @@ class TrainerConfig(Config):
 
     actor_clip_ratio: float = tunable(0.2, FloatDistribution(1e-3, 10.0, log=True))
 
-    vf_lr_schedule: Optional[str] = tunable("linear", CategoricalDistribution([None, "linear"]))
+    vf_lr_schedule: Optional[str] = tunable(
+        "linear", CategoricalDistribution([None, "linear"])
+    )
     vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-6, 1e-2, log=True))
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
 
@@ -326,10 +331,10 @@ class TrainerConfig(Config):
         if self.kl_target_stat == "max" and self.use_approx_kl:
             raise ValueError("Cannot used kl_target_stat='max' with approximated KL.")
         log_dir = os.path.abspath(self.log_dir)
-        object.__setattr__(self, 'log_dir', log_dir)
+        object.__setattr__(self, "log_dir", log_dir)
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
-            object.__setattr__(self, 'stderr_log_level', stderr_log_level)
+            object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
 
 @dataclass
@@ -689,6 +694,17 @@ class Trainer(nn.Module):
         passed on Trainer initialization.
         """
 
+        start_time = time.monotonic()
+        if (
+            self.cfg.train_step_timeout_seconds is not None
+            and self.cfg.train_step_timeout_seconds > 0
+        ):
+            deadline = start_time + self.cfg.train_step_timeout_seconds
+        else:
+            deadline = start_time + float("inf")
+
+        timed_out = False
+
         train_inputs = self.preprocess()
         self.log_dataset(train_inputs)
         self.actor.train(mode=True)
@@ -710,11 +726,12 @@ class Trainer(nn.Module):
                             ep_data.episode_number
                         ] = actor_res.observation_latents
                         action_lls_cache[ep_data.episode_number] = actor_res.action_lls
-            self._train_vf(
+            timed_out = self._train_vf(
                 observation_latent_cache,
                 action_lls_cache,
                 self.cfg.vf_pre_training_epochs,
                 desc="Pre Training VF",
+                deadline=deadline,
             )
 
         # Run primary training loop.
@@ -725,6 +742,9 @@ class Trainer(nn.Module):
             shuffle=True,
             minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
         ):
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
             for ep_data, _, actor_res in batch:
                 observation_latent_cache[
                     ep_data.episode_number
@@ -763,12 +783,13 @@ class Trainer(nn.Module):
         # on the actor network in this phase.
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
-        if self.cfg.vf_post_training_epochs > 0:
-            self._train_vf(
+        if self.cfg.vf_post_training_epochs > 0 and not timed_out:
+            timed_out = self._train_vf(
                 observation_latent_cache,
                 action_lls_cache,
                 self.cfg.vf_post_training_epochs,
                 desc="Post Training VF",
+                deadline=deadline,
             )
 
         # Update all the statistics.
@@ -780,12 +801,16 @@ class Trainer(nn.Module):
         self._replay_buffer = []
         self.train_steps_so_far += 1
 
+        if timed_out:
+            LOGGER.error("train_step() timed out")
+
     def _train_vf(
         self,
         observation_latents: dict[int, torch.Tensor],
         action_lls: dict[int, torch.Tensor],
         training_epochs: int,
         desc: str,
+        deadline: float,
     ):
         """Train just the VF using cached actor outputs.
 
@@ -881,10 +906,14 @@ class Trainer(nn.Module):
                     self.vf_optimizer.step()
                     pbar.n += len(batch["observation_latents"])
                     pbar.refresh()
+                    if time.monotonic() > deadline:
+                        return True
+        return False
 
     def _log_training_infos(self, train_locals: dict[str, Any]):
         training_stats = {
-            k: train_locals[k].item() for k in ["loss", "vf_loss", "ppo_loss", "kl_loss"]
+            k: train_locals[k].item()
+            for k in ["loss", "vf_loss", "ppo_loss", "kl_loss"]
         }
         training_stats["clip_portion"] = train_locals["ppo_info"]["clip_portion"]
         training_stats["kl_mean"] = train_locals["kl_info"]["kl_mean"]

@@ -117,11 +117,14 @@ def prepare_training_directory(cfg):
 
         stick.add_output(ArrowOutputEngine(log_dir=cfg.log_dir, run_name=cfg.run_name))
 
+
 def _run_self(args):
     import __main__
+
     cmd = ["python3", __main__.__file__] + [str(a) for a in args]
-    print(' '.join(cmd))
-    subprocess.run(cmd, capture_output=True, check=False)
+    print(" ".join(cmd))
+    subprocess.run(cmd, capture_output=False, check=False)
+
 
 class ExperimentInvocation:
     def __init__(self, train_fn, config_type):
@@ -139,7 +142,7 @@ class ExperimentInvocation:
 
         def _sample_config():
             if self.args.override_config is not None:
-                with open(self.args.override_config, 'r') as f:
+                with open(self.args.override_config, "r") as f:
                     # Load "raw" values. suggest_config will call .from_dict to
                     # decode based on the type annotations.
                     overrides = yaml.safe_load(f)
@@ -185,7 +188,7 @@ class ExperimentInvocation:
 
             # Load override config
             if self.args.override_config is not None:
-                with open(self.args.override_config, 'r') as f:
+                with open(self.args.override_config, "r") as f:
                     # Load "raw" values. suggest_config will call .from_dict to
                     # decode based on the type annotations.
                     overrides = yaml.safe_load(f)
@@ -196,11 +199,10 @@ class ExperimentInvocation:
 
             # Setup basic stick logging
             stick.init_extra(
-                log_dir=log_dir,
-                run_name=run_name,
-                stderr_log_level=stick.INFO
+                log_dir=log_dir, run_name=run_name, stderr_log_level=stick.INFO
             )
             from stick.pprint_output import PPrintOutputEngine
+
             stick.add_output(PPrintOutputEngine("stdout"))
 
             storage_url = f"sqlite:///{run_dir}/storage.db"
@@ -208,8 +210,10 @@ class ExperimentInvocation:
             LOGGER.info(f"Creating study {run_name!r} in storage {storage_url!r}")
 
             study = optuna.create_study(
-                storage=storage_url, study_name=run_name
+                storage=storage_url, study_name=run_name, direction="maximize"
             )
+
+            subprocess.Popen(["optuna-dashboard", storage_url])
 
             for trial_index in range(self.args.n_trials):
                 trial = study.ask()
@@ -229,55 +233,87 @@ class ExperimentInvocation:
                 seed_results = []
                 # Run a training run for each seed
                 for s in seeds:
-                    sub_run_name = f'{run_name}_trial={trial_index}_seed={s}'
-                    _run_self(["train", "--config", config_path, "--seed", s, "--run_name", sub_run_name, "--log_dir", log_dir])
-                    eval_stats = stick.load_log_file(os.path.join(log_dir, sub_run_name, "eval_stats.csv"))
-                    max_primary_stat = max(eval_stats["primary"])
-                    last_primary_stat = eval_stats["primary"][-1]
-                    stick.log("seed_results", {
-                        "trial": trial_index,
-                        "seed": s,
-                        "max_primary_stat": max_primary_stat,
-                        "last_primary_stat": last_primary_stat,
-                    })
-                    seed_results.append(max_primary_stat)
-                trial_result = min(seed_results)
-                trial.report(trial_result, step=1)
+                    sub_run_name = f"{run_name}_trial={trial_index}_seed={s}"
+                    _run_self(
+                        [
+                            "train",
+                            "--config",
+                            config_path,
+                            "--seed",
+                            s,
+                            "--run_name",
+                            sub_run_name,
+                            "--log_dir",
+                            log_dir,
+                        ]
+                    )
+                    try:
+                        eval_stats = stick.load_log_file(
+                            os.path.join(log_dir, sub_run_name, "eval_stats.csv")
+                        )
+                        max_primary_stat = max(eval_stats["primary"])
+                        last_primary_stat = eval_stats["primary"][-1]
+                        stick.log(
+                            "seed_results",
+                            {
+                                "trial": trial_index,
+                                "seed": s,
+                                "max_primary_stat": max_primary_stat,
+                                "last_primary_stat": last_primary_stat,
+                            },
+                        )
+                        seed_results.append(max_primary_stat)
+                    except (ValueError, FileNotFoundError):
+                        pass
+                if len(seed_results) == len(seeds):
+                    trial_result = min(seed_results)
+                    study.tell(
+                        trial, trial_result, state=optuna.trial.TrialState.COMPLETE
+                    )
+                else:
+                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
 
         train_parser = subp.add_parser(
-            "train", add_help=False,
+            "train",
+            add_help=False,
             help="Train the actor",
         )
         train_parser.set_defaults(func=_train)
         train_parser.add_argument("--config", default=None, type=str)
 
         # "High-level" hyper parameter tuning command
-        tune_parser = subp.add_parser("tune", help="Automatically tune hyper parameters")
-        tune_parser.set_defaults(func=_tune)
-        tune_parser.add_argument(
-            "--log_dir", type=str, default="runs"
+        tune_parser = subp.add_parser(
+            "tune", help="Automatically tune hyper parameters"
         )
+        tune_parser.set_defaults(func=_tune)
+        tune_parser.add_argument("--log_dir", type=str, default="runs")
         tune_parser.add_argument(
             "--run_name", type=str, default="tune_" + default_run_name()
         )
+        tune_parser.add_argument("--n_trials", type=int, default=1000)
         tune_parser.add_argument(
-            "--n_trials", type=int, default=1000
-        )
-        tune_parser.add_argument(
-            "--override-config", type=str, default=None,
-            help=dedent("""\
+            "--override-config",
+            type=str,
+            default=None,
+            help=dedent(
+                """\
                 Path to partial config file with override values.
                 Used to restrict the search space of the tuning.
-                """)
+                """
+            ),
         )
         tune_parser.add_argument(
-            "--n-seeds-per-trial", type=int, default=2,
-            help=dedent("""\
+            "--n-seeds-per-trial",
+            type=int,
+            default=2,
+            help=dedent(
+                """\
                 Number of seeds to run for each trial / hyper pararmeter configuration.
                 The minimum performance across these seeds will be used as the
                 overall trial performance. This avoids finding hyper parameter
                 configurations that only work for one seed.
-                """)
+                """
+            ),
         )
 
         # "Low level" optuna commands. Useful for distributed hparam tuning.
@@ -285,11 +321,15 @@ class ExperimentInvocation:
         create_parser.set_defaults(func=_create_study)
         create_parser.add_argument("--study-storage", type=str)
         create_parser.add_argument("--study-name", type=str)
-        report_trial = subp.add_parser("report-trial", help="Report results of a run to optuna")
+        report_trial = subp.add_parser(
+            "report-trial", help="Report results of a run to optuna"
+        )
         report_trial.set_defaults(func=_report_trial)
         report_trial.add_argument("--trial-file", type=str)
         report_trial.add_argument("--log-file", type=str)
-        sample_parser = subp.add_parser("sample-config", help="Sample a new config using optuna")
+        sample_parser = subp.add_parser(
+            "sample-config", help="Sample a new config using optuna"
+        )
         sample_parser.set_defaults(func=_sample_config)
         sample_parser.add_argument("--study-storage", type=str)
         sample_parser.add_argument("--study-name", type=str)

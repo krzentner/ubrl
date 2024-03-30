@@ -46,12 +46,10 @@ class GymConfig(TrainerConfig):
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
-    def fill_defaults(self):
-        return replace(
-            super().fill_defaults(),
-            max_buffer_episodes=self.episodes_per_train_step,
-            expected_train_steps=self.n_train_steps,
-        )
+    def __post_init__(self):
+        super().__post_init__()
+        object.__setattr__(self, "max_buffer_episodes", self.episodes_per_train_step)
+        object.__setattr__(self, "expected_train_steps", self.n_train_steps)
 
 
 def train(cfg: GymConfig):

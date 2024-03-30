@@ -2,3 +2,6 @@ n_train_steps: 2
 policy_epochs_per_train_step: 3
 vf_pre_training_epochs: 0
 vf_post_training_epochs: 10
+vf_lr_schedule: null
+actor_lr_schedule: null
+train_step_timeout_seconds: 30
