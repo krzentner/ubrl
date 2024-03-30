@@ -529,7 +529,7 @@ def split_shuffled_indices(total: int, p_right: float = 0.5):
 
 def approx_kl_div(P_lls: torch.Tensor, Q_lls: torch.Tensor) -> torch.Tensor:
     Px = P_lls.exp()
-    return (Px * (P_lls - Q_lls))
+    return Px * (P_lls - Q_lls)
 
 
 def kl_div(

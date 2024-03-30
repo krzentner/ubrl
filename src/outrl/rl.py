@@ -284,14 +284,14 @@ class TrainerConfig(Config):
     kl_coef_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
     kl_coef_min: float = tunable(0.0, FloatDistribution(0.0, 1.0))
     kl_coef_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
-    kl_target_stat: Literal["max", "mean"] = tunable(
-        "max", CategoricalDistribution(["max", "mean"])
+    kl_target_stat: Literal["mean", "max"] = tunable(
+        "mean", CategoricalDistribution(["mean", "max"])
     )
     kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
     kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
     kl_use_fixup: bool = False
 
-    use_approx_kl: bool = False
+    use_approx_kl: bool = True
     """Approximate the KL divergence using the log-likelihoods."""
 
     use_approx_entropy: bool = False
@@ -323,6 +323,8 @@ class TrainerConfig(Config):
             raise ValueError("seed should be positive or exactly -1")
         if self.checkpoint_interval < -1:
             raise ValueError("checkpoint_interval should be positive or exactly -1")
+        if self.kl_target_stat == "max" and self.use_approx_kl:
+            raise ValueError("Cannot used kl_target_stat='max' with approximated KL.")
         log_dir = os.path.abspath(self.log_dir)
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
@@ -414,7 +416,7 @@ class Trainer(nn.Module):
         self.last_training_stats = {}
         self.last_eval_stats = {}
         self.primary_performance: float = float("-inf")
-        self.primary_performance_at_last_checkpoint: float = float("-inf")
+        self.best_checkpoint_primary_performance: float = float("-inf")
         self.train_steps_so_far_at_last_checkpoint = 0
 
         self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
@@ -495,13 +497,11 @@ class Trainer(nn.Module):
         discounted_returns = pack_tensors_check(
             [train_input.discounted_returns for train_input in train_inputs], adv_len
         )
+        minibatch_ev = explained_variance(critic_out, discounted_returns)
 
         return (
             self.cfg.vf_loss_coef * vf_loss,
-            dict(
-                mb_ev=explained_variance(critic_out, discounted_returns),
-            )
-            | locals(),
+            locals(),
         )
 
     def _kl_loss(
@@ -516,11 +516,23 @@ class Trainer(nn.Module):
         # Computed for logging purposes
         original_kl_coef = self.kl_coef.detach().item()
 
+        log_probs, lengths = pack_tensors(
+            [actor_out.action_lls for actor_out in actor_outputs]
+        )
+        old_log_probs = pack_tensors_check(
+            [data.original_action_lls for data in episode_data], lengths
+        )
+        # Normalize to form a proper distribution across actions P(a)
+        log_probs -= log_probs.exp().sum().log()
+        old_log_probs -= old_log_probs.exp().sum().log()
+
+        # Approximate per-timestep KL by multiplying back in the number of timesteps
+        total_timesteps = sum(lengths)
+        approx_kl = total_timesteps * approx_kl_div(old_log_probs, log_probs)
+        total_approx_kl = approx_kl.sum()
+
         # Compute KL Divergence
-        if (
-            not self.cfg.use_approx_kl
-            and episode_data[0].original_action_dists is not None
-        ):
+        if self.cfg.use_approx_kl is False:
             new_dists = [actor_out.action_dists for actor_out in actor_outputs]
             assert new_dists[0] is not None
             old_dists = [ep_data.original_action_dists for ep_data in episode_data]
@@ -528,13 +540,10 @@ class Trainer(nn.Module):
             # TODO: Add options for other KL directions
             kl = kl_div(old_dists, new_dists)
         else:
-            log_probs, lengths = pack_tensors(
-                [actor_out.action_lls for actor_out in actor_outputs]
-            )
-            old_log_probs = pack_tensors_check(
-                [data.original_action_lls for data in episode_data], lengths
-            )
-            kl = approx_kl_div(old_log_probs, log_probs)
+            kl = approx_kl
+
+        assert kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
+        assert approx_kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
 
         # Update KL loss coefficient
         if self.cfg.kl_target_stat == "max":
@@ -554,7 +563,9 @@ class Trainer(nn.Module):
                 self.kl_coef.copy_(self.cfg.kl_coef_max)
         kl_coef = self.kl_coef.detach()
 
-        return kl_coef * kl, locals()
+        infos = locals()
+        del infos["lengths"]
+        return kl_coef * kl.sum(), infos
 
     def _actor_minibatches(
         self,
@@ -1069,7 +1080,6 @@ class Trainer(nn.Module):
         self._next_episode_number += 1
 
     def add_eval_stats(self, stats: dict[str, float], primary: str):
-        logging.info(f"Eval primary stat ({primary}): {stats[primary]}")
         log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats
@@ -1078,6 +1088,7 @@ class Trainer(nn.Module):
         for k, v in stats.items():
             hparams[k] = v
         log("hparams", hparams, step=self.total_env_steps)
+        LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
 
     def state_dict(self):
         state = {}
@@ -1136,7 +1147,7 @@ class Trainer(nn.Module):
         )
         checkpoint_best = (
             self.cfg.checkpoint_best
-            and self.primary_performance > self.primary_performance_at_last_checkpoint
+            and self.primary_performance > self.best_checkpoint_primary_performance
         )
         if checkpoint_interval or checkpoint_best:
             state_dict = self.state_dict()
@@ -1158,6 +1169,7 @@ class Trainer(nn.Module):
                 LOGGER.info(f"Checkpointing to {f_name!r}")
                 with open(f_name, "wb") as f:
                     pickle.dump(state_dict, f)
+                self.best_checkpoint_primary_performance = self.primary_performance
             return True
         else:
             return False

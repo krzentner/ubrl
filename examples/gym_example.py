@@ -103,6 +103,7 @@ def train(cfg: GymConfig):
                 rewards=episode["rewards"],
                 action_lls=episode["action_lls"],
                 terminated=episode["terminated"],
+                action_dists=episode["action_dists"],
                 any_actions_possible=episode["any_actions_possible"],
                 infos=episode["env_infos"] | episode["agent_infos"],
             )

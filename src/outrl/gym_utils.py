@@ -48,7 +48,12 @@ class GymActor(nn.Module):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        raise NotImplementedError()
+
+    def construct_dist(
+        self, params: dict[str, torch.Tensor]
+    ) -> torch.distributions.Distribution:
         raise NotImplementedError()
 
     def get_actions(
@@ -60,13 +65,15 @@ class GymActor(nn.Module):
         del reset_mask
         assert len(observations.shape) == 2
         with torch.no_grad():
-            _, dist, infos = self._run_net(
+            _, params, infos = self._run_net(
                 torch.from_numpy(observations)
                 .to(dtype=self.dtype)
                 .to(device=self.device)
             )
+        dist = self.construct_dist(params)
         action = maybe_sample(dist, best_action)
         action_ll = dist.log_prob(action)
+        infos.update({f"params.{k}": v for (k, v) in params.items()})
         infos.update(
             {
                 "action_ll": action_ll,
@@ -86,19 +93,23 @@ class GymActor(nn.Module):
         )
         actions = actions.to(dtype=self.dtype).to(device=self.device)
         assert action_pack_lens == pack_lens
-        observation_latents, dist, infos = self._run_net(observations)
+        obs_latents, params, infos = self._run_net(observations)
         del infos
-        observation_latents = unpack_tensors(observation_latents, pack_lens)
-        packed_action_ll = dist.log_prob(actions).squeeze(-1)
+        batch_dist = self.construct_dist(params)
+        obs_latents = unpack_tensors(obs_latents, pack_lens)
+        packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
+        dists = [
+            self.construct_dist({k: v[i] for (k, v) in params.items()})
+            for i in range(len(episodes))
+        ]
         action_lls = [
             act_lls[:-1] for act_lls in unpack_tensors(packed_action_ll, pack_lens)
         ]
         return [
             ActorOutput(
-                observation_latents=obs_latents,
-                action_lls=act_lls,
+                observation_latents=obs_lat, action_lls=act_lls, action_dists=dist
             )
-            for (obs_latents, act_lls) in zip(observation_latents, action_lls)
+            for (obs_lat, act_lls, dist) in zip(obs_latents, action_lls, dists)
         ]
 
 
@@ -133,21 +144,29 @@ class GymBoxActor(GymActor):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         observation_latents = self.shared_layers(obs)
         pi_x = self.pi_layers(observation_latents)
         mean = self.action_mean(pi_x)
         std = torch.clamp(self.action_logstd(pi_x).exp(), min=self.min_std)
-        dist = torch.distributions.Normal(mean, std)
-        dist = torch.distributions.Independent(dist, 1)
+        params = dict(mean=mean, std=std)
         return (
             observation_latents,
-            dist,
+            params,
             {
-                "action_mean": dist.mean.mean(dim=-1),
-                "action_stddev": dist.stddev.mean(dim=-1),
+                "action_mean": mean.mean(dim=-1),
+                "action_stddev": std.mean(dim=-1),
             },
         )
+
+    def construct_dist(
+        self, params: dict[str, torch.Tensor]
+    ) -> torch.distributions.Distribution:
+        mean, std = params["mean"], params["std"]
+        dist = torch.distributions.Normal(mean, std)
+        if len(mean.shape) > 1:
+            dist = torch.distributions.Independent(dist, 1)
+        return dist
 
 
 class GymBoxCategorialActor(GymActor):
@@ -165,17 +184,23 @@ class GymBoxCategorialActor(GymActor):
 
     def _run_net(
         self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.distributions.Distribution, dict]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         observation_latents = self.shared_layers(obs)
         pi_x = self.pi_layers(observation_latents)
         action_logits = self.action_logits(pi_x)
-        dist = torch.distributions.Categorical(logits=action_logits)
+        params = dict(logits=action_logits)
+        dist = self.construct_dist(params)
         infos = {
             f"action_{i}_prob": prob
             for (i, prob) in enumerate(dist.probs.transpose(0, 1))
         }
         assert len(infos["action_0_prob"]) == len(dist.probs)
-        return observation_latents, dist, infos
+        return observation_latents, params, infos
+
+    def construct_dist(
+        self, params: dict[str, torch.Tensor]
+    ) -> torch.distributions.Categorical:
+        return torch.distributions.Categorical(logits=params["logits"])
 
 
 def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
@@ -217,6 +242,7 @@ def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
         "rewards": torch.from_numpy(np.array(episode["rewards"])),
         "terminated": any(episode["terminals"]),
         "action_lls": action_lls,
+        "action_dists": episode["action_dists"],
         "any_actions_possible": torch.ones(len(action_lls), dtype=torch.bool),
     }
 
@@ -319,6 +345,17 @@ def collect(
                         and len(terms) >= max_episode_length
                     )
                 ):
+                    # Construct a single batch distribution
+                    # covering the whole episode
+                    action_dist_params = {}
+                    for key in agent_infos[i][0].keys():
+                        if key.startswith("params."):
+                            k = key.split(".", 1)[1]
+                            action_dist_params[k] = torch.stack(
+                                [agent_i[key] for agent_i in agent_infos[i]]
+                            )
+                    action_dists = actor.construct_dist(action_dist_params)
+
                     episodes.append(
                         process_episode(
                             {
@@ -328,6 +365,7 @@ def collect(
                                 "agent_infos": agent_infos[i],
                                 "rewards": rewards[i],
                                 "terminals": terminals[i],
+                                "action_dists": action_dists,
                             }
                         )
                     )
