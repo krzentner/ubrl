@@ -206,12 +206,6 @@ class TrainerConfig(Config):
     max_buffer_episodes: int = 128
     """Maximum number of episodes to keep in replay buffer."""
 
-    episode_priority_decay: float = tunable(0.5, FloatDistribution(0.0, 1.0))
-    """Probability to sample an episode from a prior actor version.
-
-    Set to 0 to ensure sampling is completely on-policy.
-    """
-
     max_timesteps_per_forward: Optional[int] = None
     """Maximum number of timesteps to include in a forward pass to the actor.
     Used to avoid out-of-memory errors.
@@ -240,17 +234,17 @@ class TrainerConfig(Config):
     actor_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
-    actor_lr_start: float = tunable(1e-3, FloatDistribution(1e-6, 1e-2, log=True))
+    actor_lr_start: float = tunable(1e-3, FloatDistribution(1e-4, 5e-2, log=True))
     actor_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
 
     actor_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
 
-    actor_clip_ratio: float = tunable(0.2, FloatDistribution(1e-3, 10.0, log=True))
+    actor_clip_ratio: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
 
     vf_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
-    vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-6, 1e-2, log=True))
+    vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-4, 0.1, log=True))
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
 
     vf_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
@@ -261,7 +255,7 @@ class TrainerConfig(Config):
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
-    vf_loss_coef: float = tunable(0.1, FloatDistribution(0.01, 2.0))
+    vf_loss_coef: float = tunable(0.1, FloatDistribution(0.01, 1.0))
 
     vf_hidden_sizes: list[int] = tunable(
         [128, 128],
@@ -308,7 +302,7 @@ class TrainerConfig(Config):
         False, CategoricalDistribution([True, False])
     )
 
-    grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e3, log=True))
+    grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e2, log=True))
 
     checkpoint_interval: int = 1
     """Number of train_step calls between checkpoints when calling maybe_checkpoint().
@@ -321,6 +315,13 @@ class TrainerConfig(Config):
 
     checkpoint_replay_buffer: bool = True
     """Whether to checkpoint the replay_buffer."""
+
+    log_every_grad_step: bool = False
+    """Log information every training gradient step.
+
+    This has moderate performance implications (roughly a 10% increase in wall
+    clock time), and is thus disabled by default.
+    """
 
     def __post_init__(self):
         """Fill in values with non-constant defaults. Called after construction."""
@@ -383,7 +384,7 @@ class Trainer(nn.Module):
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer = RunningMeanVar()
+        self.reward_normalizer = RunningMeanVar(use_mean=False)
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(),
             lr=self.cfg.actor_lr_start,
@@ -580,8 +581,9 @@ class Trainer(nn.Module):
         desc: Optional[str] = None,
         epochs: int = 1,
         shuffle: bool = False,
-        start_of_epoch_callback: Optional[Callable[[int], None]] = None,
-    ) -> Generator[list[tuple[EpisodeData, T, ActorOutput]], None, None]:
+    ) -> Generator[
+        tuple[int, int, list[tuple[EpisodeData, T, ActorOutput]]], None, None
+    ]:
         """Runs the actor forward pass on minibatches drawn from the replay buffer.
 
         Minibatches are a list of tuples of EpisodeData from the input, data T
@@ -619,8 +621,6 @@ class Trainer(nn.Module):
             total=epochs * sum([ep.num_timesteps for ep in episodes]), desc=desc
         ) as pbar:
             for epoch in range(epochs):
-                if start_of_epoch_callback is not None:
-                    start_of_epoch_callback(epoch)
                 next_ep_index = 0
                 while next_ep_index < len(episodes):
                     start_batch_ep_index = next_ep_index
@@ -720,7 +720,7 @@ class Trainer(nn.Module):
         # Pre-train VF (usually only used for off-policy algorithms)
         if self.cfg.vf_pre_training_epochs > 0:
             with torch.no_grad():
-                for batch in self._actor_minibatches(desc="Caching latents"):
+                for _, _, batch in self._actor_minibatches(desc="Caching latents"):
                     for ep_data, _, actor_res in batch:
                         observation_latent_cache[
                             ep_data.episode_number
@@ -735,7 +735,7 @@ class Trainer(nn.Module):
             )
 
         # Run primary training loop.
-        for batch in self._actor_minibatches(
+        for _, batch_i, batch in self._actor_minibatches(
             desc="Training Actor",
             extra_data=train_inputs,
             epochs=self.cfg.policy_epochs_per_train_step,
@@ -754,7 +754,8 @@ class Trainer(nn.Module):
             self.vf_optimizer.zero_grad()
             self.actor_optimizer.zero_grad()
             loss.backward()
-            self._log_training_infos(loss_infos)
+            if self.cfg.log_every_grad_step or batch_i == 0:
+                self._log_training_infos(loss_infos)
             try:
                 clip_grad_norm_(
                     self.actor.parameters(),
@@ -893,7 +894,9 @@ class Trainer(nn.Module):
                 for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
                     self.vf_optimizer.zero_grad()
                     vf_out = self.vf(batch["observation_latents"])
-                    vf_loss = F.mse_loss(vf_out, batch["vf_targets"])
+                    vf_loss = self.cfg.vf_loss_coef * F.mse_loss(
+                        vf_out, batch["vf_targets"]
+                    )
                     vf_loss.backward()
                     # If we have a NaN in this update, it's probably best to
                     # just crash, since something is very wrong with the

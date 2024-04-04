@@ -247,6 +247,8 @@ class RunningMeanVar(nn.Module):
         clip_max: Optional[float] = 10.0,
         min_var: float = 1e-6,
         trainable: bool = False,
+        use_mean: bool = True,
+        use_var: bool = True,
     ):
         super().__init__()
         # Handle user passing in floats
@@ -281,14 +283,26 @@ class RunningMeanVar(nn.Module):
         self.min_var: float = min_var
         """Minimal permitted variance to avoid division by zero."""
 
+        self.use_mean: bool = use_mean
+        self.use_var: bool = use_var
+
     def normalize_batch(self, x: torch.Tensor, correction=1) -> torch.Tensor:
-        y = (x - self.mean) / (torch.sqrt(self.corrected_var(correction)))
+        y = x
+        if self.use_mean:
+            y -= self.mean
+        if self.use_var:
+            y /= torch.sqrt(self.corrected_var(correction))
         if self.clip_max:
             y = torch.clamp(y, min=-self.clip_max, max=self.clip_max)
         return y
 
     def denormalize_batch(self, y: torch.Tensor, correction=1) -> torch.Tensor:
-        return (y * torch.sqrt(self.corrected_var(correction))) + self.mean
+        x = y
+        if self.use_var:
+            y *= torch.sqrt(self.corrected_var(correction))
+        if self.use_mean:
+            x += self.mean
+        return x
 
     def forward(self, x: torch.Tensor):
         return self.update(x)
