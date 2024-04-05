@@ -31,6 +31,7 @@ from outrl.torch_utils import (
     pack_tensors_check,
     pad_tensors,
     unpad_tensors,
+    pack_padded,
     explained_variance,
     unpack_tensors,
     RunningMeanVar,
@@ -110,7 +111,8 @@ class EpisodeData:
         return self.sort_key() < other.sort_key()
 
     def sort_key(self):
-        """Retain highest sampling priority episodes, tie-break to prefer newer episodes."""
+        """Retain highest sampling priority episodes, tie-break to prefer newer
+        episodes."""
         return (self.sample_priority, self.episode_number)
 
     def __post_init__(self):
@@ -231,6 +233,8 @@ class TrainerConfig(Config):
 
     train_step_timeout_seconds: Optional[int] = None
 
+    ppo_loss_coef: float = tunable(0.0, FloatDistribution(0.01, 1.0))
+    awr_loss_coef: float = tunable(1.0, FloatDistribution(0.01, 1.0))
     actor_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
@@ -250,8 +254,8 @@ class TrainerConfig(Config):
     vf_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
 
     vf_minibatch_size: int = tunable(512, IntDistribution(1, 2**32, log=True))
-    vf_pre_training_epochs: int = tunable(0, IntDistribution(0, 100))
-    vf_post_training_epochs: int = tunable(10, IntDistribution(0, 100))
+    vf_pre_training_epochs: int = tunable(10, IntDistribution(0, 20))
+    vf_post_training_epochs: int = tunable(1, IntDistribution(0, 20))
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
@@ -274,11 +278,6 @@ class TrainerConfig(Config):
     v_trace_rho_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
     v_trace_c_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
 
-    initial_temperature: float = tunable(10.0, FloatDistribution(1e-2, 1e3, log=True))
-    temperature_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
-    temperature_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
-    temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
-
     kl_coef_init: float = tunable(0.0, FloatDistribution(0.0, 100.0))
     kl_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
     kl_coef_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
@@ -298,11 +297,21 @@ class TrainerConfig(Config):
 
     entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
 
-    use_top_half_advantages: bool = tunable(
-        False, CategoricalDistribution([True, False])
+    temperature_init: float = tunable(8.0, FloatDistribution(1e-2, 1e3, log=True))
+    temperature_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
+    temperature_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
+    temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
+
+    norm_exp_advantages: bool = tunable(False, CategoricalDistribution([False, True]))
+
+    filter_bottom_half_advantages: bool = tunable(
+        False, CategoricalDistribution([False, True])
     )
 
     grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e2, log=True))
+
+    recompute_train_inputs: bool = tunable(True, CategoricalDistribution([False, True]))
+    """Recompute advantages and VF targets every epoch inside a train_step()."""
 
     checkpoint_interval: int = 1
     """Number of train_step calls between checkpoints when calling maybe_checkpoint().
@@ -350,6 +359,15 @@ class PolicyTrainingInputs:
     discounted_returns: torch.Tensor
     vf_returns: torch.Tensor
     vf_targets: torch.Tensor
+    exp_advantages: torch.Tensor
+    """Exponentiated advantages. Possibly normalized over the whole batch."""
+
+    adv_loss_mask: torch.Tensor
+    """Loss mask for policy improvement. Only true for timesteps with the
+    top-half of advantages if cfg.filter_bottom_half_advantages.
+
+    Does not affect KL penalty.
+    """
 
 
 SUB_STATE_DICT_FIELDS = [
@@ -361,6 +379,7 @@ SUB_STATE_DICT_FIELDS = [
     "vf_lr_scheduler",
     "actor_lr_scheduler",
     "kl_coef_opt",
+    "awr_temperature_opt",
 ]
 
 IGNORED_FIELDS = ["_is_full_backward_hook"]
@@ -427,6 +446,13 @@ class Trainer(nn.Module):
         self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
         self.kl_coef_opt = torch.optim.Adam([self.kl_coef], lr=self.cfg.kl_coef_lr)
 
+        self.awr_temperature = nn.Parameter(
+            torch.tensor(float(self.cfg.temperature_init))
+        )
+        self.awr_temperature_opt = torch.optim.Adam(
+            [self.awr_temperature], lr=self.cfg.temperature_lr
+        )
+
     def _primary_loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
     ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -437,9 +463,14 @@ class Trainer(nn.Module):
         kl_loss, kl_info = self._kl_loss(episode_data, train_inputs, actor_outputs)
 
         ppo_loss, ppo_info = self._ppo_loss(episode_data, train_inputs, actor_outputs)
+        awr_loss, awr_info = self._awr_loss(episode_data, train_inputs, actor_outputs)
+        # TODO: Tune awr_temperature
+
         vf_loss, vf_info = self._vf_loss(episode_data, train_inputs, actor_outputs)
 
-        loss = (ppo_loss + vf_loss + kl_loss) / self.cfg.minibatch_target_timesteps
+        loss = (
+            ppo_loss + awr_loss + vf_loss + kl_loss
+        ) / self.cfg.minibatch_target_timesteps
         # loss = ppo_loss + vf_loss + kl_loss
 
         # kl_info, vf_info, and ppo_info will all get included in locals
@@ -471,14 +502,46 @@ class Trainer(nn.Module):
         policy_gradient = ratio * advantages
         clip_policy_gradient = ratio_clipped * advantages
 
-        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient).mean()
+        # Mean is handled in the primary_loss_function
+        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
         return (
-            ppo_loss,
+            self.cfg.ppo_loss_coef * ppo_loss.sum(),
             dict(
                 clip_portion=(ratio_clipped != ratio).mean(dtype=torch.float32),
             )
             | locals(),
         )
+
+    def _awr_loss(
+        self,
+        episode_data: list[EpisodeData],
+        train_inputs: list[PolicyTrainingInputs],
+        actor_outputs: list[ActorOutput],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del episode_data
+
+        # Dividing by temperature and normalizing are handled in preprocess
+        # TODO: Should advantage exponentiation happen every minibatch or not?
+        # temperature tuning happens every minibatch, so it seems like the
+        # temperature should be used every minibatch as well.
+        # But also it seems like having a constant temperature throughout a
+        # batch might be ideal.
+
+        # We'll probably add entropy regularization using a minibatch
+        # lagrangian anyways, so maybe it doesn't matter.
+        exp_adv, adv_len = pack_tensors(
+            [train_input.exp_advantages for train_input in train_inputs]
+        )
+        if torch.isnan(exp_adv).any():
+            print("nan in exp_adv")
+            raise RuntimeError("nan in exp_adv")
+
+        log_probs = pack_tensors_check(
+            [actor_out.action_lls for actor_out in actor_outputs], adv_len
+        )
+
+        awr_loss = -log_probs * exp_adv
+        return (self.cfg.awr_loss_coef * awr_loss.sum(), locals())
 
     def _vf_loss(
         self,
@@ -622,6 +685,7 @@ class Trainer(nn.Module):
         ) as pbar:
             for epoch in range(epochs):
                 next_ep_index = 0
+                minibatch_number = 0
                 while next_ep_index < len(episodes):
                     start_batch_ep_index = next_ep_index
                     batch = []
@@ -659,10 +723,15 @@ class Trainer(nn.Module):
 
                     try:
                         forward_result = self.actor([data[0].episode for data in batch])
-                        yield [
-                            (data[0], data[1], f_res)
-                            for (data, f_res) in zip(batch, forward_result)
-                        ]
+                        yield (
+                            epoch,
+                            minibatch_number,
+                            [
+                                (data[0], data[1], f_res)
+                                for (data, f_res) in zip(batch, forward_result)
+                            ],
+                        )
+                        minibatch_number += 1
                         pbar.update(sum([data[0].num_timesteps for data in batch]))
                     except RuntimeError as ex:
                         if "Cannot allocate memory" not in str(ex):
@@ -705,8 +774,6 @@ class Trainer(nn.Module):
 
         timed_out = False
 
-        train_inputs = self.preprocess()
-        self.log_dataset(train_inputs)
         self.actor.train(mode=True)
         self.vf.train(mode=True)
 
@@ -733,6 +800,9 @@ class Trainer(nn.Module):
                 desc="Pre Training VF",
                 deadline=deadline,
             )
+
+        train_inputs = self.preprocess()
+        self.log_dataset(train_inputs)
 
         # Run primary training loop.
         for _, batch_i, batch in self._actor_minibatches(
@@ -778,6 +848,8 @@ class Trainer(nn.Module):
                 # VF or excessively off-policy data.
                 # TODO: Crash if we catch too many errors here
                 LOGGER.error(f"RuntimeError in actor optimizations: {ex}")
+            if self.cfg.recompute_train_inputs:
+                train_inputs = self.preprocess()
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
@@ -1027,6 +1099,35 @@ class Trainer(nn.Module):
             episode_lengths=torch.tensor(episode_lengths),
         )
 
+        packed_advantages = pack_padded(advantages, episode_lengths)
+        exp_advantages = (packed_advantages / self.awr_temperature.detach()).exp()
+
+        # V-MPO adds the next two modifications to the AWR loss.
+        # It's not clear that either of them are helpful.
+
+        # This modification to the AWR loss discards the policy loss on all of
+        # the timesteps with lower than average advantages.
+        # I think the idea is that this will cause the loss to focus harder on
+        # improving the timesteps with the most opportunity for improvement,
+        # but that's already the point of the awr_temperature.
+        # It seems more principled to just decrease the awr_temperature (and
+        # possibly also increase entropy regularization).
+        if self.cfg.filter_bottom_half_advantages:
+            batch_mask = packed_advantages >= packed_advantages.mean()
+            exp_advantages *= batch_mask
+        else:
+            batch_mask = torch.ones(*packed_advantages.shape, dtype=torch.bool)
+
+        # This change to the AWR loss normalizes the advantages of each batch.
+        # This results in each batch having equal magnitude loss coefficients,
+        # and therefore potentially equally sized policy steps.
+        # This seems sub-optimal, since different batches might have evidence
+        # that indicates different sized updates are appropriate.
+        # Also, the equivalent change for the PPO loss is generally regarded as
+        # not helping.
+        if self.cfg.norm_exp_advantages:
+            exp_advantages /= exp_advantages.sum()
+
         discounted_returns = discount_cumsum(padded_rewards, discount=discount)
 
         train_inputs = [
@@ -1035,13 +1136,16 @@ class Trainer(nn.Module):
                 discounted_returns=disc_ret,
                 vf_returns=vf_ret,
                 vf_targets=vf_target,
+                exp_advantages=exp_adv,
+                adv_loss_mask=mask,
             )
-            for (adv, disc_ret, vf_ret, vf_target) in zip(
+            for (adv, disc_ret, vf_ret, vf_target, exp_adv, mask) in zip(
                 unpad_tensors(advantages, episode_lengths),
                 unpad_tensors(discounted_returns, episode_lengths),
                 unpad_tensors(vf_returns, episode_lengths),
                 unpad_tensors(vf_targets, episode_lengths),
-                # unpad_tensors(discounted_returns, episode_lengths),
+                unpack_tensors(exp_advantages, episode_lengths),
+                unpack_tensors(batch_mask, episode_lengths),
             )
         ]
         assert len(train_inputs) == len(self._replay_buffer)

@@ -287,25 +287,28 @@ class RunningMeanVar(nn.Module):
         self.use_var: bool = use_var
 
     def normalize_batch(self, x: torch.Tensor, correction=1) -> torch.Tensor:
+        # Don't use in-place operations in this method!
         y = x
         if self.use_mean:
-            y -= self.mean
+            y = y - self.mean
         if self.use_var:
-            y /= torch.sqrt(self.corrected_var(correction))
+            y = y / torch.sqrt(self.corrected_var(correction))
         if self.clip_max:
             y = torch.clamp(y, min=-self.clip_max, max=self.clip_max)
         return y
 
     def denormalize_batch(self, y: torch.Tensor, correction=1) -> torch.Tensor:
+        # Don't use in-place operations in this method!
         x = y
         if self.use_var:
-            y *= torch.sqrt(self.corrected_var(correction))
+            y = y * torch.sqrt(self.corrected_var(correction))
         if self.use_mean:
-            x += self.mean
+            x = x + self.mean
         return x
 
     def forward(self, x: torch.Tensor):
-        return self.update(x)
+        self.update(x)
+        return self.normalize_batch(x)
 
     def update(self, x: torch.Tensor):
         if len(x.shape) < len(self.mean.shape):
@@ -333,8 +336,6 @@ class RunningMeanVar(nn.Module):
         self.var = new_var
         self.mean = new_mean
         self.count = new_total
-
-        return self.normalize_batch(x)
 
     def corrected_var(self, correction=1):
         d = self.count - correction
@@ -464,6 +465,11 @@ def pad_tensors(
 def unpad_tensors(padded: torch.Tensor, lengths: list[int]) -> list[torch.Tensor]:
     assert all(padded.shape[1] >= length for length in lengths)
     return [padded[i, :length] for i, length in enumerate(lengths)]
+
+
+def pack_padded(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
+    """Equivelant to pack_tensors_check(unpad_tensors(...))."""
+    return pack_tensors_check(unpad_tensors(padded, lengths), lengths)
 
 
 @dataclass
