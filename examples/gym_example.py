@@ -9,6 +9,7 @@ try:
     import gymnasium as gym
 except ImportError:
     import gym
+from optuna.distributions import FloatDistribution
 from tqdm import tqdm
 
 import stick
@@ -46,6 +47,11 @@ class GymConfig(TrainerConfig):
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
+    init_std: float = tunable(0.5, FloatDistribution(0.0, 2.0))
+    """Only used for Box shaped action spaces."""
+    min_std: float = tunable(1e-6, FloatDistribution(1e-6, 0.1, log=True))
+    """Only used for Box shaped action spaces."""
+
     def __post_init__(self):
         super().__post_init__()
         object.__setattr__(self, "max_buffer_episodes", self.episodes_per_train_step)
@@ -56,7 +62,10 @@ def train(cfg: GymConfig):
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
 
     actor = make_gym_actor(
-        envs, hidden_sizes=cfg.encoder_hidden_sizes, pi_hidden_sizes=cfg.pi_hidden_sizes
+        envs, hidden_sizes=cfg.encoder_hidden_sizes,
+        pi_hidden_sizes=cfg.pi_hidden_sizes,
+        init_std=cfg.init_std,
+        min_std=cfg.min_std,
     )
     print("actor:", actor)
 

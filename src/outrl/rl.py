@@ -259,7 +259,7 @@ class TrainerConfig(Config):
 
     vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
 
-    vf_loss_coef: float = tunable(0.1, FloatDistribution(0.01, 1.0))
+    vf_loss_coef: float = tunable(0.1, FloatDistribution(1e-6, 1.0, log=True))
 
     vf_hidden_sizes: list[int] = tunable(
         [128, 128],
@@ -302,7 +302,7 @@ class TrainerConfig(Config):
     temperature_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
     temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
 
-    norm_exp_advantages: bool = tunable(False, CategoricalDistribution([False, True]))
+    norm_exp_advantages: bool = tunable(True, CategoricalDistribution([False, True]))
 
     filter_bottom_half_advantages: bool = tunable(
         False, CategoricalDistribution([False, True])
@@ -404,7 +404,7 @@ class Trainer(nn.Module):
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
         self.reward_normalizer = RunningMeanVar(use_mean=False)
-        self.actor_optimizer = torch.optim.Adam(
+        self.actor_optimizer = torch.optim.AdamW(
             self.actor.parameters(),
             lr=self.cfg.actor_lr_start,
             weight_decay=self.cfg.actor_weight_decay,
@@ -417,7 +417,7 @@ class Trainer(nn.Module):
             self.cfg.expected_train_steps,
         )
 
-        self.vf_optimizer = torch.optim.Adam(
+        self.vf_optimizer = torch.optim.AdamW(
             self.vf.parameters(),
             lr=self.cfg.vf_lr_start,
             weight_decay=self.cfg.vf_weight_decay,
@@ -444,12 +444,12 @@ class Trainer(nn.Module):
         self.train_steps_so_far_at_last_checkpoint = 0
 
         self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
-        self.kl_coef_opt = torch.optim.Adam([self.kl_coef], lr=self.cfg.kl_coef_lr)
+        self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
 
         self.awr_temperature = nn.Parameter(
             torch.tensor(float(self.cfg.temperature_init))
         )
-        self.awr_temperature_opt = torch.optim.Adam(
+        self.awr_temperature_opt = torch.optim.AdamW(
             [self.awr_temperature], lr=self.cfg.temperature_lr
         )
 
@@ -532,9 +532,6 @@ class Trainer(nn.Module):
         exp_adv, adv_len = pack_tensors(
             [train_input.exp_advantages for train_input in train_inputs]
         )
-        if torch.isnan(exp_adv).any():
-            print("nan in exp_adv")
-            raise RuntimeError("nan in exp_adv")
 
         log_probs = pack_tensors_check(
             [actor_out.action_lls for actor_out in actor_outputs], adv_len
@@ -632,6 +629,7 @@ class Trainer(nn.Module):
         kl_coef = self.kl_coef.detach()
 
         kl_mean = kl.mean()
+        kl_max = kl.max()
         infos = locals()
         del infos["lengths"]
         return kl_coef * kl.sum(), infos
@@ -988,10 +986,11 @@ class Trainer(nn.Module):
     def _log_training_infos(self, train_locals: dict[str, Any]):
         training_stats = {
             k: train_locals[k].item()
-            for k in ["loss", "vf_loss", "ppo_loss", "kl_loss"]
+            for k in ["loss", "vf_loss", "ppo_loss", "kl_loss", "awr_loss"]
         }
         training_stats["clip_portion"] = train_locals["ppo_info"]["clip_portion"]
         training_stats["kl_mean"] = train_locals["kl_info"]["kl_mean"]
+        training_stats["kl_max"] = train_locals["kl_info"]["kl_max"]
         stick.log("training_stats", training_stats, level=stick.INFO)
         self.last_training_stats = training_stats
 
@@ -1021,8 +1020,8 @@ class Trainer(nn.Module):
             "vf_target_mean": vf_targets.mean(),
             "total_env_steps": self.total_env_steps,
         }
-        # for k in self._replay_buffer[0].infos.keys():
-        #     dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
+        for k in self._replay_buffer[0].infos.keys():
+            dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer).mean()
 
         stick.log(
             "dataset_stats",
@@ -1100,10 +1099,9 @@ class Trainer(nn.Module):
         )
 
         packed_advantages = pack_padded(advantages, episode_lengths)
-        exp_advantages = (packed_advantages / self.awr_temperature.detach()).exp()
+        temperature = self.awr_temperature.detach()
 
         # V-MPO adds the next two modifications to the AWR loss.
-        # It's not clear that either of them are helpful.
 
         # This modification to the AWR loss discards the policy loss on all of
         # the timesteps with lower than average advantages.
@@ -1114,19 +1112,23 @@ class Trainer(nn.Module):
         # possibly also increase entropy regularization).
         if self.cfg.filter_bottom_half_advantages:
             batch_mask = packed_advantages >= packed_advantages.mean()
-            exp_advantages *= batch_mask
+            packed_advantages[batch_mask] = float('-inf')
         else:
             batch_mask = torch.ones(*packed_advantages.shape, dtype=torch.bool)
 
         # This change to the AWR loss normalizes the advantages of each batch.
         # This results in each batch having equal magnitude loss coefficients,
         # and therefore potentially equally sized policy steps.
-        # This seems sub-optimal, since different batches might have evidence
-        # that indicates different sized updates are appropriate.
-        # Also, the equivalent change for the PPO loss is generally regarded as
-        # not helping.
+        # On the one hand, this matches trust-region expectations.
+        # On the other hand, different batches might have evidence that
+        # indicates different sized updates are appropriate.
+        # However, this prevents NaNs in the exp advantages, so we enable it by
+        # default for convenience.
         if self.cfg.norm_exp_advantages:
-            exp_advantages /= exp_advantages.sum()
+            exp_advantages = F.softmax(packed_advantages / temperature, dim=0)
+        else:
+            exp_advantages = (packed_advantages / self.awr_temperature.detach()).exp()
+
 
         discounted_returns = discount_cumsum(padded_rewards, discount=discount)
 

@@ -73,7 +73,7 @@ class GymActor(nn.Module):
         dist = self.construct_dist(params)
         action = maybe_sample(dist, best_action)
         action_ll = dist.log_prob(action)
-        infos.update({f"params.{k}": v for (k, v) in params.items()})
+        infos.update({f"action_params.{k}": v for (k, v) in params.items()})
         infos.update(
             {
                 "action_ll": action_ll,
@@ -137,7 +137,8 @@ class GymBoxActor(GymActor):
         )
         nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std).log().item())
         nn.init.orthogonal_(
-            self.action_logstd.weight, gain=torch.tensor(init_std).log().item()
+            self.action_logstd.weight,
+            gain=torch.tensor(init_std).log().item()
         )
         nn.init.zeros_(self.action_logstd.weight)
         nn.init.zeros_(self.action_mean.bias)
@@ -150,14 +151,16 @@ class GymBoxActor(GymActor):
         observation_latents = self.shared_layers(obs)
         pi_x = self.pi_layers(observation_latents)
         mean = self.action_mean(pi_x)
-        std = torch.clamp(self.action_logstd(pi_x).exp(), min=self.min_std)
+        std_pre_clamp = self.action_logstd(pi_x).exp()
+        std = torch.clamp(std_pre_clamp, min=self.min_std)
         params = dict(mean=mean, std=std)
         return (
             observation_latents,
             params,
             {
-                "action_mean": mean.mean(dim=-1),
-                "action_stddev": std.mean(dim=-1),
+                # "action_mean": mean.mean(dim=-1),
+                # "action_stddev": std.mean(dim=-1),
+                "action_stddev_unclamped": std_pre_clamp.mean(dim=-1),
             },
         )
 
@@ -212,9 +215,15 @@ def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
     obs_space = type(env.observation_space).__name__
 
     if obs_space == "Box" and act_space == "Box":
-        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, **kwargs)
+        box_kwargs = {}
+        for k, v in kwargs.items():
+            if k in ['init_std', 'min_std']:
+                box_kwargs[k] = v
+            else:
+                raise ValueError(f"Unexpected kwarg {k!r}")
+        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, **box_kwargs)
     elif obs_space == "Box" and act_space == "Discrete":
-        return GymBoxCategorialActor(env, hidden_sizes, pi_hidden_sizes, **kwargs)
+        return GymBoxCategorialActor(env, hidden_sizes, pi_hidden_sizes)
     else:
         raise NotImplementedError(
             f"No GymActor for observation_space={env.observation_space}, "
@@ -351,7 +360,7 @@ def collect(
                     # covering the whole episode
                     action_dist_params = {}
                     for key in agent_infos[i][0].keys():
-                        if key.startswith("params."):
+                        if key.startswith("action_params."):
                             k = key.split(".", 1)[1]
                             action_dist_params[k] = torch.stack(
                                 [agent_i[key] for agent_i in agent_infos[i]]

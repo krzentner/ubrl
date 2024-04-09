@@ -99,6 +99,7 @@ def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any])
     values that should not be tuned.
     """
     args = dict(overrides)
+    missing_k = []
     for f in fields(config):
         if f.name in overrides:
             trial.set_user_attr(f.name, overrides[f.name])
@@ -110,7 +111,12 @@ def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any])
                 args[f.name] = dist.sample(f.name, trial)
             else:
                 args[f.name] = trial._suggest(f.name, dist)
-    return config.from_dict(args)
+        else:
+            missing_k.append(f.name)
+    cfg = config.from_dict(args)
+    for k in missing_k:
+        trial.set_user_attr(k, getattr(cfg, k))
+    return cfg
 
 
 def default_run_name() -> str:
@@ -262,14 +268,17 @@ class ExperimentInvocation:
                 config_path = os.path.join(run_dir, f"trial_{trial_index}.yaml")
                 save_yaml(cfg, config_path)
 
-                # Choose args.n_seeds_per_trial unique seeds less than 10k
-                max_seed = 10000
-                seeds = []
-                for _ in range(self.args.n_seeds_per_trial):
-                    s = random.randrange(max_seed)
-                    while s in seeds:
-                        s = (s + 1) % max_seed
-                    seeds.append(s)
+                if self.args.fixed_seeds:
+                    seeds = self.args.fixed_seeds
+                else:
+                    # Choose args.n_seeds_per_trial unique seeds less than 10k
+                    max_seed = 10000
+                    seeds = []
+                    for _ in range(self.args.n_seeds_per_trial):
+                        s = random.randrange(max_seed)
+                        while s in seeds:
+                            s = (s + 1) % max_seed
+                        seeds.append(s)
 
                 seed_results = []
                 # Run a training run for each seed
@@ -356,6 +365,17 @@ class ExperimentInvocation:
                 The minimum performance across these seeds will be used as the
                 overall trial performance. This avoids finding hyper parameter
                 configurations that only work for one seed.
+                """
+            ),
+        )
+        tune_parser.add_argument(
+            "--fixed-seeds",
+            type=int,
+            nargs="*",
+            help=dedent(
+                """\
+                A fixed set of seeds to use for each trial.
+                Overrides --n-seeds-per-trial.
                 """
             ),
         )
