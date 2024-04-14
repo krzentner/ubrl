@@ -121,8 +121,8 @@ class GymBoxActor(GymActor):
         env: "GymEnv",
         hidden_sizes: list[int],
         pi_hidden_sizes: list[int],
-        init_std: float = 0.5,
-        min_std: float = 1e-6,
+        init_std: float,
+        min_std: float,
     ):
         super().__init__(
             env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes
@@ -208,20 +208,14 @@ class GymBoxCategorialActor(GymActor):
         return torch.distributions.Categorical(logits=params["logits"])
 
 
-def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, **kwargs):
+def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, init_std: float = 0.5, min_std: float = 1e-6):
     while isinstance(env, list):
         env = env[0]
     act_space = type(env.action_space).__name__
     obs_space = type(env.observation_space).__name__
 
     if obs_space == "Box" and act_space == "Box":
-        box_kwargs = {}
-        for k, v in kwargs.items():
-            if k in ['init_std', 'min_std']:
-                box_kwargs[k] = v
-            else:
-                raise ValueError(f"Unexpected kwarg {k!r}")
-        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, **box_kwargs)
+        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, init_std=init_std, min_std=min_std)
     elif obs_space == "Box" and act_space == "Discrete":
         return GymBoxCategorialActor(env, hidden_sizes, pi_hidden_sizes)
     else:

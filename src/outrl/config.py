@@ -132,19 +132,13 @@ def prepare_training_directory(cfg: "outrl.rl.TrainerConfig"):
     os.makedirs(os.path.join(cfg.log_dir, cfg.run_name), exist_ok=True)
     save_yaml(cfg, os.path.join(cfg.log_dir, cfg.run_name, "config.yaml"))
 
-    # Set the default log level before creating the logger
-    # TODO: Figure out a better API for this (that doesn't involve cluttering
-    # stick.init() with a bunch of options).
-    import stick.tb_output
-
-    stick.tb_output.DEFAULT_LOG_LEVEL = stick.LOG_LEVELS[cfg.tb_log_level]
-
     # stick will handle seeding for us
     stick.init_extra(
         log_dir=cfg.log_dir,
         run_name=cfg.run_name,
         config=cfg.to_dict(),
         stderr_log_level=cfg.stderr_log_level,
+        tb_log_level=cfg.tb_log_level,
     )
     if cfg.pprint_logging:
         from stick.pprint_output import PPrintOutputEngine
@@ -271,14 +265,15 @@ class ExperimentInvocation:
                 if self.args.fixed_seeds:
                     seeds = self.args.fixed_seeds
                 else:
-                    # Choose args.n_seeds_per_trial unique seeds less than 10k
-                    max_seed = 10000
                     seeds = []
-                    for _ in range(self.args.n_seeds_per_trial):
-                        s = random.randrange(max_seed)
-                        while s in seeds:
-                            s = (s + 1) % max_seed
-                        seeds.append(s)
+
+                # Choose args.n_seeds_per_trial unique seeds less than 10k
+                max_seed = 10000
+                while len(seeds) < self.args.n_seeds_per_trial:
+                    s = random.randrange(max_seed)
+                    while s in seeds:
+                        s = (s + 1) % max_seed
+                    seeds.append(s)
 
                 seed_results = []
                 # Run a training run for each seed

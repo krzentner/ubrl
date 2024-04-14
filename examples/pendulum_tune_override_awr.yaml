@@ -54,3 +54,4 @@ max_buffer_episodes: 100
 eval_episodes: 100
 n_train_steps: 2
 train_steps_per_eval: 2
+norm_exp_advantages: true
