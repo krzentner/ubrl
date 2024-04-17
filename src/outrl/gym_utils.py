@@ -20,19 +20,19 @@ from outrl.torch_utils import (
 class GymActor(nn.Module):
     def __init__(
         self,
-        env: "GymEnv",
+        *,
+        obs_size: int,
         hidden_sizes: list[int],
         pi_hidden_sizes: list[int],
     ):
         super().__init__()
 
-        obs_dim = flatten_shape(env.observation_space.shape)
         self.shared_layers = nn.Sequential(
             RunningMeanVar(
-                init_mean=torch.zeros(obs_dim), init_var=torch.ones(obs_dim)
+                init_mean=torch.zeros(obs_size), init_var=torch.ones(obs_size)
             ),
             make_mlp(
-                input_size=obs_dim,
+                input_size=obs_size,
                 hidden_sizes=hidden_sizes,
                 use_dropout=False,
             ),
@@ -118,27 +118,26 @@ class GymActor(nn.Module):
 class GymBoxActor(GymActor):
     def __init__(
         self,
-        env: "GymEnv",
+        *,
+        obs_size: int,
+        action_size: int,
         hidden_sizes: list[int],
         pi_hidden_sizes: list[int],
         init_std: float,
         min_std: float,
     ):
         super().__init__(
-            env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes
+            obs_size=obs_size,
+            hidden_sizes=hidden_sizes,
+            pi_hidden_sizes=pi_hidden_sizes,
         )
 
-        self.action_mean = nn.Linear(
-            pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
-        )
+        self.action_mean = nn.Linear(pi_hidden_sizes[-1], action_size)
 
-        self.action_logstd = nn.Linear(
-            pi_hidden_sizes[-1], flatten_shape(env.action_space.shape)
-        )
+        self.action_logstd = nn.Linear(pi_hidden_sizes[-1], action_size)
         nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std).log().item())
         nn.init.orthogonal_(
-            self.action_logstd.weight,
-            gain=torch.tensor(init_std).log().item()
+            self.action_logstd.weight, gain=torch.tensor(init_std).log().item()
         )
         nn.init.zeros_(self.action_logstd.weight)
         nn.init.zeros_(self.action_mean.bias)
@@ -177,15 +176,19 @@ class GymBoxActor(GymActor):
 class GymBoxCategorialActor(GymActor):
     def __init__(
         self,
-        env: "GymEnv",
+        *,
+        obs_size: int,
+        action_size: int,
         hidden_sizes: list[int],
         pi_hidden_sizes: list[int],
     ):
         super().__init__(
-            env, hidden_sizes=hidden_sizes, pi_hidden_sizes=pi_hidden_sizes
+            obs_size=obs_size,
+            hidden_sizes=hidden_sizes,
+            pi_hidden_sizes=pi_hidden_sizes,
         )
 
-        self.action_logits = nn.Linear(pi_hidden_sizes[-1], env.action_space.n)
+        self.action_logits = nn.Linear(pi_hidden_sizes[-1], action_size)
 
     def _run_net(
         self, obs: torch.Tensor
@@ -208,16 +211,33 @@ class GymBoxCategorialActor(GymActor):
         return torch.distributions.Categorical(logits=params["logits"])
 
 
-def make_gym_actor(env, hidden_sizes, pi_hidden_sizes, init_std: float = 0.5, min_std: float = 1e-6):
+def make_gym_actor(
+    env, hidden_sizes, pi_hidden_sizes, init_std: float = 0.5, min_std: float = 1e-6
+):
     while isinstance(env, list):
         env = env[0]
     act_space = type(env.action_space).__name__
     obs_space = type(env.observation_space).__name__
+    obs_size = flatten_shape(env.observation_space.shape)
 
     if obs_space == "Box" and act_space == "Box":
-        return GymBoxActor(env, hidden_sizes, pi_hidden_sizes, init_std=init_std, min_std=min_std)
+        action_size = flatten_shape(env.action_space.shape)
+        return GymBoxActor(
+            obs_size=obs_size,
+            action_size=action_size,
+            hidden_sizes=hidden_sizes,
+            pi_hidden_sizes=pi_hidden_sizes,
+            init_std=init_std,
+            min_std=min_std,
+        )
     elif obs_space == "Box" and act_space == "Discrete":
-        return GymBoxCategorialActor(env, hidden_sizes, pi_hidden_sizes)
+        action_size = env.action_space.n
+        return GymBoxCategorialActor(
+            obs_size=obs_size,
+            action_size=action_size,
+            hidden_sizes=hidden_sizes,
+            pi_hidden_sizes=pi_hidden_sizes,
+        )
     else:
         raise NotImplementedError(
             f"No GymActor for observation_space={env.observation_space}, "

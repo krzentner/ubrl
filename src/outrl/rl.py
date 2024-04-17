@@ -373,16 +373,24 @@ class PolicyTrainingInputs:
     """
 
 
-SUB_STATE_DICT_FIELDS = [
-    "actor",
-    "vf",
-    "reward_normalizer",
+OPTIMIZER_FIELDS = [
     "actor_optimizer",
     "vf_optimizer",
     "vf_lr_scheduler",
     "actor_lr_scheduler",
     "kl_coef_opt",
     "awr_temperature_opt",
+]
+
+SUBMODULE_FIELDS = [
+    "actor",
+    "vf",
+    "reward_normalizer",
+]
+
+PARAM_FIELDS = [
+    "kl_coef",
+    "awr_temperature",
 ]
 
 IGNORED_FIELDS = ["_is_full_backward_hook"]
@@ -407,31 +415,6 @@ class Trainer(nn.Module):
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
         self.reward_normalizer = RunningMeanVar(use_mean=False)
-        self.actor_optimizer = torch.optim.AdamW(
-            self.actor.parameters(),
-            lr=self.cfg.actor_lr_start,
-            weight_decay=self.cfg.actor_weight_decay,
-        )
-        self.actor_lr_scheduler = make_scheduler(
-            self.actor_optimizer,
-            self.cfg.actor_lr_schedule,
-            self.cfg.actor_lr_start,
-            self.cfg.actor_lr_end,
-            self.cfg.expected_train_steps,
-        )
-
-        self.vf_optimizer = torch.optim.AdamW(
-            self.vf.parameters(),
-            lr=self.cfg.vf_lr_start,
-            weight_decay=self.cfg.vf_weight_decay,
-        )
-        self.vf_lr_scheduler = make_scheduler(
-            self.vf_optimizer,
-            self.cfg.vf_lr_schedule,
-            self.cfg.vf_lr_start,
-            self.cfg.vf_lr_end,
-            self.cfg.expected_train_steps,
-        )
 
         self._replay_buffer: list[EpisodeData] = []
         self._next_episode_number: int = 0
@@ -447,11 +430,42 @@ class Trainer(nn.Module):
         self.train_steps_so_far_at_last_checkpoint = 0
 
         self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
-        self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
 
         self.awr_temperature = nn.Parameter(
             torch.tensor(float(self.cfg.temperature_init))
         )
+
+        # This method is also called after loading the state dict to re-attach
+        # parameters
+        self._setup_optimizers()
+
+    def _setup_optimizers(self):
+        self.actor_optimizer = torch.optim.AdamW(
+            self.actor.parameters(),
+            lr=self.cfg.actor_lr_start,
+            weight_decay=self.cfg.actor_weight_decay,
+        )
+        self.actor_lr_scheduler = make_scheduler(
+            self.actor_optimizer,
+            self.cfg.actor_lr_schedule,
+            self.cfg.actor_lr_start,
+            self.cfg.actor_lr_end,
+            self.cfg.expected_train_steps,
+        )
+        self.vf_optimizer = torch.optim.AdamW(
+            self.vf.parameters(),
+            lr=self.cfg.vf_lr_start,
+            weight_decay=self.cfg.vf_weight_decay,
+        )
+        self.vf_lr_scheduler = make_scheduler(
+            self.vf_optimizer,
+            self.cfg.vf_lr_schedule,
+            self.cfg.vf_lr_start,
+            self.cfg.vf_lr_end,
+            self.cfg.expected_train_steps,
+        )
+
+        self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
         self.awr_temperature_opt = torch.optim.AdamW(
             [self.awr_temperature], lr=self.cfg.temperature_lr
         )
@@ -511,13 +525,10 @@ class Trainer(nn.Module):
         norm_coef = self.cfg.ppo_loss_coef / self.cfg.minibatch_target_timesteps
         ppo_loss_scaled = norm_coef * ppo_loss.sum()
         infos = locals()
-        del infos['self']
-        del infos['adv_len']
-        infos['clip_portion'] = (ratio_clipped != ratio).mean(dtype=torch.float32)
-        return (
-            ppo_loss_scaled,
-            infos
-        )
+        del infos["self"]
+        del infos["adv_len"]
+        infos["clip_portion"] = (ratio_clipped != ratio).mean(dtype=torch.float32)
+        return (ppo_loss_scaled, infos)
 
     def _awr_loss(
         self,
@@ -556,8 +567,8 @@ class Trainer(nn.Module):
         awr_loss_scaled = norm_coef * awr_loss.sum()
         # Don't want to log these here
         infos = locals()
-        del infos['self']
-        del infos['adv_len']
+        del infos["self"]
+        del infos["adv_len"]
         return (awr_loss_scaled, infos)
 
     def _vf_loss(
@@ -587,12 +598,9 @@ class Trainer(nn.Module):
         norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
         vf_loss_scaled = norm_coef * vf_loss
         infos = locals()
-        del infos['self']
-        del infos['adv_len']
-        return (
-            vf_loss_scaled,
-            infos
-        )
+        del infos["self"]
+        del infos["adv_len"]
+        return (vf_loss_scaled, infos)
 
     def _kl_loss(
         self,
@@ -664,8 +672,8 @@ class Trainer(nn.Module):
         kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
         kl_loss_scaled = norm_coef * kl_symlog.sum()
         infos = locals()
-        del infos['lengths']
-        del infos['self']
+        del infos["lengths"]
+        del infos["self"]
         return kl_loss_scaled, infos
 
     def _actor_minibatches(
@@ -794,6 +802,11 @@ class Trainer(nn.Module):
         All options for tuning this method are present in the TrainerConfig
         passed on Trainer initialization.
         """
+        if len(self._replay_buffer) > self.cfg.max_buffer_episodes:
+            self._replay_buffer = list(
+                self._replay_buffer[-self.cfg.max_buffer_episodes :]
+            )
+            assert len(self._replay_buffer) == self.cfg.max_buffer_episodes
 
         errors = 0
         start_time = time.monotonic()
@@ -858,7 +871,10 @@ class Trainer(nn.Module):
             self.actor_optimizer.zero_grad()
             loss.backward()
             self.total_actor_grad_steps += 1
-            if batch_i == 0 or (self.cfg.log_grad_step_period > 0 and batch_i % self.cfg.log_grad_step_period == 0):
+            if batch_i == 0 or (
+                self.cfg.log_grad_step_period > 0
+                and batch_i % self.cfg.log_grad_step_period == 0
+            ):
                 self._log_training_infos(loss_infos)
             try:
                 clip_grad_norm_(
@@ -907,9 +923,7 @@ class Trainer(nn.Module):
         self.vf_lr_scheduler.step()
         self.actor.train(mode=False)
         self.vf.train(mode=False)
-        stick.log("last_training_stats", self.last_training_stats,
-                  level=stick.RESULTS)
-        self._replay_buffer = []
+        stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
         self.train_steps_so_far += 1
 
         if timed_out:
@@ -1159,11 +1173,12 @@ class Trainer(nn.Module):
 
         heated_adv = -adv_packed / self.awr_temperature.detach()
         exp_advantages = heated_adv.exp()
-        rect_adv = exp_advantages - exp_advantages.min()
 
         max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-        large_exp_adv = (~torch.isfinite(rect_adv) |
-                         (rect_adv > max_exp_adv))
+        exp_advantages[~torch.isfinite(exp_advantages)] = 1 + max_exp_adv
+        rect_adv = exp_advantages - exp_advantages.min()
+
+        large_exp_adv = ~torch.isfinite(rect_adv) | (rect_adv > max_exp_adv)
         clipped_exp_adv = rect_adv.clone()
         clipped_exp_adv[large_exp_adv] = max_exp_adv
 
@@ -1280,10 +1295,12 @@ class Trainer(nn.Module):
 
     def state_dict(self):
         state = {}
-        for k in SUB_STATE_DICT_FIELDS:
+        for k in SUBMODULE_FIELDS + OPTIMIZER_FIELDS:
             state[k] = getattr(self, k).state_dict()
+        for k in PARAM_FIELDS:
+            state[k] = getattr(self, k).data
         for k, v in self.__dict__.items():
-            if k in IGNORED_FIELDS or k in SUB_STATE_DICT_FIELDS:
+            if k in IGNORED_FIELDS or k in OPTIMIZER_FIELDS or k in SUBMODULE_FIELDS:
                 continue
             elif k == "cfg":
                 state[k] = v.to_dict()
@@ -1300,12 +1317,17 @@ class Trainer(nn.Module):
 
     def load_state_dict(self, state_dict):
         state = state_dict
-        for k in SUB_STATE_DICT_FIELDS:
+        for k in PARAM_FIELDS + SUBMODULE_FIELDS + OPTIMIZER_FIELDS:
             assert k in state, f"Missing {k!r} from state dict"
         for k, v in state.items():
-            if k == "cfg":
+            if k in OPTIMIZER_FIELDS:
+                # We need to handle these fields once all parameters are loaded
+                continue
+            elif k == "cfg":
                 self.cfg = type(self.cfg).from_dict(v)
-            elif k in SUB_STATE_DICT_FIELDS:
+            elif k in PARAM_FIELDS:
+                setattr(self, k, nn.Parameter(v))
+            elif k in SUBMODULE_FIELDS:
                 getattr(self, k).load_state_dict(v)
             else:
                 field_now = getattr(self, k, None)
@@ -1317,6 +1339,14 @@ class Trainer(nn.Module):
                             f"Field {k} was not expected to have a load_state_dict method"
                         )
                 setattr(self, k, v)
+
+        # Attach all of the optimizers again
+        # This method depends cfg, and all parameter and sub-module fields
+        self._setup_optimizers()
+
+        # Now we can load the optimizer state dictionaries
+        for k in OPTIMIZER_FIELDS:
+            getattr(self, k).load_state_dict(state[k])
 
         # Make sure optimizers are attached to parameters
         assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
@@ -1373,7 +1403,9 @@ class Trainer(nn.Module):
                 with open(best_ckpt, "rb") as f:
                     state = pickle.load(f)
                     self.load_state_dict(state)
-                    LOGGER.critical(f"Resuming from checkpoint {best_ckpt}")
+                    LOGGER.critical(
+                        f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
+                    )
                     return True
             except (pickle.UnpicklingError, ValueError) as ex:
                 LOGGER.error(f"Could not load {best_ckpt}: {ex}")
@@ -1387,7 +1419,9 @@ class Trainer(nn.Module):
                 with open(f_name, "rb") as f:
                     state = pickle.load(f)
                     self.load_state_dict(state)
-                    LOGGER.critical(f"Resuming from checkpoint {f_name}")
+                    LOGGER.critical(
+                        f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
+                    )
                     return True
             except (pickle.UnpicklingError, ValueError) as ex:
                 LOGGER.error(f"Could not load {f_name}: {ex}")

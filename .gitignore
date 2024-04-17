@@ -167,3 +167,4 @@ cython_debug/
 /outputs
 /python*.svg
 /runs*
+/plots*
