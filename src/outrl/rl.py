@@ -1171,7 +1171,7 @@ class Trainer(nn.Module):
             adv_packed = adv_packed - adv_packed[batch_mask].mean()
             adv_packed = adv_packed / adv_packed[batch_mask].std()
 
-        heated_adv = -adv_packed / self.awr_temperature.detach()
+        heated_adv = adv_packed / self.awr_temperature.detach()
         exp_advantages = heated_adv.exp()
 
         max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
@@ -1533,5 +1533,5 @@ def v_trace_estimation(
     v_s = v_diff + vf_x
 
     # Note the time offset. Can't use v_diff here!
-    advantages = rho * (rewards * gammas * v_s[:, 1:] - vf_x[:, :-1])
+    advantages = rho * (rewards + gammas * v_s[:, 1:] - vf_x[:, :-1])
     return advantages, v_s

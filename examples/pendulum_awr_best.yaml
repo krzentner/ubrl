@@ -3,10 +3,10 @@ max_episode_length: 100
 actor_lr_start: 0.01
 awr_loss_coef: 1.0
 checkpoint_best: true
-checkpoint_interval: -1
-checkpoint_replay_buffer: false
+checkpoint_interval: 1
+checkpoint_replay_buffer: true
 discount_inv: 0.1
-episodes_per_train_step: 100
+episodes_per_train_step: 50
 eval_episodes: 100
 expected_train_steps: 1000
 n_train_steps: 1000
@@ -22,10 +22,7 @@ pprint_logging: true
 recompute_train_inputs: true
 stderr_log_level: INFO
 tb_log_level: TRACE
-temperature_init: 0.5
-vf_loss_coef: 0.1
-vf_lr_start: 0.01
+temperature_init: 0.1
 vf_minibatch_size: 512
 vf_post_training_epochs: 10
 vf_pre_training_epochs: 15
-vf_weight_decay: 0.001

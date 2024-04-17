@@ -86,8 +86,8 @@ def train(cfg: GymConfig):
             )
             eval_stats = episode_stats(eval_episodes)
             trainer.add_eval_stats(eval_stats, "AverageReturn")
-            # TODO: Checkpoint, resume
-            trainer.maybe_checkpoint()
+            if step > 0:
+                trainer.maybe_checkpoint()
         if step == cfg.n_train_steps:
             break
         train_episodes = collect(
