@@ -3,14 +3,13 @@
 # Usage: examples/gym_example.py train --n_train_steps=2 --seed=7
 #
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 try:
     import gymnasium as gym
 except ImportError:
     import gym
 from optuna.distributions import FloatDistribution
-from tqdm import tqdm
 
 import stick
 from outrl.gym_utils import make_gym_agent, collect, episode_stats

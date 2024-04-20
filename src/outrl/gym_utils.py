@@ -7,10 +7,9 @@ from tqdm import tqdm
 
 from outrl.rl import AgentOutput
 from outrl.torch_utils import (
-    concat,
+    force_concat,
     make_mlp,
     flatten_shape,
-    maybe_sample,
     RunningMeanVar,
     pack_tensors,
     unpack_tensors,
@@ -71,7 +70,10 @@ class GymAgent(nn.Module):
                 .to(device=self.device)
             )
         dist = self.construct_dist(params)
-        action = maybe_sample(dist, best_action)
+        if best_action:
+            action = dist.mode
+        else:
+            action = dist.sample()
         action_ll = dist.log_prob(action)
         infos.update({f"action_params.{k}": v for (k, v) in params.items()})
         infos.update(
@@ -248,12 +250,13 @@ def make_gym_agent(
 def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
     agent_info_keys = episode["agent_infos"][0].keys()
     agent_infos = {
-        k: concat(agent_i[k] for agent_i in episode["agent_infos"])
+        k: force_concat(agent_i[k] for agent_i in episode["agent_infos"])
         for k in agent_info_keys
     }
     env_info_keys = episode["env_infos"][0].keys()
     env_infos = {
-        k: concat(env_i[k] for env_i in episode["env_infos"]) for k in env_info_keys
+        k: force_concat(env_i[k] for env_i in episode["env_infos"])
+        for k in env_info_keys
     }
 
     action_lls = torch.stack(

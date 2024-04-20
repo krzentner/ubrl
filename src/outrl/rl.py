@@ -1,6 +1,6 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from textwrap import dedent
-from typing import Any, Callable, Optional, TypeVar, Generator, Union, Literal
+from typing import Any, Optional, TypeVar, Generator, Literal
 import os
 import random
 import warnings
@@ -24,10 +24,12 @@ from optuna.distributions import (
 import stick
 
 from outrl.torch_utils import (
-    concat,
+    force_concat,
     make_mlp,
+    pack_recursive,
     pack_tensors,
     pack_tensors_check,
+    pad_packed,
     pad_tensors,
     unpad_tensors,
     pack_padded,
@@ -39,6 +41,7 @@ from outrl.torch_utils import (
     ActionDist,
     kl_div,
     approx_kl_div,
+    used_for_logging,
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
 
@@ -76,21 +79,25 @@ class EpisodeData:
     """Wrapper around an episode that maintains metadata and caches computed values."""
 
     episode: Any
-    """The episode (treated as an opaque object)."""
+    """The episode (treated as an opaque object). Will be passed back to the
+    agent during optimization."""
 
     episode_number: int
-    """Records with add_episode() call this episode came from."""
+    """Records which add_episode() call this episode came from."""
 
     num_timesteps: int
-    """Number of steps in episode."""
+    """Number of time steps in episode."""
 
     terminated: bool
     """Boolean indicating if the episode reached a terminal state. Always False
-    in infinite horizon MDPs or when and episode reaches a timeout."""
+    in infinite horizon MDPs or when an episode reaches a timeout."""
 
     original_action_lls: torch.Tensor
     """Original action lls provided when the episode was added. Used for
-    v-trace off-policy correction and in the PPO loss (when enabled)."""
+    v-trace off-policy correction and in the PPO loss (when enabled).
+
+    Do not require gradients.
+    """
 
     original_action_dists: Optional[ActionDist]
     """Original action distributions optionally provided when the episode was
@@ -107,14 +114,6 @@ class EpisodeData:
 
     weight: float = 1.0
     """Importance of this episode."""
-
-    def __lt__(self, other):
-        return self.sort_key() < other.sort_key()
-
-    def sort_key(self):
-        """Retain highest weight episodes, tie-break to prefer newer
-        episodes."""
-        return (self.weight, self.episode_number)
 
     def __post_init__(self):
         assert self.original_action_lls.shape == (self.num_timesteps,)
@@ -178,7 +177,8 @@ class TrainerConfig(Config):
     """
 
     seed: int = random.randrange(10000)
-    """Random seed for this experiment. Set to a random int < 10k if not specified.
+    """Random seed for this experiment. Set to a random int < 10k if not
+    specified.
 
     Set to -1 to disable setting the random seed.
     """
@@ -462,46 +462,91 @@ class TrainerConfig(Config):
     exact action distributions are provided by the agent."""
 
     entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
+    # TODO: Should this be in mean log-likelihood or entropy?
 
-    temperature_init: float = tunable(8.0, FloatDistribution(1e-2, 1e3, log=True))
+    temperature_init: float = tunable(1.0, FloatDistribution(1e-2, 1e3, log=True))
+    """Initial AWR temperature. If temperature_lr is 0, this value will be used
+    throughout training."""
+
     temperature_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
-    temperature_min: float = tunable(0.01, FloatDistribution(0.0, 1.0))
-    temperature_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
+    """How quickly to tune the AWR temperature."""
+
+    temperature_min: float = tunable(0.05, FloatDistribution(0.0, 1.0))
+    """Minimum AWR temperature. Small values exponentially increase the AWR
+    loss. Limits of numerical precision make very low values impractical."""
+    temperature_max: float = tunable(100, FloatDistribution(0.1, 1e5, log=True))
+    """Maximum AWR temperature. Large values cause the AWR loss to ignore
+    advantages and just perform behavioral cloning.
+    """
 
     normalize_advantages: bool = tunable(True, CategoricalDistribution([False, True]))
+    """Whether to normalize the advantages across the batch before computing
+    the AWR coefficients.
 
-    advantage_clip: float = tunable(12.0, FloatDistribution(0.1, 100.0))
-    """Max value for advantages in AWR loss.
+    Note that this is not used in the PPO loss.
+    """
 
-    Has a significant effect in practice. Does not just affect corner-cases.
+    advantage_clip: float = tunable(12.0, FloatDistribution(0.1, 20.0))
+    """Max exponent value for advantages in AWR loss.
+
+    Large values can lead to NaN errors.
+
+    Can have a significant effect, since many timesteps will have clipped
+    coefficients at low temperatures.
     """
 
     grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e2, log=True))
+    """Grad norm to clip the actor and value function parameters to in the main
+    training loop.
+
+    Small values will consistently lower the loss.
+    """
 
     recompute_train_inputs: bool = tunable(True, CategoricalDistribution([False, True]))
-    """Recompute advantages and VF targets every epoch inside a train_step()."""
+    """Recompute advantages and VF targets every epoch inside a train_step().
+
+    This causes full off-policy steps to be taken every train_step().
+    """
 
     checkpoint_interval: int = 1
-    """Number of train_step calls between checkpoints when calling maybe_checkpoint().
+    """Number of train_step() calls between checkpoints when calling
+    maybe_checkpoint().
 
-    Disable checkpointing by setting to a negative value."""
+    If set to 0, maybe_checkpoint() will always checkpoint if the checkpoint
+    file does not already exist for the current train step.
+
+    Disable periodic checkpointing by setting to a negative value."""
 
     checkpoint_best: bool = True
     """Whether to checkpoint in maybe_checkpoint() after an improvement in the
-    primary performance statistic passed to add_eval_stats."""
+    primary performance statistic passed to add_eval_stats()."""
 
     checkpoint_replay_buffer: bool = True
-    """Whether to checkpoint the replay_buffer."""
+    """Whether to include the replay_buffer in the checkpoint.
+
+    Needed for fully reproducible resume, but can have significant time and
+    disk-space costs if the replay buffer is larger than the agent and
+    checkpointing is being performed frequently.
+    """
 
     log_grad_step_period: int = 20
     """Log information every n training gradient steps.
 
-    This has moderate implications for wall clock time if set to very low
-    values (e.g. 1).
+    This has moderate time costs (on the order of +10% to runtime) if set to
+    very low values (e.g. 1).
     """
 
     max_permitted_errors_per_train_step: int = 10
-    """Number of times to permit RuntimeError in each train_step."""
+    """Number of times to permit RuntimeError in each train_step() before
+    re-raising the error.
+
+    By default, occasional errors are caught and logged. Occasional anomalies
+    from extremely unlikely events and torch bugs are usually prevented from
+    crashing the run by clipping the grad norm.
+
+    Many errors at once usually indicate that training cannot continue, so the
+    error should be re-raised to avoid wasting time.
+    """
 
     def __post_init__(self):
         """Fill in values with non-constant defaults. Called after construction."""
@@ -518,20 +563,29 @@ class TrainerConfig(Config):
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
 
-@dataclass
+@dataclass(eq=False)
 class PolicyTrainingInputs:
     """Values used to train the policy that are not present in EpisodeData.
 
-    An instance of this class accompanies each EpisodeData during policy optimization.
+    An instance of this class accompanies each EpisodeData during policy
+    optimization.
 
     These values are recomputed every train_step()."""
 
     advantages: torch.Tensor
-    discounted_returns: torch.Tensor
-    vf_returns: torch.Tensor
-    vf_targets: torch.Tensor
+    """Advantages for this episode. Used in PPO loss (when enabled)."""
+
     exp_advantages: torch.Tensor
-    """Exponentiated advantages."""
+    """Coefficients used in the AWR loss."""
+
+    vf_targets: torch.Tensor
+    """Target values for the value function loss."""
+
+    discounted_returns: torch.Tensor
+    """Discounted sum of future rewards. Used in logging."""
+
+    vf_returns: torch.Tensor
+    """Estimated returns from the value function. Used in logging."""
 
 
 _OPTIMIZER_FIELDS = [
@@ -603,6 +657,10 @@ class Trainer:
         self._setup_optimizers()
 
     def _setup_optimizers(self):
+        """(Re)create all of the optimizers to use the current parameters.
+
+        This method is called in __init__ and also in load_state_dict().
+        """
         self.agent_optimizer = torch.optim.AdamW(
             self.agent.parameters(),
             lr=self.cfg.agent_lr_start,
@@ -758,11 +816,11 @@ class Trainer:
         vf_targets_packed, adv_len = pack_tensors(
             [train_input.vf_targets for train_input in train_inputs]
         )
-        obs_latents_packed = pack_tensors_check(
+        state_enc_packed = pack_tensors_check(
             [agent_out.state_encodings[:-1] for agent_out in agent_outputs], adv_len
         )
 
-        critic_out = self.vf(obs_latents_packed)
+        critic_out = self.vf(state_enc_packed)
         vf_loss = F.mse_loss(critic_out, vf_targets_packed)
 
         discounted_returns = pack_tensors_check(
@@ -841,6 +899,7 @@ class Trainer:
 
         kl_mean = kl.mean()
         kl_max = kl.max()
+        used_for_logging(kl_mean, kl_max)
 
         norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
 
@@ -1124,13 +1183,10 @@ class Trainer:
         smaller minibatches of shuffled timesteps from across multiple
         episodes.
         """
-        obs_latents_packed, obs_lens = pack_tensors(
-            [
-                state_encodings[ep_data.episode_number]
-                for ep_data in self._replay_buffer
-            ]
+        state_enc_packed, obs_lens = pack_tensors(
+            [state_encodings[ep_data.episode_number] for ep_data in self._replay_buffer]
         )
-        assert not obs_latents_packed.requires_grad
+        assert not state_enc_packed.requires_grad
 
         padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
         if self.cfg.normalize_rewards:
@@ -1160,8 +1216,8 @@ class Trainer:
                     or epoch == training_epochs
                     or self.cfg.vf_recompute_targets
                 ):
-                    vf_x_packed = self.vf(obs_latents_packed)
-                    vf_x = pad_tensors(unpack_tensors(vf_x_packed, obs_lens))
+                    vf_x_packed = self.vf(state_enc_packed)
+                    vf_x = pad_packed(vf_x_packed, obs_lens)
 
                     for i, episode_length in enumerate(episode_lengths):
                         # zero vf_{t+1} in terminated episodes
@@ -1186,7 +1242,7 @@ class Trainer:
                     vf_targets_packed = pack_padded(vf_targets, obs_lens)
 
                 dataset = DictDataset(
-                    state_encodings=obs_latents_packed, vf_targets=vf_targets_packed
+                    state_encodings=state_enc_packed, vf_targets=vf_targets_packed
                 )
                 for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
                     self.vf_optimizer.zero_grad()
@@ -1238,28 +1294,20 @@ class Trainer:
         full_episode_rewards = pad_tensors(
             [data.rewards for data in self._replay_buffer]
         )
-        vf_returns, vf_lens = pack_tensors(
-            [train_input.vf_returns for train_input in train_inputs]
-        )
-        discounted_returns = pack_tensors_check(
-            [train_input.discounted_returns for train_input in train_inputs], vf_lens
-        )
-        vf_targets = pack_tensors_check(
-            [train_input.vf_targets for train_input in train_inputs], vf_lens
-        )
+        t_inputs = pack_recursive(train_inputs)
         dataset_stats = {
             "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
             "ev": explained_variance(
-                vf_returns,
-                discounted_returns,
+                t_inputs.vf_returns,
+                t_inputs.discounted_returns,
             ),
-            "disc_mean": discounted_returns.mean(),
-            "vf_mean": vf_returns.mean(),
-            "vf_target_mean": vf_targets.mean(),
+            "disc_mean": t_inputs.discounted_returns.mean(),
+            "vf_mean": t_inputs.vf_returns.mean(),
+            "vf_target_mean": t_inputs.vf_targets.mean(),
             "total_env_steps": self.total_env_steps,
         }
         for k in self._replay_buffer[0].infos.keys():
-            dataset_stats[k] = concat(
+            dataset_stats[k] = force_concat(
                 data.infos[k] for data in self._replay_buffer
             ).mean()
 
@@ -1271,7 +1319,9 @@ class Trainer:
         )
 
         for k in self._replay_buffer[0].infos.keys():
-            dataset_stats[k] = concat(data.infos[k] for data in self._replay_buffer)
+            dataset_stats[k] = force_concat(
+                data.infos[k] for data in self._replay_buffer
+            )
 
         stick.log(
             "dataset_stats_trace",
@@ -1297,10 +1347,10 @@ class Trainer:
         self.vf.train(mode=False)
         with torch.no_grad():
             agent_outputs = self.agent([data.episode for data in self._replay_buffer])
-            obs_latents_packed = pack_tensors_check(
+            state_enc_packed = pack_tensors_check(
                 [agent_out.state_encodings for agent_out in agent_outputs], obs_lens
             )
-            vf_returns_packed = self.vf(obs_latents_packed)
+            vf_returns_packed = self.vf(state_enc_packed)
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
@@ -1312,7 +1362,7 @@ class Trainer:
         )
         terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
 
-        vf_returns = pad_tensors(unpack_tensors(vf_returns_packed, obs_lens))
+        vf_returns = pad_packed(vf_returns_packed, obs_lens)
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
             # Everything after last valid observation should have been padded to zero
@@ -1487,7 +1537,12 @@ class Trainer:
         for k in _PARAM_FIELDS:
             state[k] = getattr(self, k).data
         for k, v in self.__dict__.items():
-            if k in _IGNORED_FIELDS or k in _OPTIMIZER_FIELDS or k in _SUBMODULE_FIELDS or k in _PARAM_FIELDS:
+            if (
+                k in _IGNORED_FIELDS
+                or k in _OPTIMIZER_FIELDS
+                or k in _SUBMODULE_FIELDS
+                or k in _PARAM_FIELDS
+            ):
                 continue
             elif k == "cfg":
                 state[k] = v.to_dict()
