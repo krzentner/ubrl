@@ -13,7 +13,7 @@ from optuna.distributions import FloatDistribution
 from tqdm import tqdm
 
 import stick
-from outrl.gym_utils import make_gym_actor, collect, episode_stats
+from outrl.gym_utils import make_gym_agent, collect, episode_stats
 from outrl.rl import Trainer, TrainerConfig
 from outrl.config import ExperimentInvocation, tunable, IntListDistribution
 
@@ -61,15 +61,15 @@ class GymConfig(TrainerConfig):
 def train(cfg: GymConfig):
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
 
-    actor = make_gym_actor(
+    agent = make_gym_agent(
         envs, hidden_sizes=cfg.encoder_hidden_sizes,
         pi_hidden_sizes=cfg.pi_hidden_sizes,
         init_std=cfg.init_std,
         min_std=cfg.min_std,
     )
-    print("actor:", actor)
+    print("agent:", agent)
 
-    trainer = Trainer(cfg, actor)
+    trainer = Trainer(cfg, agent)
 
     trainer.attempt_resume(prefer_best=False)
 
@@ -79,21 +79,20 @@ def train(cfg: GymConfig):
             eval_episodes = collect(
                 cfg.max_episode_length * cfg.eval_episodes,
                 envs,
-                actor,
+                agent,
                 best_action=True,
                 max_episode_length=cfg.max_episode_length,
                 full_episodes_only=True,
             )
             eval_stats = episode_stats(eval_episodes)
             trainer.add_eval_stats(eval_stats, "AverageReturn")
-            if step > 0:
-                trainer.maybe_checkpoint()
+            trainer.maybe_checkpoint()
         if step == cfg.n_train_steps:
             break
         train_episodes = collect(
             cfg.max_episode_length * cfg.episodes_per_train_step,
             envs,
-            actor,
+            agent,
             best_action=False,
             max_episode_length=cfg.max_episode_length,
             full_episodes_only=False,

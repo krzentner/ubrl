@@ -48,15 +48,15 @@ T = TypeVar("T")
 
 
 @dataclass(eq=False)
-class ActorOutput:
-    """Result from one episode when calling .forward() on an actor.
+class AgentOutput:
+    """Result from one episode when calling .forward() on an agent.
 
-    Differentiating both observation_latents and action_lls should affect
-    earlier layers in the actor.
+    Differentiating both state_encodings and action_lls should affect
+    earlier layers in the agent.
     """
 
-    observation_latents: torch.Tensor
-    """Differentiable representations of the observations in the episode."""
+    state_encodings: torch.Tensor
+    """Differentiable representation of the observations in the episode."""
 
     action_lls: torch.Tensor
     """Differentiable log-likelihood of actions taken in the episode."""
@@ -103,8 +103,8 @@ class EpisodeData:
     infos: dict[str, Any]
     """User infos. Will be logged if possible."""
 
-    sample_priority: float = 1.0
-    """Priority for sampling episode. Decreased every train_step()."""
+    sample_weight: float = 1.0
+    """Episode sampling weight. Decreased every train_step()."""
 
     def __lt__(self, other):
         return self.sort_key() < other.sort_key()
@@ -112,7 +112,7 @@ class EpisodeData:
     def sort_key(self):
         """Retain highest sampling priority episodes, tie-break to prefer newer
         episodes."""
-        return (self.sample_priority, self.episode_number)
+        return (self.sample_weight, self.episode_number)
 
     def __post_init__(self):
         assert self.original_action_lls.shape == (self.num_timesteps,)
@@ -208,7 +208,7 @@ class TrainerConfig(Config):
     """Maximum number of episodes to keep in replay buffer."""
 
     max_timesteps_per_forward: Optional[int] = None
-    """Maximum number of timesteps to include in a forward pass to the actor.
+    """Maximum number of timesteps to include in a forward pass to the agent.
     Used to avoid out-of-memory errors.
 
     Defaults to no limit. Automatically decreases on (most) memory errors.
@@ -234,15 +234,15 @@ class TrainerConfig(Config):
 
     ppo_loss_coef: float = tunable(0.0, FloatDistribution(0.0, 1000.0))
     awr_loss_coef: float = tunable(1.0, FloatDistribution(0.0, 1000.0))
-    actor_lr_schedule: Optional[str] = tunable(
+    agent_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
-    actor_lr_start: float = tunable(1e-3, FloatDistribution(1e-4, 5e-2, log=True))
-    actor_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
+    agent_lr_start: float = tunable(1e-3, FloatDistribution(1e-4, 5e-2, log=True))
+    agent_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
 
-    actor_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
+    agent_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
 
-    actor_clip_ratio: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
+    agent_clip_ratio: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
 
     vf_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
@@ -374,16 +374,16 @@ class PolicyTrainingInputs:
 
 
 OPTIMIZER_FIELDS = [
-    "actor_optimizer",
+    "agent_optimizer",
     "vf_optimizer",
     "vf_lr_scheduler",
-    "actor_lr_scheduler",
+    "agent_lr_scheduler",
     "kl_coef_opt",
     "awr_temperature_opt",
 ]
 
 SUBMODULE_FIELDS = [
-    "actor",
+    "agent",
     "vf",
     "reward_normalizer",
 ]
@@ -397,13 +397,13 @@ IGNORED_FIELDS = ["_is_full_backward_hook"]
 
 
 class Trainer(nn.Module):
-    def __init__(self, cfg: TrainerConfig, actor):
+    def __init__(self, cfg: TrainerConfig, agent):
         super().__init__()
         self.cfg = cfg
 
-        self.actor = actor
+        self.agent = agent
 
-        self.observation_latent_size = self.actor.observation_latent_size
+        self.observation_latent_size = self.agent.observation_latent_size
 
         self.vf = make_mlp(
             input_size=self.observation_latent_size,
@@ -440,16 +440,16 @@ class Trainer(nn.Module):
         self._setup_optimizers()
 
     def _setup_optimizers(self):
-        self.actor_optimizer = torch.optim.AdamW(
-            self.actor.parameters(),
-            lr=self.cfg.actor_lr_start,
-            weight_decay=self.cfg.actor_weight_decay,
+        self.agent_optimizer = torch.optim.AdamW(
+            self.agent.parameters(),
+            lr=self.cfg.agent_lr_start,
+            weight_decay=self.cfg.agent_weight_decay,
         )
-        self.actor_lr_scheduler = make_scheduler(
-            self.actor_optimizer,
-            self.cfg.actor_lr_schedule,
-            self.cfg.actor_lr_start,
-            self.cfg.actor_lr_end,
+        self.agent_lr_scheduler = make_scheduler(
+            self.agent_optimizer,
+            self.cfg.agent_lr_schedule,
+            self.cfg.agent_lr_start,
+            self.cfg.agent_lr_end,
             self.cfg.expected_train_steps,
         )
         self.vf_optimizer = torch.optim.AdamW(
@@ -470,24 +470,24 @@ class Trainer(nn.Module):
             [self.awr_temperature], lr=self.cfg.temperature_lr
         )
 
-        self.total_actor_grad_steps = 0
+        self.total_agent_grad_steps = 0
 
     def _primary_loss_function(
-        self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, ActorOutput]]
+        self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, AgentOutput]]
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         episode_data: list[EpisodeData] = [b[0] for b in batch]
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
-        actor_outputs: list[ActorOutput] = [b[2] for b in batch]
+        agent_outputs: list[AgentOutput] = [b[2] for b in batch]
 
-        kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, actor_outputs)
+        kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
 
-        ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, actor_outputs)
+        ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
 
-        awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, actor_outputs)
+        awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, agent_outputs)
 
         # TODO: Tune awr_temperature
 
-        vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, actor_outputs)
+        vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, agent_outputs)
 
         loss = ppo_loss + awr_loss + vf_loss + kl_loss
 
@@ -498,13 +498,13 @@ class Trainer(nn.Module):
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
-        actor_outputs: list[ActorOutput],
+        agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         advantages, adv_len = pack_tensors(
             [train_input.advantages for train_input in train_inputs]
         )
         log_probs = pack_tensors_check(
-            [actor_out.action_lls for actor_out in actor_outputs], adv_len
+            [agent_out.action_lls for agent_out in agent_outputs], adv_len
         )
 
         old_log_probs = pack_tensors_check(
@@ -514,7 +514,7 @@ class Trainer(nn.Module):
 
         ratio = torch.exp(log_probs - old_log_probs)
         ratio_clipped = torch.clamp(
-            ratio, 1 / (1 + self.cfg.actor_clip_ratio), 1 + self.cfg.actor_clip_ratio
+            ratio, 1 / (1 + self.cfg.agent_clip_ratio), 1 + self.cfg.agent_clip_ratio
         )
 
         policy_gradient = ratio * advantages
@@ -534,7 +534,7 @@ class Trainer(nn.Module):
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
-        actor_outputs: list[ActorOutput],
+        agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del episode_data
 
@@ -552,7 +552,7 @@ class Trainer(nn.Module):
         )
 
         log_probs = pack_tensors_check(
-            [actor_out.action_lls for actor_out in actor_outputs], adv_len
+            [agent_out.action_lls for agent_out in agent_outputs], adv_len
         )
 
         awr_loss = -log_probs * exp_adv
@@ -575,7 +575,7 @@ class Trainer(nn.Module):
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
-        actor_outputs: list[ActorOutput],
+        agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # For consistency with other loss functions, we still take
         # episode_data, but don't use it.
@@ -584,7 +584,7 @@ class Trainer(nn.Module):
             [train_input.vf_targets for train_input in train_inputs]
         )
         obs_latents_packed = pack_tensors_check(
-            [actor_out.observation_latents[:-1] for actor_out in actor_outputs], adv_len
+            [agent_out.state_encodings[:-1] for agent_out in agent_outputs], adv_len
         )
 
         critic_out = self.vf(obs_latents_packed)
@@ -606,7 +606,7 @@ class Trainer(nn.Module):
         self,
         episode_data: list[EpisodeData],
         train_inputs: list[PolicyTrainingInputs],
-        actor_outputs: list[ActorOutput],
+        agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # For consistency with other loss functions, we still take
         # train_inputs, but don't use it.
@@ -615,7 +615,7 @@ class Trainer(nn.Module):
         original_kl_coef = self.kl_coef.detach().item()
 
         log_probs, lengths = pack_tensors(
-            [actor_out.action_lls for actor_out in actor_outputs]
+            [agent_out.action_lls for agent_out in agent_outputs]
         )
         old_log_probs = pack_tensors_check(
             [data.original_action_lls for data in episode_data], lengths
@@ -631,7 +631,7 @@ class Trainer(nn.Module):
 
         # Compute KL Divergence
         if self.cfg.use_approx_kl is False:
-            new_dists = [actor_out.action_dists for actor_out in actor_outputs]
+            new_dists = [agent_out.action_dists for agent_out in agent_outputs]
             assert new_dists[0] is not None
             old_dists = [ep_data.original_action_dists for ep_data in episode_data]
             assert old_dists[0] is not None
@@ -676,7 +676,7 @@ class Trainer(nn.Module):
         del infos["self"]
         return kl_loss_scaled, infos
 
-    def _actor_minibatches(
+    def _agent_minibatches(
         self,
         episodes: Optional[list[EpisodeData]] = None,
         extra_data: Optional[list[T]] = None,
@@ -685,13 +685,13 @@ class Trainer(nn.Module):
         epochs: int = 1,
         shuffle: bool = False,
     ) -> Generator[
-        tuple[int, int, list[tuple[EpisodeData, T, ActorOutput]]], None, None
+        tuple[int, int, list[tuple[EpisodeData, T, AgentOutput]]], None, None
     ]:
-        """Runs the actor forward pass on minibatches drawn from the replay buffer.
+        """Runs the agent forward pass on minibatches drawn from the replay buffer.
 
         Minibatches are a list of tuples of EpisodeData from the input, data T
-        from the extra_data (None if not provided), and ActorOutput from the
-        actor forward pass.
+        from the extra_data (None if not provided), and AgentOutput from the
+        agent forward pass.
 
         This method handles sizing of minibatches to avoid OOM, shuffling of
         episodes, rendering the progress bar, and running for multiple epochs.
@@ -762,7 +762,7 @@ class Trainer(nn.Module):
                         )
 
                     try:
-                        forward_result = self.actor([data[0].episode for data in batch])
+                        forward_result = self.agent([data[0].episode for data in batch])
                         yield (
                             epoch,
                             minibatch_number,
@@ -820,11 +820,11 @@ class Trainer(nn.Module):
 
         timed_out = False
 
-        self.actor.train(mode=True)
+        self.agent.train(mode=True)
         self.vf.train(mode=True)
 
         # Cached policy outputs for VF training.
-        # This avoids performing a full pass on the actor network when tuning
+        # This avoids performing a full pass on the agent network when tuning
         # the VF outside of the primary loss.
         # The VF loss still tunes the full network in the primary loss.
         observation_latent_cache = {}
@@ -833,12 +833,12 @@ class Trainer(nn.Module):
         # Pre-train VF (usually only used for off-policy algorithms)
         if self.cfg.vf_pre_training_epochs > 0:
             with torch.no_grad():
-                for _, _, batch in self._actor_minibatches(desc="Caching latents"):
-                    for ep_data, _, actor_res in batch:
+                for _, _, batch in self._agent_minibatches(desc="Caching latents"):
+                    for ep_data, _, agent_res in batch:
                         observation_latent_cache[
                             ep_data.episode_number
-                        ] = actor_res.observation_latents
-                        action_lls_cache[ep_data.episode_number] = actor_res.action_lls
+                        ] = agent_res.state_encodings
+                        action_lls_cache[ep_data.episode_number] = agent_res.action_lls
             timed_out = self._train_vf(
                 observation_latent_cache,
                 action_lls_cache,
@@ -847,12 +847,12 @@ class Trainer(nn.Module):
                 deadline=deadline,
             )
 
-        train_inputs = self.preprocess()
-        self.log_dataset(train_inputs)
+        train_inputs = self._preprocess()
+        self._log_dataset(train_inputs)
 
         # Run primary training loop.
-        for _, batch_i, batch in self._actor_minibatches(
-            desc="Training Actor",
+        for _, batch_i, batch in self._agent_minibatches(
+            desc="Training Agent",
             extra_data=train_inputs,
             epochs=self.cfg.policy_epochs_per_train_step,
             shuffle=True,
@@ -861,16 +861,16 @@ class Trainer(nn.Module):
             if time.monotonic() > deadline:
                 timed_out = True
                 break
-            for ep_data, _, actor_res in batch:
+            for ep_data, _, agent_res in batch:
                 observation_latent_cache[
                     ep_data.episode_number
-                ] = actor_res.observation_latents.detach()
-                action_lls_cache[ep_data.episode_number] = actor_res.action_lls.detach()
+                ] = agent_res.state_encodings.detach()
+                action_lls_cache[ep_data.episode_number] = agent_res.action_lls.detach()
             loss, loss_infos = self._primary_loss_function(batch)
             self.vf_optimizer.zero_grad()
-            self.actor_optimizer.zero_grad()
+            self.agent_optimizer.zero_grad()
             loss.backward()
-            self.total_actor_grad_steps += 1
+            self.total_agent_grad_steps += 1
             if batch_i == 0 or (
                 self.cfg.log_grad_step_period > 0
                 and batch_i % self.cfg.log_grad_step_period == 0
@@ -878,7 +878,7 @@ class Trainer(nn.Module):
                 self._log_training_infos(loss_infos)
             try:
                 clip_grad_norm_(
-                    self.actor.parameters(),
+                    self.agent.parameters(),
                     max_norm=self.cfg.grad_norm_max,
                     error_if_nonfinite=True,
                 )
@@ -888,7 +888,7 @@ class Trainer(nn.Module):
                     error_if_nonfinite=True,
                 )
                 self.vf_optimizer.step()
-                self.actor_optimizer.step()
+                self.agent_optimizer.step()
             except RuntimeError as ex:
                 # This seems to only trigger if the batch is so small the loss
                 # is NaN or so big we OOM.
@@ -897,16 +897,16 @@ class Trainer(nn.Module):
                 # potentially extremely slowing training on e.g. an over-fit
                 # VF or excessively off-policy data.
                 # TODO: Crash if we catch too many errors here
-                LOGGER.error(f"RuntimeError in actor optimizations: {ex}")
+                LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
                 errors += 1
                 if errors > self.cfg.max_permitted_errors_per_train_step:
                     raise ex
             if self.cfg.recompute_train_inputs:
-                train_inputs = self.preprocess()
+                train_inputs = self._preprocess()
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
-        # on the actor network in this phase.
+        # on the agent network in this phase.
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
         if self.cfg.vf_post_training_epochs > 0 and not timed_out:
@@ -919,9 +919,9 @@ class Trainer(nn.Module):
             )
 
         # Update all the statistics.
-        self.actor_lr_scheduler.step()
+        self.agent_lr_scheduler.step()
         self.vf_lr_scheduler.step()
-        self.actor.train(mode=False)
+        self.agent.train(mode=False)
         self.vf.train(mode=False)
         stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
         self.train_steps_so_far += 1
@@ -931,19 +931,19 @@ class Trainer(nn.Module):
 
     def _train_vf(
         self,
-        observation_latents: dict[int, torch.Tensor],
+        state_encodings: dict[int, torch.Tensor],
         action_lls: dict[int, torch.Tensor],
         training_epochs: int,
         desc: str,
         deadline: float,
     ):
-        """Train just the VF using cached actor outputs.
+        """Train just the VF using cached agent outputs.
 
-        observation_latents and action_lls are indexed by the `episode_number`
+        state_encodings and action_lls are indexed by the `episode_number`
         field of EpisodeData, and should contain non-differentiable cached
-        components from each episode's ActorOutput.
+        components from each episode's AgentOutput.
 
-        This method does not tune the parameters of the actor.
+        This method does not tune the parameters of the agent.
 
         Because this training is only tuning the memoryless VF tail, it uses
         smaller minibatches of shuffled timesteps from across multiple
@@ -951,7 +951,7 @@ class Trainer(nn.Module):
         """
         obs_latents_packed, obs_lens = pack_tensors(
             [
-                observation_latents[ep_data.episode_number]
+                state_encodings[ep_data.episode_number]
                 for ep_data in self._replay_buffer
             ]
         )
@@ -995,7 +995,7 @@ class Trainer(nn.Module):
                             terminated[i] = True
 
                     with torch.no_grad():
-                        _, vf_targets = v_trace_estimation(
+                        _, vf_targets = _v_trace_estimation(
                             lmbda=self.cfg.v_trace_lambda,
                             rho_max=self.cfg.v_trace_rho_max,
                             c_max=self.cfg.v_trace_c_max,
@@ -1011,11 +1011,11 @@ class Trainer(nn.Module):
                     vf_targets_packed = pack_padded(vf_targets, obs_lens)
 
                 dataset = DictDataset(
-                    observation_latents=obs_latents_packed, vf_targets=vf_targets_packed
+                    state_encodings=obs_latents_packed, vf_targets=vf_targets_packed
                 )
                 for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
                     self.vf_optimizer.zero_grad()
-                    vf_out = self.vf(batch["observation_latents"])
+                    vf_out = self.vf(batch["state_encodings"])
                     vf_loss = self.cfg.vf_loss_coef * F.mse_loss(
                         vf_out, batch["vf_targets"]
                     )
@@ -1029,7 +1029,7 @@ class Trainer(nn.Module):
                         error_if_nonfinite=True,
                     )
                     self.vf_optimizer.step()
-                    pbar.n += len(batch["observation_latents"])
+                    pbar.n += len(batch["state_encodings"])
                     pbar.refresh()
                     if time.monotonic() > deadline:
                         return True
@@ -1048,7 +1048,7 @@ class Trainer(nn.Module):
             "training_stats",
             training_stats,
             level=stick.INFO,
-            step=self.total_actor_grad_steps,
+            step=self.total_agent_grad_steps,
         )
         self.last_training_stats = training_stats
 
@@ -1056,10 +1056,10 @@ class Trainer(nn.Module):
             "train_locals",
             train_locals,
             level=stick.TRACE,
-            step=self.total_actor_grad_steps,
+            step=self.total_agent_grad_steps,
         )
 
-    def log_dataset(self, train_inputs: list[PolicyTrainingInputs]):
+    def _log_dataset(self, train_inputs: list[PolicyTrainingInputs]):
         full_episode_rewards = pad_tensors(
             [data.rewards for data in self._replay_buffer]
         )
@@ -1105,25 +1105,32 @@ class Trainer(nn.Module):
             step=self.total_env_steps,
         )
 
-    def preprocess(self):
+    def _preprocess(self) -> list[PolicyTrainingInputs]:
+        """Compute training inputs from the replay buffer and value function.
+
+        Mostly this consists of the advantages and value function
+        targets. See the PolicyTrainingInputs class for more
+        information.
+        """
+
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
         obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
         assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
 
         # Compute vf_returns
-        self.actor.train(mode=False)
+        self.agent.train(mode=False)
         self.vf.train(mode=False)
         with torch.no_grad():
-            actor_outputs = self.actor([data.episode for data in self._replay_buffer])
+            agent_outputs = self.agent([data.episode for data in self._replay_buffer])
             obs_latents_packed = pack_tensors_check(
-                [actor_out.observation_latents for actor_out in actor_outputs], obs_lens
+                [agent_out.state_encodings for agent_out in agent_outputs], obs_lens
             )
             vf_returns_packed = self.vf(obs_latents_packed)
-        self.actor.train(mode=True)
+        self.agent.train(mode=True)
         self.vf.train(mode=True)
 
         action_lls_now = pad_tensors(
-            [actor_out.action_lls for actor_out in actor_outputs]
+            [agent_out.action_lls for agent_out in agent_outputs]
         )
         original_action_lls = pad_tensors(
             [data.original_action_lls for data in self._replay_buffer]
@@ -1150,7 +1157,7 @@ class Trainer(nn.Module):
         discount = 1 - self.cfg.discount_inv
         gammas = discount * torch.ones_like(rewards_normed)
 
-        padded_advantages, vf_targets = v_trace_estimation(
+        padded_advantages, vf_targets = _v_trace_estimation(
             lmbda=self.cfg.v_trace_lambda,
             rho_max=self.cfg.v_trace_rho_max,
             c_max=self.cfg.v_trace_c_max,
@@ -1182,7 +1189,7 @@ class Trainer(nn.Module):
         clipped_exp_adv = rect_adv.clone()
         clipped_exp_adv[large_exp_adv] = max_exp_adv
 
-        discounted_returns = discount_cumsum(padded_rewards, discount=discount)
+        discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
 
         train_inputs = [
             PolicyTrainingInputs(
@@ -1229,24 +1236,31 @@ class Trainer(nn.Module):
         terminated: bool,
         action_dists: Optional[ActionDist] = None,
         any_actions_possible: Optional[torch.Tensor] = None,
-        sample_priority: float = 1.0,
-        infos: Optional[dict[str, Any]] = None,
+        sample_weight: float = 1.0,
+        infos: Optional[dict[str, torch.Tensor]] = None,
     ):
         """Add a new episode to the replay buffer.
 
         Arguments:
+            episode (Any): The episode. Can be any value that the agent accepts
+                (in a list) to its forward method.
             rewards (torch.Tensor): Float Tensor containing rewards achieved
                 after taking each action.
             terminated (bool): True if the episode ended in a terminal state,
                 and False if the episode timed-out, was abandoned, or is still
-                ongoing
+                ongoing.
+            action_dists (Optional[ActionDist]): Optional original action
+                distributions. Used to compute exact KL divergence and entropy
+                regularization depending on the config.
             any_actions_possible (torch.Tensor?): Boolean Tensor indicating if any
                 actions were possible to take at this state. This allows
                 ignoring states where no action was possible (e.g. the initial
                 prompt in an LLM, or intermediate frames in a video input when
                 using frame-skip). Assumes always true if not provided.
-            sample_priority (float): Optional initial sample priority weight.
+            sample_weight (float): Optional initial sample priority weight.
                 Will be adjusted by the learner.
+            infos (Optional[dict[str,torch.Tensor]]): extra information about
+                the episode. Will be summarized and logged every training step.
 
         """
         assert isinstance(rewards, torch.Tensor)
@@ -1274,7 +1288,7 @@ class Trainer(nn.Module):
                 original_action_dists=action_dists,
                 rewards=rewards,
                 any_actions_possible=any_actions_possible,
-                sample_priority=sample_priority,
+                sample_weight=sample_weight,
                 infos=infos,
             )
         )
@@ -1353,8 +1367,8 @@ class Trainer(nn.Module):
         assert self.vf_optimizer.param_groups[0]["params"][0] is next(
             self.vf.parameters()
         )
-        assert self.actor_optimizer.param_groups[0]["params"][0] is next(
-            self.actor.parameters()
+        assert self.agent_optimizer.param_groups[0]["params"][0] is next(
+            self.agent.parameters()
         )
 
     def maybe_checkpoint(self):
@@ -1375,13 +1389,16 @@ class Trainer(nn.Module):
                     self.cfg.run_name,
                     f"train_step_{self.train_steps_so_far}.pkl",
                 )
-                LOGGER.info(f"Checkpointing to {f_name!r}")
-                with open(
-                    f_name,
-                    "wb",
-                ) as f:
-                    pickle.dump(state_dict, f)
-                self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
+                if not os.path.exists(f_name):
+                    LOGGER.info(f"Checkpointing to {f_name!r}")
+                    with open(
+                        f_name,
+                        "wb",
+                    ) as f:
+                        pickle.dump(state_dict, f)
+                    self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
+                else:
+                    LOGGER.info(f"Checkpoint {f_name!r} already exists")
             if checkpoint_best:
                 f_name = os.path.join(self.cfg.log_dir, self.cfg.run_name, f"best.pkl")
                 LOGGER.info(f"Checkpointing to {f_name!r}")
@@ -1428,7 +1445,7 @@ class Trainer(nn.Module):
         return False
 
 
-def discount_cumsum(x: torch.Tensor, discount: float):
+def _discount_cumsum(x: torch.Tensor, discount: float):
     B, L = x.shape
     discount_x = discount * torch.ones_like(x[0])
     discount_x[0] = 1.0
@@ -1446,7 +1463,7 @@ def discount_cumsum(x: torch.Tensor, discount: float):
 
 
 @torch.jit.script
-def v_trace_estimation(
+def _v_trace_estimation(
     *,
     lmbda: float,
     rho_max: float,
@@ -1473,17 +1490,17 @@ def v_trace_estimation(
         lmbda (float): Lambda parameter that controls the bias-variance tradeoff.
         rho_max (float): The "VF truncation" importance weight clip.
         c_max (float): The "trace-cutting" importance weight clip.
-        gammas (torch.Tensor): A 2D tensor of per-timestep discount factors.
-            Used to avoid discounting across states where no action was
-            possible.
+        gammas (torch.Tensor): A 2D tensor of per-timestep discount
+            coefficients. Used to avoid discounting across states where no
+            action was possible.
         vf_x (torch.Tensor): A 2D tensor of value function estimates with shape
             (N, T + 1), where N is the batch dimension (number of episodes) and
-            T is the maximum episode length experienced by the actor. If an
+            T is the maximum episode length experienced by the agent. If an
             episode terminates in fewer than T time steps, the remaining
             elements in that episode should be set to 0.
         rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
             (N, T), where N is the batch dimension (number of episodes) and T
-            is the maximum episode length experienced by the actor.
+            is the maximum episode length experienced by the agent.
         episode_lengths (torch.Tensor) A 1D tensor indicating the episode length.
         terminated (torch.Tensor): A 1D tensor indicating if the episode
             ended in a terminal state.

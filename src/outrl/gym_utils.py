@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from outrl.rl import ActorOutput
+from outrl.rl import AgentOutput
 from outrl.torch_utils import (
     concat,
     make_mlp,
@@ -17,7 +17,7 @@ from outrl.torch_utils import (
 )
 
 
-class GymActor(nn.Module):
+class GymAgent(nn.Module):
     def __init__(
         self,
         *,
@@ -81,7 +81,7 @@ class GymActor(nn.Module):
         )
         return np.asarray(action), infos
 
-    def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[ActorOutput]:
+    def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[AgentOutput]:
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
         observations = observations.to(dtype=self.dtype).to(device=self.device)
         # Add a trailing fake action so each observation has an action afterwards
@@ -93,11 +93,11 @@ class GymActor(nn.Module):
         )
         actions = actions.to(dtype=self.dtype).to(device=self.device)
         assert action_pack_lens == pack_lens
-        obs_latents, params, infos = self._run_net(observations)
+        state_encodings, params, infos = self._run_net(observations)
         del infos
 
         batch_dist = self.construct_dist(params)
-        obs_latents = unpack_tensors(obs_latents, pack_lens)
+        state_encodings = unpack_tensors(state_encodings, pack_lens)
         packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
         unpacked_params = {k: unpack_tensors(v, pack_lens) for (k, v) in params.items()}
         dists = [
@@ -108,14 +108,14 @@ class GymActor(nn.Module):
             act_lls[:-1] for act_lls in unpack_tensors(packed_action_ll, pack_lens)
         ]
         return [
-            ActorOutput(
-                observation_latents=obs_lat, action_lls=act_lls, action_dists=dist
+            AgentOutput(
+                state_encodings=state_enc, action_lls=act_lls, action_dists=dist
             )
-            for (obs_lat, act_lls, dist) in zip(obs_latents, action_lls, dists)
+            for (state_enc, act_lls, dist) in zip(state_encodings, action_lls, dists)
         ]
 
 
-class GymBoxActor(GymActor):
+class GymBoxAgent(GymAgent):
     def __init__(
         self,
         *,
@@ -147,14 +147,14 @@ class GymBoxActor(GymActor):
     def _run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
-        observation_latents = self.shared_layers(obs)
-        pi_x = self.pi_layers(observation_latents)
+        state_encodings = self.shared_layers(obs)
+        pi_x = self.pi_layers(state_encodings)
         mean = self.action_mean(pi_x)
         std_pre_clamp = self.action_logstd(pi_x).exp()
         std = torch.clamp(std_pre_clamp, min=self.min_std)
         params = dict(mean=mean, std=std)
         return (
-            observation_latents,
+            state_encodings,
             params,
             {
                 # "action_mean": mean.mean(dim=-1),
@@ -173,7 +173,7 @@ class GymBoxActor(GymActor):
         return dist
 
 
-class GymBoxCategorialActor(GymActor):
+class GymBoxCategorialAgent(GymAgent):
     def __init__(
         self,
         *,
@@ -193,8 +193,8 @@ class GymBoxCategorialActor(GymActor):
     def _run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
-        observation_latents = self.shared_layers(obs)
-        pi_x = self.pi_layers(observation_latents)
+        state_encodings = self.shared_layers(obs)
+        pi_x = self.pi_layers(state_encodings)
         action_logits = self.action_logits(pi_x)
         params = dict(logits=action_logits)
         dist = self.construct_dist(params)
@@ -203,7 +203,7 @@ class GymBoxCategorialActor(GymActor):
             for (i, prob) in enumerate(dist.probs.transpose(0, 1))
         }
         assert len(infos["action_0_prob"]) == len(dist.probs)
-        return observation_latents, params, infos
+        return state_encodings, params, infos
 
     def construct_dist(
         self, params: dict[str, torch.Tensor]
@@ -211,7 +211,7 @@ class GymBoxCategorialActor(GymActor):
         return torch.distributions.Categorical(logits=params["logits"])
 
 
-def make_gym_actor(
+def make_gym_agent(
     env, hidden_sizes, pi_hidden_sizes, init_std: float = 0.5, min_std: float = 1e-6
 ):
     while isinstance(env, list):
@@ -222,7 +222,7 @@ def make_gym_actor(
 
     if obs_space == "Box" and act_space == "Box":
         action_size = flatten_shape(env.action_space.shape)
-        return GymBoxActor(
+        return GymBoxAgent(
             obs_size=obs_size,
             action_size=action_size,
             hidden_sizes=hidden_sizes,
@@ -232,7 +232,7 @@ def make_gym_actor(
         )
     elif obs_space == "Box" and act_space == "Discrete":
         action_size = env.action_space.n
-        return GymBoxCategorialActor(
+        return GymBoxCategorialAgent(
             obs_size=obs_size,
             action_size=action_size,
             hidden_sizes=hidden_sizes,
@@ -240,7 +240,7 @@ def make_gym_actor(
         )
     else:
         raise NotImplementedError(
-            f"No GymActor for observation_space={env.observation_space}, "
+            f"No GymAgent for observation_space={env.observation_space}, "
             f"action_space={env.action_space}"
         )
 
@@ -275,12 +275,12 @@ def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
 def collect(
     num_timesteps: int,
     envs,
-    actor,
+    agent,
     best_action: bool = False,
     full_episodes_only: bool = True,
     max_episode_length: Optional[int] = None,
 ):
-    actor.train(mode=False)
+    agent.train(mode=False)
     n_envs = len(envs)
 
     # Wrap around gym inconsistencies
@@ -339,7 +339,7 @@ def collect(
         while not end_now:
             timestep += 1
             # run the agent
-            acts, agent_i = actor.get_actions(
+            acts, agent_i = agent.get_actions(
                 np.asarray([obs[-1] for obs in observations]),
                 best_action=best_action,
                 reset_mask=reset_mask,
@@ -379,7 +379,7 @@ def collect(
                             action_dist_params[k] = torch.stack(
                                 [agent_i[key] for agent_i in agent_infos[i]]
                             )
-                    action_dists = actor.construct_dist(action_dist_params)
+                    action_dists = agent.construct_dist(action_dist_params)
 
                     episodes.append(
                         process_episode(
