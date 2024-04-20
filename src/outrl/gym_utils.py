@@ -44,7 +44,7 @@ class GymAgent(nn.Module):
 
         self.dtype = torch.float32
         self.device = "cpu"
-        self.observation_latent_size = hidden_sizes[-1]
+        self.state_encoding_size = hidden_sizes[-1]
 
     def _run_net(
         self, obs: torch.Tensor

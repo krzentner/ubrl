@@ -42,7 +42,7 @@ from outrl.torch_utils import (
 )
 from outrl.config import Config, tunable, IntListDistribution, default_run_name
 
-LOGGER = logging.getLogger("outrl")
+_LOGGER = logging.getLogger("outrl")
 
 T = TypeVar("T")
 
@@ -64,10 +64,10 @@ class AgentOutput:
     action_dists: Optional[ActionDist] = None
     """Distribution used to generate actions.
 
-    Will be used for the KL penalty if not None, cfg.kl_dist_penalty > 0, and
-    cfg.use_approx_kl is False.
+    Will be used for the KL penalty if not None and cfg.use_approx_kl is False.
 
-    Will be used for entropy regularization if not None and cfg.approx_entropy is False.
+    Will be used for entropy regularization if not None and cfg.approx_entropy
+    is False.
     """
 
 
@@ -89,10 +89,12 @@ class EpisodeData:
     in infinite horizon MDPs or when and episode reaches a timeout."""
 
     original_action_lls: torch.Tensor
-    """Original action lls provided when the episode was added."""
+    """Original action lls provided when the episode was added. Used for
+    v-trace off-policy correction and in the PPO loss (when enabled)."""
 
     original_action_dists: Optional[ActionDist]
-    """Original action distributions provided when the episode was added."""
+    """Original action distributions optionally provided when the episode was
+    added."""
 
     rewards: torch.Tensor
     """Rewards provided when the episode was added."""
@@ -103,16 +105,16 @@ class EpisodeData:
     infos: dict[str, Any]
     """User infos. Will be logged if possible."""
 
-    sample_weight: float = 1.0
-    """Episode sampling weight. Decreased every train_step()."""
+    weight: float = 1.0
+    """Importance of this episode."""
 
     def __lt__(self, other):
         return self.sort_key() < other.sort_key()
 
     def sort_key(self):
-        """Retain highest sampling priority episodes, tie-break to prefer newer
+        """Retain highest weight episodes, tie-break to prefer newer
         episodes."""
-        return (self.sample_weight, self.episode_number)
+        return (self.weight, self.episode_number)
 
     def __post_init__(self):
         assert self.original_action_lls.shape == (self.num_timesteps,)
@@ -230,35 +232,112 @@ class TrainerConfig(Config):
     expected_train_steps: int = 1000
     """Expected number of training steps. Used for controlling scheduled parameters."""
 
-    train_step_timeout_seconds: Optional[int] = None
+    train_step_timeout_seconds: Optional[float] = None
+    """train_step() will exit early if this number of seconds of wall-clock
+    time is exceeded during it. The current gradient step will still finish
+    first, so this timeout is only approximately enforced.
+    """
 
     ppo_loss_coef: float = tunable(0.0, FloatDistribution(0.0, 1000.0))
+    """Loss coefficient for the PPO loss. Usually unused, since the AWR loss is
+    more flexible.
+    """
+
     awr_loss_coef: float = tunable(1.0, FloatDistribution(0.0, 1000.0))
+    """Loss coefficient for the main RL loss. Usually does not need to be
+    tuned."""
+
     agent_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
+    """Learning rate schedule for the agent. Typically used to decrease the
+    learning rate to near-zero near the end of training."""
+
     agent_lr_start: float = tunable(1e-3, FloatDistribution(1e-4, 5e-2, log=True))
+    """Initial learning rate for the agent. If the agent_lr_schedule is None,
+    this learning rate will be used throughout training. """
+
     agent_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
+    """Final learning rate for the agent. If the agent_lr_schedule is None,
+    this learning rate will not be used."""
 
     agent_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
+    """Weight decay for the agent using AdamW."""
 
-    agent_clip_ratio: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
+    ppo_clip_epsilon: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
+    """PPO loss will be clipped to only apply the loss when the log-likelihood is between 1 / (1 + ppo_clip_epsilon) and 1 + ppo_clip_epsilon.
+
+    Because the ppo_loss is disabled by default, this field also has no effect by default.
+    Because OutRL uses regularized VF training, VF clipping is not used.
+    """
 
     vf_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
+    """Learning rate schedule for the value function parameters. Typically used to decrease the learning rate to near-zero near the end of training."""
     vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-4, 0.1, log=True))
+    """Initial learning rate for the value function parameters. If the
+    vf_lr_schedule is None, this learning rate will be used throughout
+    training. """
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
+    """Final learning rate for the value function parameters. If the
+    vf_lr_schedule is None, this learning rate will not be used. """
 
     vf_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
+    """Weight decay for the value function parameters using AdamW."""
 
     vf_minibatch_size: int = tunable(512, IntDistribution(1, 2**32, log=True))
-    vf_pre_training_epochs: int = tunable(10, IntDistribution(0, 20))
-    vf_post_training_epochs: int = tunable(1, IntDistribution(0, 20))
+    """Number of timesteps used in minibatches when pre-training and
+    post-training the value function from frozen state encodings.
 
-    vf_recompute_targets: bool = tunable(False, CategoricalDistribution([True, False]))
+    Because the value function uses a memoryless architecture (the VF relies on
+    the agent to encode memory, if necessary), this minibatch size is typically
+    met precisely (except for one trailing odd-sized minibatch).
+    """
+
+    vf_pre_training_epochs: int = tunable(10, IntDistribution(0, 20))
+    """Number of epochs of value function training to run from frozen state
+    encodings each train_step() before training the agent.
+
+    Because OutRL uses an AWR-style loss, training the VF before the policy is
+    expected.
+    """
+    vf_post_training_epochs: int = tunable(1, IntDistribution(0, 20))
+    """Number of epochs of value function training to run from frozen state
+    encodings each train_step() after training the agent.
+
+    Because the value function is also tuned with the agent, this pass mostly
+    serves to allow the value function to "catch up" to changing state
+    encodings before the next train_step begins.
+    """
+
+    vf_recompute_targets: bool = tunable(True, CategoricalDistribution([True, False]))
+    """If true, value function targets will be recomputed every epoch of value
+    function optimization.
+
+    This allows the value function to make predictions based on "mixing"
+    advantages from multiple episodes, as is typical in Q-learning based
+    algorithms.
+
+    If your environment is partially observable, disabling this option may
+    improve training reliability.
+    """
 
     vf_loss_coef: float = tunable(0.1, FloatDistribution(1e-6, 1.0, log=True))
+    """Coefficient to apply to the value function loss.
+
+    Losses are usually around unit-scale by default. This coefficient being
+    smaller than the agent loss coefficient(s) encourages the agent to focus on
+    performing well, and only producing good state encodings as a secondary
+    priority.
+
+    Contrary to comments in some other frameworks, this hyper parameter has a
+    very large effect!
+
+    To keep the gradient scale on the value function consistent between the
+    value function and agent training phases, this coefficient is applied in
+    both cases.
+    """
 
     vf_hidden_sizes: list[int] = tunable(
         [128, 128],
@@ -269,30 +348,118 @@ class TrainerConfig(Config):
             [256, 256, 256],
         ),
     )
+    """Size of latent representations used in the value function to predict
+    future returns from state encodings.
+
+    Value function training is regularized with dropout, and value function
+    training is relatively fast, so there is little disadvantage to making the
+    value function wider.
+    """
 
     discount_inv: float = tunable(0.01, FloatDistribution(1e-5, 0.1, log=True))
-    """Discount, expresseed such that gamma = 1 - discount_inv."""
+    """Discount, expresseed such that gamma = 1 - discount_inv to allow
+    hyper-parameter tuning in log space.
+
+    This hyper parameter can have a very significant effect.
+    """
 
     v_trace_lambda: float = tunable(0.95, FloatDistribution(0.0, 1.0))
+    """Lambda parameter to v-trace advantage estimation.
+
+    Controls the bias-variance tradeoff between pure belmann bootstraps and
+    monte-carlo estimates. A value of 1 corresponds to minimal bias, and
+    matches v-trace as originally proposed.
+    """
+
     v_trace_rho_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
+    """The "value function truncation" importance weight maximum in v-trace.
+
+    Setting this value to very large values disables it, performing maximally
+    off-policy advantage estimation.
+
+    Smaller values limit the degree to which rewards from increased likelihood
+    off-policy actions can contribute to estimated advantages.
+    """
+
     v_trace_c_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
+    """The "trace-cutting" importance weight maximum in v-trace.
+
+    Setting this value to very large values disables it, performing maximally
+    off-policy advantage estimation.
+
+    Smaller values limit the degree to which future value function estimates
+    from increased likelihood off-policy states can contribute to estimated
+    advantages.
+    """
 
     kl_coef_init: float = tunable(0.0, FloatDistribution(0.0, 100.0))
+    """Initial loss coefficient for KL penalty / regularization of the agent.
+
+    The KL coefficient will be tuned using a lagrangian style loss to keep the
+    size of policy updates to within a maximal value (kl_soft_target).
+
+    This penalty is applied exactly if action_dists is provided by the agent,
+    or applied approximately using action_lls otherwise.
+    """
+
     kl_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
+    """How quickly to adapt the loss coefficient for KL penalty.
+
+    The KL coefficient will be tuned using a lagrangian style loss to keep the
+    size of policy updates to within a maximal value (kl_soft_target).
+    """
+
     kl_coef_min: float = tunable(0.0, FloatDistribution(0.0, 1.0))
-    kl_coef_max: float = tunable(1e5, FloatDistribution(0.1, 1e10, log=True))
+    """Minimum value of the KL coefficient. Setting this to a non-zero value
+    can help stabilize training very low-entropy continuous action space
+    policies using the PPO loss, but is typically unnecessary.
+    """
+
+    kl_coef_max: float = tunable(1e3, FloatDistribution(0.1, 1e6, log=True))
+    """Maximum value of the KL coefficient. Necessary to ensure eventual
+    convergence of the KL penalty.
+
+    If you are experiencing crashes due to NaNs when the kl_coef is high,
+    decrease this value.
+    """
+
     kl_target_stat: Literal["mean", "max"] = tunable(
         "mean", CategoricalDistribution(["mean", "max"])
     )
+    """What statistic of the KL divergence to constrain.
+
+    Constraining the mean KL divergence is typical, but constraining the max KL
+    can improve stability during long runs with little disadvantage.
+    """
+
     kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
-    kl_fixup_coef: float = tunable(3, FloatDistribution(1.0, 20.0, log=True))
+    """Target per-timestep KL divergence per train-step.
+
+    If this value is exceeded, the kl_coef will become non-zero to limit the
+    training step size.
+
+    Because this value is enforced using a lagrangian, KL steps are often 2-3x
+    this target.
+    """
+
+    kl_fixup_coef: float = tunable(3, FloatDistribution(1.1, 20.0, log=True))
+    """Multiple of the kl_soft_target to strictly enforce when kl_use_fixup is
+    True.
+
+    Low values of this parameter may drastically increase the compute time used
+    by the fixup phase.
+    """
+
     kl_use_fixup: bool = False
+    """Strictly enforce a KL limit using a fixup phase."""
 
     use_approx_kl: bool = False
-    """Approximate the KL divergence using the log-likelihoods."""
+    """Approximate the KL divergence using action log-likelihoods even if exact
+    action distributions are provided by the agent."""
 
     use_approx_entropy: bool = False
-    """Approximate the action entropy using the log-likelihoods."""
+    """Approximate the action entropy using action log-likelihoods even if
+    exact action distributions are provided by the agent."""
 
     entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
 
@@ -364,16 +531,10 @@ class PolicyTrainingInputs:
     vf_returns: torch.Tensor
     vf_targets: torch.Tensor
     exp_advantages: torch.Tensor
-    """Exponentiated advantages. Possibly normalized over the whole batch."""
-
-    adv_loss_mask: torch.Tensor
-    """Loss mask for policy improvement.
-
-    Does not affect KL penalty.
-    """
+    """Exponentiated advantages."""
 
 
-OPTIMIZER_FIELDS = [
+_OPTIMIZER_FIELDS = [
     "agent_optimizer",
     "vf_optimizer",
     "vf_lr_scheduler",
@@ -382,35 +543,37 @@ OPTIMIZER_FIELDS = [
     "awr_temperature_opt",
 ]
 
-SUBMODULE_FIELDS = [
+_SUBMODULE_FIELDS = [
     "agent",
     "vf",
     "reward_normalizer",
 ]
 
-PARAM_FIELDS = [
+_PARAM_FIELDS = [
     "kl_coef",
     "awr_temperature",
 ]
 
-IGNORED_FIELDS = ["_is_full_backward_hook"]
+_IGNORED_FIELDS = ["_is_full_backward_hook"]
 
 
-class Trainer(nn.Module):
+class Trainer:
     def __init__(self, cfg: TrainerConfig, agent):
         super().__init__()
         self.cfg = cfg
 
         self.agent = agent
 
-        self.observation_latent_size = self.agent.observation_latent_size
+        self._state_encoding_size = self.agent.state_encoding_size
 
         self.vf = make_mlp(
-            input_size=self.observation_latent_size,
+            input_size=self._state_encoding_size,
             hidden_sizes=self.cfg.vf_hidden_sizes,
             output_size=0,
             use_dropout=True,
         )
+
+        # Zero the initial VF output to stabilize training
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
@@ -475,6 +638,18 @@ class Trainer(nn.Module):
     def _primary_loss_function(
         self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, AgentOutput]]
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Reinforcement learning loss function.
+
+        Combines together losses from many sources to train both the agent and
+        value function.
+
+        Returns a loss which is usually near unit scale and a dictionary of
+        infos to log for this gradient step.
+
+        Note that lagrangian losses (for the KL and entropy) are optimized in
+        their related loss functions.
+        """
+
         episode_data: list[EpisodeData] = [b[0] for b in batch]
         train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
         agent_outputs: list[AgentOutput] = [b[2] for b in batch]
@@ -514,7 +689,7 @@ class Trainer(nn.Module):
 
         ratio = torch.exp(log_probs - old_log_probs)
         ratio_clipped = torch.clamp(
-            ratio, 1 / (1 + self.cfg.agent_clip_ratio), 1 + self.cfg.agent_clip_ratio
+            ratio, 1 / (1 + self.cfg.ppo_clip_epsilon), 1 + self.cfg.ppo_clip_epsilon
         )
 
         policy_gradient = ratio * advantages
@@ -897,7 +1072,7 @@ class Trainer(nn.Module):
                 # potentially extremely slowing training on e.g. an over-fit
                 # VF or excessively off-policy data.
                 # TODO: Crash if we catch too many errors here
-                LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
+                _LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
                 errors += 1
                 if errors > self.cfg.max_permitted_errors_per_train_step:
                     raise ex
@@ -927,7 +1102,7 @@ class Trainer(nn.Module):
         self.train_steps_so_far += 1
 
         if timed_out:
-            LOGGER.error("train_step() timed out")
+            _LOGGER.error("train_step() timed out")
 
     def _train_vf(
         self,
@@ -1173,10 +1348,9 @@ class Trainer(nn.Module):
         adv_packed = pack_padded(padded_advantages, episode_lengths)
         assert not adv_packed.requires_grad
 
-        batch_mask = torch.ones(*adv_packed.shape, dtype=torch.bool)
         if self.cfg.normalize_advantages:
-            adv_packed = adv_packed - adv_packed[batch_mask].mean()
-            adv_packed = adv_packed / adv_packed[batch_mask].std()
+            adv_packed = adv_packed - adv_packed.mean()
+            adv_packed = adv_packed / adv_packed.std()
 
         heated_adv = adv_packed / self.awr_temperature.detach()
         exp_advantages = heated_adv.exp()
@@ -1198,15 +1372,13 @@ class Trainer(nn.Module):
                 vf_returns=vf_ret,
                 vf_targets=vf_target,
                 exp_advantages=exp_adv,
-                adv_loss_mask=mask,
             )
-            for (adv, disc_ret, vf_ret, vf_target, exp_adv, mask) in zip(
+            for (adv, disc_ret, vf_ret, vf_target, exp_adv) in zip(
                 unpack_tensors(adv_packed, episode_lengths),
                 unpad_tensors(discounted_returns, episode_lengths),
                 unpad_tensors(vf_returns, episode_lengths),
                 unpad_tensors(vf_targets, episode_lengths),
                 unpack_tensors(clipped_exp_adv, episode_lengths),
-                unpack_tensors(batch_mask, episode_lengths),
             )
         ]
         assert len(train_inputs) == len(self._replay_buffer)
@@ -1236,12 +1408,13 @@ class Trainer(nn.Module):
         terminated: bool,
         action_dists: Optional[ActionDist] = None,
         any_actions_possible: Optional[torch.Tensor] = None,
-        sample_weight: float = 1.0,
+        weight: float = 1.0,
         infos: Optional[dict[str, torch.Tensor]] = None,
     ):
         """Add a new episode to the replay buffer.
 
-        Arguments:
+        Args:
+
             episode (Any): The episode. Can be any value that the agent accepts
                 (in a list) to its forward method.
             rewards (torch.Tensor): Float Tensor containing rewards achieved
@@ -1257,8 +1430,8 @@ class Trainer(nn.Module):
                 ignoring states where no action was possible (e.g. the initial
                 prompt in an LLM, or intermediate frames in a video input when
                 using frame-skip). Assumes always true if not provided.
-            sample_weight (float): Optional initial sample priority weight.
-                Will be adjusted by the learner.
+            weight (float): Optional weight indicating importance of the
+                episode. May be adjusted by the learner.
             infos (Optional[dict[str,torch.Tensor]]): extra information about
                 the episode. Will be summarized and logged every training step.
 
@@ -1288,7 +1461,7 @@ class Trainer(nn.Module):
                 original_action_dists=action_dists,
                 rewards=rewards,
                 any_actions_possible=any_actions_possible,
-                sample_weight=sample_weight,
+                weight=weight,
                 infos=infos,
             )
         )
@@ -1305,16 +1478,16 @@ class Trainer(nn.Module):
         for k, v in stats.items():
             hparams[k] = v
         stick.log("hparams", hparams, step=self.total_env_steps)
-        LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
+        _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
 
     def state_dict(self):
         state = {}
-        for k in SUBMODULE_FIELDS + OPTIMIZER_FIELDS:
+        for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
             state[k] = getattr(self, k).state_dict()
-        for k in PARAM_FIELDS:
+        for k in _PARAM_FIELDS:
             state[k] = getattr(self, k).data
         for k, v in self.__dict__.items():
-            if k in IGNORED_FIELDS or k in OPTIMIZER_FIELDS or k in SUBMODULE_FIELDS:
+            if k in _IGNORED_FIELDS or k in _OPTIMIZER_FIELDS or k in _SUBMODULE_FIELDS or k in _PARAM_FIELDS:
                 continue
             elif k == "cfg":
                 state[k] = v.to_dict()
@@ -1323,7 +1496,7 @@ class Trainer(nn.Module):
                     state[k] = v
             else:
                 if hasattr(v, "state_dict"):
-                    LOGGER.error(
+                    _LOGGER.error(
                         f"Field {k} was not expected to have a state_dict method"
                     )
                 state[k] = v
@@ -1331,25 +1504,25 @@ class Trainer(nn.Module):
 
     def load_state_dict(self, state_dict):
         state = state_dict
-        for k in PARAM_FIELDS + SUBMODULE_FIELDS + OPTIMIZER_FIELDS:
+        for k in _PARAM_FIELDS + _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
             assert k in state, f"Missing {k!r} from state dict"
         for k, v in state.items():
-            if k in OPTIMIZER_FIELDS:
+            if k in _OPTIMIZER_FIELDS:
                 # We need to handle these fields once all parameters are loaded
                 continue
             elif k == "cfg":
                 self.cfg = type(self.cfg).from_dict(v)
-            elif k in PARAM_FIELDS:
+            elif k in _PARAM_FIELDS:
                 setattr(self, k, nn.Parameter(v))
-            elif k in SUBMODULE_FIELDS:
+            elif k in _SUBMODULE_FIELDS:
                 getattr(self, k).load_state_dict(v)
             else:
                 field_now = getattr(self, k, None)
                 if field_now is None:
-                    LOGGER.error(f"Attempting to set unknown field {k}")
+                    _LOGGER.error(f"Attempting to set unknown field {k}")
                 else:
                     if hasattr(field_now, "load_state_dict"):
-                        LOGGER.error(
+                        _LOGGER.error(
                             f"Field {k} was not expected to have a load_state_dict method"
                         )
                 setattr(self, k, v)
@@ -1359,7 +1532,7 @@ class Trainer(nn.Module):
         self._setup_optimizers()
 
         # Now we can load the optimizer state dictionaries
-        for k in OPTIMIZER_FIELDS:
+        for k in _OPTIMIZER_FIELDS:
             getattr(self, k).load_state_dict(state[k])
 
         # Make sure optimizers are attached to parameters
@@ -1390,7 +1563,7 @@ class Trainer(nn.Module):
                     f"train_step_{self.train_steps_so_far}.pkl",
                 )
                 if not os.path.exists(f_name):
-                    LOGGER.info(f"Checkpointing to {f_name!r}")
+                    _LOGGER.info(f"Checkpointing to {f_name!r}")
                     with open(
                         f_name,
                         "wb",
@@ -1398,10 +1571,10 @@ class Trainer(nn.Module):
                         pickle.dump(state_dict, f)
                     self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
                 else:
-                    LOGGER.info(f"Checkpoint {f_name!r} already exists")
+                    _LOGGER.info(f"Checkpoint {f_name!r} already exists")
             if checkpoint_best:
                 f_name = os.path.join(self.cfg.log_dir, self.cfg.run_name, f"best.pkl")
-                LOGGER.info(f"Checkpointing to {f_name!r}")
+                _LOGGER.info(f"Checkpointing to {f_name!r}")
                 with open(f_name, "wb") as f:
                     pickle.dump(state_dict, f)
                 self.best_checkpoint_primary_performance = self.primary_performance
@@ -1420,12 +1593,12 @@ class Trainer(nn.Module):
                 with open(best_ckpt, "rb") as f:
                     state = pickle.load(f)
                     self.load_state_dict(state)
-                    LOGGER.critical(
+                    _LOGGER.critical(
                         f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
                     )
                     return True
             except (pickle.UnpicklingError, ValueError) as ex:
-                LOGGER.error(f"Could not load {best_ckpt}: {ex}")
+                _LOGGER.error(f"Could not load {best_ckpt}: {ex}")
         checkpoints = glob(f"{checkpoint_dir}/train_step_*.pkl")
         with_idx = [
             (int(f_name.rsplit("_", 1)[-1].split(".", 1)[0]), f_name)
@@ -1436,12 +1609,12 @@ class Trainer(nn.Module):
                 with open(f_name, "rb") as f:
                     state = pickle.load(f)
                     self.load_state_dict(state)
-                    LOGGER.critical(
+                    _LOGGER.critical(
                         f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
                     )
                     return True
             except (pickle.UnpicklingError, ValueError) as ex:
-                LOGGER.error(f"Could not load {f_name}: {ex}")
+                _LOGGER.error(f"Could not load {f_name}: {ex}")
         return False
 
 
@@ -1504,6 +1677,7 @@ def _v_trace_estimation(
         episode_lengths (torch.Tensor) A 1D tensor indicating the episode length.
         terminated (torch.Tensor): A 1D tensor indicating if the episode
             ended in a terminal state.
+
     Returns:
         A tuple containing:
             torch.Tensor: A 2D tensor of estimated advantages.
@@ -1535,6 +1709,8 @@ def _v_trace_estimation(
 
     gamma_c = gammas * c
 
+    # TODO: Do we need a (1 - lmbda) on the right here? Double-check the math.
+    # I don't think we do, since we recursive
     delta_V = rho * (rewards + gammas * vf_x[:, 1:] - vf_x[:, :-1])
 
     # In the paper: v_{s_t} - V(x_t)

@@ -1,4 +1,4 @@
-#OutRL
+# OutRL
 
 "Outside-the-Box Reinforcement Learning"
 
@@ -50,6 +50,8 @@ The `Trainer` is the class that provides most of OutRL's functionality.
 A Trainer is constructed from a `TrainerConfig` (referred to as `cfg` elsewhere) and an agent.
 
 The agent should be a `torch.nn.Module` with a forward method that takes in a list of "episodes" and returns a list of `ActorOutput` (one per episode).
+The agent should also have an integer field `state_encoding_size` that is the
+dimensionality of the state encodings returned by the agent.
 
 The episode can be any value you would like, as long as your agent can produce differentiable state encodings and action log-likelihoods for every time-step in the episode.
 
