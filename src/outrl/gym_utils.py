@@ -1,3 +1,12 @@
+"""Utilities for working with the OpenAI Gym API.
+
+These utilities are not considered part of the core OutRL library, and OutRL does not depend on anything in this module.
+
+If you're using OutRL, the main reason is probably that you want to implement
+custom neural networks for your environment, which you can base off of the code
+in this module. We recommend you copy freely from this file instead of
+inheriting from the classes defined here.
+"""
 from typing import Optional, Any
 
 import numpy as np
@@ -13,18 +22,33 @@ from outrl.torch_utils import (
     RunningMeanVar,
     pack_tensors,
     unpack_tensors,
+    Sizes,
 )
 
 
 class GymAgent(nn.Module):
+    """Agent intended to be used with the Gym API."""
+
     def __init__(
         self,
         *,
         obs_size: int,
-        hidden_sizes: list[int],
-        pi_hidden_sizes: list[int],
+        hidden_sizes: Sizes,
+        pi_hidden_sizes: Sizes,
     ):
+        """
+
+        Args:
+
+            obs_size (int): Flattened size of observations.
+            hidden_sizes (Sizes): Sizes of latent representations for the shared layers.
+            pi_hidden_sizes (Sizes): Sizes of latent representations for the
+                policy specific layers.
+        """
         super().__init__()
+
+        self.state_encoding_size = hidden_sizes[-1]
+        """This field is part of the OutRL API."""
 
         self.shared_layers = nn.Sequential(
             RunningMeanVar(
@@ -43,16 +67,28 @@ class GymAgent(nn.Module):
 
         self.dtype = torch.float32
         self.device = "cpu"
-        self.state_encoding_size = hidden_sizes[-1]
 
-    def _run_net(
+    def run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        """Main "forward pass" method used during both collect and optimization.
+
+        Returns a tuple of:
+
+            A torch.Tensor containing state_encodings (not used during collect).
+
+            A dictionary of distribution params (will be passed to construct_dist()).
+
+            A dictionary of infos (will be logged).
+        """
         raise NotImplementedError()
 
     def construct_dist(
         self, params: dict[str, torch.Tensor]
     ) -> torch.distributions.Distribution:
+        """Construct a torch.distribution.Distribution from a dictionary of
+        parameters returned by run_net() (or a concatenation thereof).
+        """
         raise NotImplementedError()
 
     def get_actions(
@@ -61,10 +97,24 @@ class GymAgent(nn.Module):
         reset_mask: np.ndarray,
         best_action: bool = False,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Compute a batch of actions from a batch of observations.
+
+        If an index in reset_mask is True, this is the first observation in the
+        episode (only used for Agents with memory).
+
+        When best_action is True, takes the most likely action (mode) of the
+        action distributions.
+
+        Returns a tuple of:
+
+            A np.ndarray containing a batch of (sampled) actions.
+
+            A dict of infos to log.
+        """
         del reset_mask
         assert len(observations.shape) == 2
         with torch.no_grad():
-            _, params, infos = self._run_net(
+            _, params, infos = self.run_net(
                 torch.from_numpy(observations)
                 .to(dtype=self.dtype)
                 .to(device=self.device)
@@ -84,6 +134,16 @@ class GymAgent(nn.Module):
         return np.asarray(action), infos
 
     def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[AgentOutput]:
+        """Implements the OutRL forward pass API in terms of run_net().
+
+        Args:
+
+            episodes: A list of "episode" objects, as produced by collect().
+
+        Returns:
+
+            A list of AgentOutput objects.
+        """
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
         observations = observations.to(dtype=self.dtype).to(device=self.device)
         # Add a trailing fake action so each observation has an action afterwards
@@ -95,7 +155,7 @@ class GymAgent(nn.Module):
         )
         actions = actions.to(dtype=self.dtype).to(device=self.device)
         assert action_pack_lens == pack_lens
-        state_encodings, params, infos = self._run_net(observations)
+        state_encodings, params, infos = self.run_net(observations)
         del infos
 
         batch_dist = self.construct_dist(params)
@@ -118,6 +178,12 @@ class GymAgent(nn.Module):
 
 
 class GymBoxAgent(GymAgent):
+    """GymAgent producing a continuous action distribution suitable for the
+    "Box" action space.
+
+    Despite this library's name, this class cannot be fully avoided.
+    """
+
     def __init__(
         self,
         *,
@@ -146,7 +212,7 @@ class GymBoxAgent(GymAgent):
         self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
         self.min_std = min_std
 
-    def _run_net(
+    def run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         state_encodings = self.shared_layers(obs)
@@ -176,6 +242,10 @@ class GymBoxAgent(GymAgent):
 
 
 class GymBoxCategorialAgent(GymAgent):
+    """GymAgent producing a discrete action distribution suitable for the
+    "Categorical" action space.
+    """
+
     def __init__(
         self,
         *,
@@ -192,7 +262,7 @@ class GymBoxCategorialAgent(GymAgent):
 
         self.action_logits = nn.Linear(pi_hidden_sizes[-1], action_size)
 
-    def _run_net(
+    def run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         state_encodings = self.shared_layers(obs)
@@ -214,8 +284,31 @@ class GymBoxCategorialAgent(GymAgent):
 
 
 def make_gym_agent(
-    env, hidden_sizes, pi_hidden_sizes, init_std: float = 0.5, min_std: float = 1e-6
+    env,
+    hidden_sizes: Sizes,
+    pi_hidden_sizes: Sizes,
+    init_std: float = 0.5,
+    min_std: float = 1e-6,
 ):
+    """Attempt to construct a GymAgent appropriate for the passed in environment.
+
+    Not all observation and action spaces are supported.
+
+    If you know specifically what type of environment you have, it is probably
+    simpler to construct the appropriate GymAgent directly.
+
+    Args:
+
+        env (gym.Env or gymnasium.Env): Environment. Used for its
+            observation_space and action_space fields.
+        hidden_sizes (Sizes): Shared hidden sizes.
+        pi_hidden_sizes (Sizes): Action tail hidden sizes.
+        init_std (float): Initial standard deviation when using a Box action
+            space. Ignored for other action spaces.
+        min_std (float): Minimum standard deviation when using a Box action
+            space. Ignored for other action spaces.
+
+    """
     while isinstance(env, list):
         env = env[0]
     act_space = type(env.action_space).__name__
@@ -248,6 +341,11 @@ def make_gym_agent(
 
 
 def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
+    """Convert an episode from the temporary form used in collect() into a
+    "durable" form used in GymAgent.forward().
+
+    Mostly converts a bunch of lists of np.ndarrays to torch.Tensors.
+    """
     agent_info_keys = episode["agent_infos"][0].keys()
     agent_infos = {
         k: force_concat(agent_i[k] for agent_i in episode["agent_infos"])
@@ -277,12 +375,31 @@ def process_episode(episode: dict[str, Any]) -> dict[str, Any]:
 
 def collect(
     num_timesteps: int,
-    envs,
-    agent,
+    envs: list["Env"],
+    agent: GymAgent,
     best_action: bool = False,
     full_episodes_only: bool = True,
     max_episode_length: Optional[int] = None,
 ):
+    """Minimal data collector for Gym(nasium) environments.
+
+    Batches observations and actions to the agent, and performs no other
+    optimizations.
+
+    Attempts to collect num_timesteps total timesteps using some number of
+    parallel environments. Will produce extra if num_timesteps is not a
+    multiple of len(envs).
+
+    If best_action is true, asks the agent to perform the most likely actions
+    ("deterministic eval").
+    If full_episodes_only is true, only returns full episodes, and potentially
+    more than num_timesteps. Usually used with the previous argument for policy
+    evaluation.
+
+    Will avoid collecting more than max_episode_length timesteps per episode,
+    if specified. Episodes truncated by max_episode_length will by used when
+    full_episodes_only is set.
+    """
     agent.train(mode=False)
     n_envs = len(envs)
 
@@ -423,11 +540,24 @@ def collect(
 
 
 def episode_stats(episodes: list[dict[str, Any]]) -> dict[str, float]:
+    """Compute evaluation stats from episodes returned by collect().
+
+    Return value is typically passed to Trainer.add_eval_stats().
+
+    If you're using a custom environment, you likely want to copy and modify
+    this function to report important statistics about your environment besides
+    just reward.
+    """
     returns = [ep["rewards"].sum() for ep in episodes]
     terminations = [ep["terminated"] for ep in episodes]
     lengths = [len(ep["rewards"]) for ep in episodes]
-    return {
-        "AverageReturn": float(np.mean(returns)),
-        "TerminationRate": float(np.mean(terminations)),
-        "AverageEpisodeLengths": float(np.mean(lengths)),
+    stats = {
+        "episode_total_rewards": float(np.mean(returns)),
+        "episode_termination_rate": float(np.mean(terminations)),
+        "episode_length": float(np.mean(lengths)),
     }
+    if "success" in episodes[0]["env_infos"]:
+        stats["episode_success_rate"] = float(
+            np.mean([float(np.any(ep["env_infos"]["success"])) for ep in episodes])
+        )
+    return stats

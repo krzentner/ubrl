@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
+import simple_parsing
 
 from optuna.distributions import (
     FloatDistribution,
@@ -43,7 +44,7 @@ from outrl.torch_utils import (
     approx_kl_div,
     used_for_logging,
 )
-from outrl.config import Config, tunable, IntListDistribution, default_run_name
+from outrl.config import tunable, IntListDistribution, default_run_name
 
 _LOGGER = logging.getLogger("outrl")
 
@@ -75,7 +76,7 @@ class AgentOutput:
 
 
 @dataclass(eq=False)
-class EpisodeData:
+class _EpisodeData:
     """Wrapper around an episode that maintains metadata and caches computed values."""
 
     episode: Any
@@ -165,8 +166,11 @@ class EpisodeData:
                         )
 
 
+_GENERATED_FROM_TIME = "GENERATED_FROM_TIME"
+
+
 @dataclass
-class TrainerConfig(Config):
+class TrainerConfig(simple_parsing.Serializable):
     """Config structure for the Trainer.
 
     Can be saved to / loaded from yaml.
@@ -183,13 +187,13 @@ class TrainerConfig(Config):
     Set to -1 to disable setting the random seed.
     """
 
-    run_name: str = default_run_name()
+    run_name: str = _GENERATED_FROM_TIME
     """The name of this trainer run.
 
     Generated uniquely from the name of the main module and time by default."""
 
-    log_dir: str = "runs"
-    """Directory to log into. Full path will be {log_dir}/{run_name}.
+    runs_dir: str = "runs"
+    """Directory to log into. Full path will be {runs_dir}/{run_name}.
 
     Set to None to disable logging."""
 
@@ -354,6 +358,8 @@ class TrainerConfig(Config):
     Value function training is regularized with dropout, and value function
     training is relatively fast, so there is little disadvantage to making the
     value function wider.
+
+    Defaults to [128, 128].
     """
 
     discount_inv: float = tunable(0.01, FloatDistribution(1e-5, 0.1, log=True))
@@ -552,22 +558,24 @@ class TrainerConfig(Config):
         """Fill in values with non-constant defaults. Called after construction."""
         if self.seed < -1:
             raise ValueError("seed should be positive or exactly -1")
+        if self.run_name == _GENERATED_FROM_TIME:
+            object.__setattr__(self, "run_name", default_run_name())
         if self.checkpoint_interval < -1:
             raise ValueError("checkpoint_interval should be positive or exactly -1")
         if self.kl_target_stat == "max" and self.use_approx_kl:
             raise ValueError("Cannot used kl_target_stat='max' with approximated KL.")
-        log_dir = os.path.abspath(self.log_dir)
-        object.__setattr__(self, "log_dir", log_dir)
+        runs_dir = os.path.abspath(self.runs_dir)
+        object.__setattr__(self, "runs_dir", runs_dir)
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
 
 @dataclass(eq=False)
-class PolicyTrainingInputs:
-    """Values used to train the policy that are not present in EpisodeData.
+class _PolicyTrainingInputs:
+    """Values used to train the policy that are not present in _EpisodeData.
 
-    An instance of this class accompanies each EpisodeData during policy
+    An instance of this class accompanies each _EpisodeData during policy
     optimization.
 
     These values are recomputed every train_step()."""
@@ -633,7 +641,7 @@ class Trainer:
 
         self.reward_normalizer = RunningMeanVar(use_mean=False)
 
-        self._replay_buffer: list[EpisodeData] = []
+        self._replay_buffer: list[_EpisodeData] = []
         self._next_episode_number: int = 0
         self._dtype = torch.float32
 
@@ -694,7 +702,7 @@ class Trainer:
         self.total_agent_grad_steps = 0
 
     def _primary_loss_function(
-        self, batch: list[tuple[EpisodeData, PolicyTrainingInputs, AgentOutput]]
+        self, batch: list[tuple[_EpisodeData, _PolicyTrainingInputs, AgentOutput]]
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Reinforcement learning loss function.
 
@@ -708,8 +716,8 @@ class Trainer:
         their related loss functions.
         """
 
-        episode_data: list[EpisodeData] = [b[0] for b in batch]
-        train_inputs: list[PolicyTrainingInputs] = [b[1] for b in batch]
+        episode_data: list[_EpisodeData] = [b[0] for b in batch]
+        train_inputs: list[_PolicyTrainingInputs] = [b[1] for b in batch]
         agent_outputs: list[AgentOutput] = [b[2] for b in batch]
 
         kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
@@ -725,12 +733,13 @@ class Trainer:
         loss = ppo_loss + awr_loss + vf_loss + kl_loss
 
         # kl_infos, vf_infos, and ppo_infos will all get included in locals
+        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos)
         return loss, locals()
 
     def _ppo_loss(
         self,
-        episode_data: list[EpisodeData],
-        train_inputs: list[PolicyTrainingInputs],
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
         agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         advantages, adv_len = pack_tensors(
@@ -765,8 +774,8 @@ class Trainer:
 
     def _awr_loss(
         self,
-        episode_data: list[EpisodeData],
-        train_inputs: list[PolicyTrainingInputs],
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
         agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del episode_data
@@ -791,6 +800,7 @@ class Trainer:
         awr_loss = -log_probs * exp_adv
 
         log_probs_scale = log_probs.detach().abs().mean()
+        used_for_logging(log_probs_scale)
         norm_coef = self.cfg.awr_loss_coef / (self.cfg.minibatch_target_timesteps)
         # Try to keep average awr_loss scale mostly constant
         # if self.cfg.norm_exp_advantages:
@@ -806,13 +816,14 @@ class Trainer:
 
     def _vf_loss(
         self,
-        episode_data: list[EpisodeData],
-        train_inputs: list[PolicyTrainingInputs],
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
         agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # For consistency with other loss functions, we still take
         # episode_data, but don't use it.
         del episode_data
+
         vf_targets_packed, adv_len = pack_tensors(
             [train_input.vf_targets for train_input in train_inputs]
         )
@@ -827,6 +838,7 @@ class Trainer:
             [train_input.discounted_returns for train_input in train_inputs], adv_len
         )
         minibatch_ev = explained_variance(critic_out, discounted_returns)
+        used_for_logging(minibatch_ev)
 
         norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
         vf_loss_scaled = norm_coef * vf_loss
@@ -837,15 +849,16 @@ class Trainer:
 
     def _kl_loss(
         self,
-        episode_data: list[EpisodeData],
-        train_inputs: list[PolicyTrainingInputs],
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
         agent_outputs: list[AgentOutput],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         # For consistency with other loss functions, we still take
         # train_inputs, but don't use it.
         del train_inputs
-        # Computed for logging purposes
+
         original_kl_coef = self.kl_coef.detach().item()
+        used_for_logging(original_kl_coef)
 
         log_probs, lengths = pack_tensors(
             [agent_out.action_lls for agent_out in agent_outputs]
@@ -912,18 +925,18 @@ class Trainer:
 
     def _agent_minibatches(
         self,
-        episodes: Optional[list[EpisodeData]] = None,
+        episodes: Optional[list[_EpisodeData]] = None,
         extra_data: Optional[list[T]] = None,
         minibatch_target_timesteps: Optional[int] = None,
         desc: Optional[str] = None,
         epochs: int = 1,
         shuffle: bool = False,
     ) -> Generator[
-        tuple[int, int, list[tuple[EpisodeData, T, AgentOutput]]], None, None
+        tuple[int, int, list[tuple[_EpisodeData, T, AgentOutput]]], None, None
     ]:
         """Runs the agent forward pass on minibatches drawn from the replay buffer.
 
-        Minibatches are a list of tuples of EpisodeData from the input, data T
+        Minibatches are a list of tuples of _EpisodeData from the input, data T
         from the extra_data (None if not provided), and AgentOutput from the
         agent forward pass.
 
@@ -932,7 +945,7 @@ class Trainer:
         Basically, this method plays a similar role to "Trainer" classes in
         supervised learning libraries.
 
-        Yields: list[tuple[EpisodeData, T, ForwardResult]]
+        Yields: list[tuple[_EpisodeData, T, ForwardResult]]
         """
         if episodes is None:
             episodes = self._replay_buffer
@@ -1174,7 +1187,7 @@ class Trainer:
         """Train just the VF using cached agent outputs.
 
         state_encodings and action_lls are indexed by the `episode_number`
-        field of EpisodeData, and should contain non-differentiable cached
+        field of _EpisodeData, and should contain non-differentiable cached
         components from each episode's AgentOutput.
 
         This method does not tune the parameters of the agent.
@@ -1290,11 +1303,11 @@ class Trainer:
             step=self.total_agent_grad_steps,
         )
 
-    def _log_dataset(self, train_inputs: list[PolicyTrainingInputs]):
+    def _log_dataset(self, train_inputs: list[_PolicyTrainingInputs]):
         full_episode_rewards = pad_tensors(
             [data.rewards for data in self._replay_buffer]
         )
-        t_inputs = pack_recursive(train_inputs)
+        t_inputs = pack_recursive(train_inputs)[0]
         dataset_stats = {
             "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
             "ev": explained_variance(
@@ -1330,11 +1343,11 @@ class Trainer:
             step=self.total_env_steps,
         )
 
-    def _preprocess(self) -> list[PolicyTrainingInputs]:
+    def _preprocess(self) -> list[_PolicyTrainingInputs]:
         """Compute training inputs from the replay buffer and value function.
 
         Mostly this consists of the advantages and value function
-        targets. See the PolicyTrainingInputs class for more
+        targets. See the _PolicyTrainingInputs class for more
         information.
         """
 
@@ -1416,7 +1429,7 @@ class Trainer:
         discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
 
         train_inputs = [
-            PolicyTrainingInputs(
+            _PolicyTrainingInputs(
                 advantages=adv,
                 discounted_returns=disc_ret,
                 vf_returns=vf_ret,
@@ -1502,7 +1515,7 @@ class Trainer:
             infos = {}
 
         self._replay_buffer.append(
-            EpisodeData(
+            _EpisodeData(
                 episode,
                 episode_number=self._next_episode_number,
                 num_timesteps=num_timesteps,
@@ -1613,7 +1626,7 @@ class Trainer:
             state_dict = self.state_dict()
             if checkpoint_interval:
                 f_name = os.path.join(
-                    self.cfg.log_dir,
+                    self.cfg.runs_dir,
                     self.cfg.run_name,
                     f"train_step_{self.train_steps_so_far}.pkl",
                 )
@@ -1628,7 +1641,7 @@ class Trainer:
                 else:
                     _LOGGER.info(f"Checkpoint {f_name!r} already exists")
             if checkpoint_best:
-                f_name = os.path.join(self.cfg.log_dir, self.cfg.run_name, f"best.pkl")
+                f_name = os.path.join(self.cfg.runs_dir, self.cfg.run_name, f"best.pkl")
                 _LOGGER.info(f"Checkpointing to {f_name!r}")
                 with open(f_name, "wb") as f:
                     pickle.dump(state_dict, f)
@@ -1641,7 +1654,7 @@ class Trainer:
         self, prefer_best: bool = False, checkpoint_dir: Optional[str] = None
     ):
         if checkpoint_dir is None:
-            checkpoint_dir = os.path.join(self.cfg.log_dir, self.cfg.run_name)
+            checkpoint_dir = os.path.join(self.cfg.runs_dir, self.cfg.run_name)
         best_ckpt = os.path.join(checkpoint_dir, "best.pkl")
         if prefer_best and os.path.exists(best_ckpt):
             try:

@@ -61,7 +61,8 @@ def train(cfg: GymConfig):
     envs = [gym.make(cfg.env_name) for _ in range(cfg.n_envs)]
 
     agent = make_gym_agent(
-        envs, hidden_sizes=cfg.encoder_hidden_sizes,
+        envs,
+        hidden_sizes=cfg.encoder_hidden_sizes,
         pi_hidden_sizes=cfg.pi_hidden_sizes,
         init_std=cfg.init_std,
         min_std=cfg.min_std,
@@ -84,7 +85,7 @@ def train(cfg: GymConfig):
                 full_episodes_only=True,
             )
             eval_stats = episode_stats(eval_episodes)
-            trainer.add_eval_stats(eval_stats, "AverageReturn")
+            trainer.add_eval_stats(eval_stats, "episode_total_rewards")
             trainer.maybe_checkpoint()
         if step == cfg.n_train_steps:
             break
@@ -115,7 +116,9 @@ def train(cfg: GymConfig):
         trainer.train_step()
         step += 1
     if cfg.env_name == "CartPole-v1":
-        assert eval_stats["AverageReturn"] >= 200, "Should have trained optimal policy"
+        assert (
+            eval_stats["episode_total_rewards"] >= 200
+        ), "Should have trained optimal policy"
 
 
 if __name__ == "__main__":

@@ -22,9 +22,9 @@ import torch.nn.functional as F
 T = TypeVar("T")
 
 SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], nn.Module]
-Initializer = Callable[[torch.Tensor], None]
+ParamInitializer = Callable[[torch.Tensor], None]
 Shape = Union[int, Tuple[int, ...]]
-Sizes = Union[int, Tuple[int, ...], List[int]]
+Sizes = Union[Tuple[int, ...], List[int]]
 
 
 class CustomTorchDist:
@@ -62,23 +62,26 @@ class NonLinearity(nn.Module):
 
     """
 
-    def __init__(self, non_linear: SupportsNonlinearity):
+    def __init__(self, non_linearity: Callable[[torch.Tensor], torch.Tensor]):
         super().__init__()
-
-        if isinstance(non_linear, type):
-            self.module = non_linear()
-        elif callable(non_linear):
-            self.module = copy.deepcopy(non_linear)
-        else:
-            raise ValueError(
-                "Non linear function {} is not supported".format(non_linear)
-            )
+        self.function = copy.deepcopy(non_linearity)
 
     def forward(self, x: torch.Tensor):
-        return self.module(x)
+        """Calls the wrapped non-linearity."""
+        return self.function(x)
 
     def __repr__(self):
-        return repr(self.module)
+        return repr(self.function)
+
+
+def wrap_nonlinearity(non_linearity: SupportsNonlinearity) -> nn.Module:
+    """Convert a non-linearity (possibly a function) into a Module."""
+    if isinstance(non_linearity, nn.Module):
+        return copy.deepcopy(non_linearity)
+    elif isinstance(non_linearity, type):
+        return non_linearity()
+    else:
+        return NonLinearity(non_linearity)
 
 
 class SqueezeModule(nn.Module):
@@ -97,6 +100,7 @@ class SqueezeModule(nn.Module):
         self.dim = dim
 
     def forward(self, x: torch.Tensor):
+        """Removes specified unit dimensions."""
         return x.squeeze(self.dim)
 
     def __repr__(self):
@@ -114,13 +118,13 @@ def flatten_shape(shape: Shape) -> int:
 def make_mlp(
     *,
     input_size: int,
-    hidden_sizes: List[int],
+    hidden_sizes: Sizes,
     output_size: Optional[int] = None,
     hidden_nonlinearity: SupportsNonlinearity = nn.SiLU,
-    hidden_w_init: Initializer = nn.init.xavier_normal_,
-    hidden_b_init: Initializer = nn.init.zeros_,
-    output_w_init: Initializer = nn.init.xavier_normal_,
-    output_b_init: Initializer = nn.init.zeros_,
+    hidden_w_init: ParamInitializer = nn.init.xavier_normal_,
+    hidden_b_init: ParamInitializer = nn.init.zeros_,
+    output_w_init: ParamInitializer = nn.init.xavier_normal_,
+    output_b_init: ParamInitializer = nn.init.zeros_,
     use_dropout: bool = True,
     layer_normalization: bool = False,
 ) -> nn.Sequential:
@@ -149,7 +153,9 @@ def make_mlp(
         step_layers.add_module("linear", linear_layer)
 
         if hidden_nonlinearity:
-            step_layers.add_module("non_linearity", NonLinearity(hidden_nonlinearity))
+            step_layers.add_module(
+                "non_linearity", wrap_nonlinearity(hidden_nonlinearity)
+            )
         layers.append(step_layers)
 
         prev_size = size
@@ -176,18 +182,21 @@ def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
     It is the proportion of the variance in one variable that is explained or
     predicted from another variable.
 
-    interpretation:
+    Interpretation:
+
         1 => all variance explained
         0 => not predicting anything
         <0 => overfit and predicting badly
 
     Args:
+
         ypred (torch.Tensor): Sample data from the first variable.
             Shape: :math:`(N, max_episode_length)`.
         y (torch.Tensor): Sample data from the second variable.
             Shape: :math:`(N, max_episode_length)`.
 
     Returns:
+
         float: The explained variance.
 
     """
@@ -204,21 +213,6 @@ def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
 
     res = 1 - (torch.var(y - ypred) + epsilon) / (vary + epsilon)
     return res
-
-
-def sample_or_mode(dist: torch.distributions.Distribution, get_mode: bool = False):
-    """Samples from input distribution unless get_mode is True.
-
-    When get_mode is True, returns the mode of the input distribution.
-
-    Allows deterministic evaluation of the most likely sequence of actions from
-    apolicy, which often (but not always) perform better than sampling actions.
-    """
-
-    if get_mode:
-        return dist.mode
-    else:
-        return dist.sample()
 
 
 class RunningMeanVar(nn.Module):
@@ -299,6 +293,7 @@ class RunningMeanVar(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor):
+        """Updates the statistics and normalizes the batch."""
         self.update(x)
         return self.normalize_batch(x)
 
@@ -342,22 +337,51 @@ class RunningMeanVar(nn.Module):
         dst[f"{prefix}.count"] = self.count
 
 
-def pack_recursive(data: Union[list[T], T]) -> T:
-    """Recursively pack tensors contained in dataclasses, dictionaries, lists."""
+def pack_recursive(
+    data: Union[list[T], T], prefix: str = ""
+) -> tuple[T, Optional[list[int]]]:
+    """Recursively pack tensors contained in dataclasses, dictionaries, and lists.
+
+    No-op for non-sequence inputs.
+
+    Raises:
+
+        ValueError: On inconsistent lengths in (sub)fields.
+
+    """
+    lengths = None
+
+    def update_lengths(new_lens: list[int], prefix: str):
+        nonlocal lengths
+        if lengths is None:
+            lengths = new_lens
+        elif lengths != new_lens:
+            raise ValueError("Inconsistent lengths in field {prefix}")
+
     if isinstance(data, (list, tuple)):
         if is_dataclass(data[0]):
-            return replace(
-                data[0],
-                **{
-                    field.name: pack_recursive([getattr(d, field.name) for d in data])
-                    for field in fields(data[0])
-                },
-            )
+            field_values = {}
+            for field in fields(data[0]):
+                prefix = f"{prefix}.{field}"
+                packed_field, new_lengths = pack_recursive(
+                    [getattr(d, field.name) for d in data], prefix
+                )
+                update_lengths(new_lengths, prefix)
+                field_values[field.name] = packed_field
+            return replace(data[0], **field_values), lengths
         elif isinstance(data[0], dict):
-            return {k: pack_recursive(d[k] for d in data) for k in data[0].keys()}
+            out_dict = {}
+            for k in data[0].keys():
+                prefix = f"{prefix}[{k!r}]"
+                packed_value, new_lengths = pack_recursive(d[k] for d in data)
+                update_lengths(new_lengths, prefix)
+                out_dict[k] = packed_value
+            return out_dict, lengths
         elif isinstance(data[0], torch.Tensor):
-            return pack_tensors(data)[0]
-    return data
+            packed_list, new_lengths = pack_tensors(data)
+            update_lengths(new_lengths, prefix)
+            return packed_list, lengths
+    return data, lengths
 
 
 def pack_tensors(tensor_list: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:
