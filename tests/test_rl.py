@@ -1,5 +1,5 @@
 import torch
-from outrl.rl import discount_cumsum
+from outrl import _discount_cumsum
 
 
 def test_discount_cumsum():
@@ -11,5 +11,5 @@ def test_discount_cumsum():
     expected_result[:, -1] = rewards[:, -1]
     for i in range(L - 2, -1, -1):
         expected_result[:, i] = rewards[:, i] + discount * expected_result[:, i + 1]
-    actual_result = discount_cumsum(rewards, discount)
+    actual_result = _discount_cumsum(rewards, discount)
     assert torch.allclose(actual_result, expected_result)

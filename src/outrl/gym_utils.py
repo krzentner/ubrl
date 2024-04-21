@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from outrl.rl import AgentOutput
+from outrl import AgentOutput
 from outrl.torch_utils import (
     force_concat,
     make_mlp,

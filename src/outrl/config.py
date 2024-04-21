@@ -127,7 +127,7 @@ def default_run_name() -> str:
     return f"{file_trail}_{now}"
 
 
-def prepare_training_directory(cfg: "outrl.rl.TrainerConfig"):
+def prepare_training_directory(cfg: "outrl.TrainerConfig"):
     """Creates a directory for logging and sets up logging."""
     os.makedirs(os.path.join(cfg.runs_dir, cfg.run_name), exist_ok=True)
     save_yaml(cfg, os.path.join(cfg.runs_dir, cfg.run_name, "config.yaml"))
@@ -169,7 +169,7 @@ def cmd_sample_config(
     override_config: Optional[str],
     study_storage: str,
     study_name: str,
-    config_type: "type[outrl.rl.TrainerConfig]",
+    config_type: "type[outrl.TrainerConfig]",
     out_path: str,
 ):
     """Low-level command for manually distributing hyper-parameter optimization.
@@ -240,7 +240,7 @@ class ExperimentInvocation:
             provided train_fn to produce an agent.
         tune: Runs hparam tuning using optuna using the provided train
             function to maximize the primary_performance stat passed to
-            outrl.rl.Trainer.add_eval_stats().
+            outrl.Trainer.add_eval_stats().
         create-study: Low-level command for manually distributing hyper
             parameter tuning. Creates a new optuna study.
         sample-config: Low-level command for manually distributing hyper
@@ -252,7 +252,7 @@ class ExperimentInvocation:
     def __init__(
         self,
         train_fn: "Callable[[config_type], None]",
-        config_type: "type[outrl.rl.TrainerConfig]",
+        config_type: "type[outrl.TrainerConfig]",
     ):
         self.parser = simple_parsing.ArgumentParser(
             nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT,

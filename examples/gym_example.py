@@ -12,8 +12,8 @@ except ImportError:
 from optuna.distributions import FloatDistribution
 
 import stick
+from outrl import Trainer, TrainerConfig
 from outrl.gym_utils import make_gym_agent, collect, episode_stats
-from outrl.rl import Trainer, TrainerConfig
 from outrl.config import ExperimentInvocation, tunable, IntListDistribution
 
 
