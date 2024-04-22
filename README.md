@@ -10,7 +10,7 @@ It provides a single learning algorithm optimized for reliability and
 performance when training large models.
 
 OutRL avoids defining any environment API at all, and only defines a minimal
-[Trainer and agent API](src/outrl/rl.py). This avoids the use of any "Space"
+`Trainer` and `Agent` API. This avoids the use of any "Space"
 types, such as the "gym.spaces.Box" that pervades other RL libraries. For
 working with the popular gym(nasium) API, a small [optional
 library](src/outrl/gym_utils.py) and [example](examples/gym_example.py) is
@@ -37,7 +37,7 @@ OutRL significantly reduces the number of full forward passes required to
 propagate rewards back through time.
 
 
-## API
+## API Overview
 
 OutRL does not require you to use any particular command line user interface, you can use whatever control flow you'd like to create and invoke a `outrl.Trainer` on your agent.
 
@@ -47,9 +47,9 @@ However, there are some utilities for writing short "launch scripts" with a cons
 
 The `Trainer` is the class that provides most of OutRL's functionality.
 
-A Trainer is constructed from a `TrainerConfig` (referred to as `cfg` elsewhere) and an agent.
+A Trainer is constructed from a `TrainerConfig` (referred to as `cfg` elsewhere) and an `Agent`.
 
-The agent should be a `torch.nn.Module` with a forward method that takes in a list of "episodes" and returns a list of `ActorOutput` (one per episode).
+The agent should be a `torch.nn.Module` with a forward method that takes in a list of "episodes" and returns a list of `AgentOutput` (one per episode).
 The agent should also have an integer field `state_encoding_size` that is the
 dimensionality of the state encodings returned by the agent.
 
@@ -81,7 +81,7 @@ There's a small utility for managing config files, setting up run directories,
 command line parsing, and hyper-parameter tuning.
 
 To use it, write a training function that should receive a (subclass of) `outrl.TrainerConfig`, and will train a new agent given that config.
-Then, pass that function and the config type to `outrl.ExperimentInvocation` and call `run()`.
+Then, pass that function and the config type to `outrl.config.ExperimentInvocation` and call `run()`.
 
 Example:
 
@@ -98,7 +98,7 @@ def train(cfg: MyConfig):
   ...
 
 if __name__ == '__main__':
-  outrl.ExperimentInvocation(train, MyConfig).run()
+  outrl.config.ExperimentInvocation(train, MyConfig).run()
 ```
 
 Then, you can call e.g. `python my_launcher.py train --env_name=CartPole-v1`.

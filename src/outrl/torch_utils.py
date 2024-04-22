@@ -1,6 +1,21 @@
+"""A variety of small utilities for working with pytorch.
+
+These utilities are not specific to reinforcement learning, and generally fall
+into a few categories:
+
+- A family of functions for packing / unpacking / padding / unpadding tensors.
+  Mostly used for combining tensors from different tensors to batch operations
+  across episodes.
+- Tools for allowing the user to express probabilistic actions without needing
+  to construct complex torch.distributions.Distribution product types.
+- Filling in minor "holes" in torch's API, like an automatic normalization
+  module, modules for putting commonly used functions into modules, convenient
+  functions for constructing networks from high-level descriptions.
+"""
+
 import copy
-from dataclasses import dataclass, is_dataclass, fields, replace
-from textwrap import dedent
+import dataclasses
+from dataclasses import dataclass
 from typing import (
     TypeVar,
     Callable,
@@ -21,10 +36,8 @@ import torch.nn.functional as F
 
 T = TypeVar("T")
 
-SupportsNonlinearity = Union[Callable[[torch.Tensor], torch.Tensor], nn.Module]
-ParamInitializer = Callable[[torch.Tensor], None]
-Shape = Union[int, Tuple[int, ...]]
 Sizes = Union[Tuple[int, ...], List[int]]
+"""Typically used for "hidden_sizes" of an MLP."""
 
 
 class CustomTorchDist:
@@ -47,7 +60,7 @@ class CustomTorchDist:
 ActionDist = Union[
     torch.distributions.Distribution,
     CustomTorchDist,
-    list[Union[torch.distributions.Distribution, CustomTorchDist]],
+    Union[list[torch.distributions.Distribution], list[CustomTorchDist]],
 ]
 
 
@@ -74,7 +87,9 @@ class NonLinearity(nn.Module):
         return repr(self.function)
 
 
-def wrap_nonlinearity(non_linearity: SupportsNonlinearity) -> nn.Module:
+def wrap_nonlinearity(
+    non_linearity: Union[Callable[[torch.Tensor], torch.Tensor], nn.Module]
+) -> nn.Module:
     """Convert a non-linearity (possibly a function) into a Module."""
     if isinstance(non_linearity, nn.Module):
         return copy.deepcopy(non_linearity)
@@ -90,7 +105,7 @@ class SqueezeModule(nn.Module):
     Used to produce neural networks that produce "scalar" outputs.
 
     Args:
-        dim (int?): Index to squeeze.
+        dim (Optional[int]): Index to squeeze.
 
     """
 
@@ -107,7 +122,7 @@ class SqueezeModule(nn.Module):
         return f"SqueezeModule(dim={self.dim})"
 
 
-def flatten_shape(shape: Shape) -> int:
+def flatten_shape(shape: Union[int, Tuple[int, ...], list[int]]) -> int:
     """Flatten a shape down to a integer size."""
     if isinstance(shape, int):
         return shape
@@ -120,11 +135,13 @@ def make_mlp(
     input_size: int,
     hidden_sizes: Sizes,
     output_size: Optional[int] = None,
-    hidden_nonlinearity: SupportsNonlinearity = nn.SiLU,
-    hidden_w_init: ParamInitializer = nn.init.xavier_normal_,
-    hidden_b_init: ParamInitializer = nn.init.zeros_,
-    output_w_init: ParamInitializer = nn.init.xavier_normal_,
-    output_b_init: ParamInitializer = nn.init.zeros_,
+    hidden_nonlinearity: Union[
+        Callable[[torch.Tensor], torch.Tensor], nn.Module
+    ] = nn.SiLU,
+    hidden_w_init: Callable[[torch.Tensor], None] = nn.init.xavier_normal_,
+    hidden_b_init: Callable[[torch.Tensor], None] = nn.init.zeros_,
+    output_w_init: Callable[[torch.Tensor], None] = nn.init.xavier_normal_,
+    output_b_init: Callable[[torch.Tensor], None] = nn.init.zeros_,
     use_dropout: bool = True,
     layer_normalization: bool = False,
 ) -> nn.Sequential:
@@ -177,23 +194,23 @@ def make_mlp(
 def explained_variance(ypred: torch.Tensor, y: torch.Tensor):
     """Explained variation for 1D inputs.
 
-    Similar to R^2 value but using corrected variances.
+    Similar to R^2 value but also requires the prediction values to have the
+    correct constant bias.
 
-    It is the proportion of the variance in one variable that is explained or
+    The proportion of the variance in one variable that is explained or
     predicted from another variable.
 
     Interpretation:
 
-        1 => all variance explained
-        0 => not predicting anything
-        <0 => overfit and predicting badly
+        1 -> all variance explained
+        0 -> not predicting anything
+        negative values -> overfit and predicting badly
 
     Args:
 
-        ypred (torch.Tensor): Sample data from the first variable.
-            Shape: :math:`(N, max_episode_length)`.
-        y (torch.Tensor): Sample data from the second variable.
-            Shape: :math:`(N, max_episode_length)`.
+        ypred (torch.Tensor): Predicted values.
+
+        y (torch.Tensor): Target values.
 
     Returns:
 
@@ -236,6 +253,13 @@ class RunningMeanVar(nn.Module):
         use_mean: bool = True,
         use_var: bool = True,
     ):
+        """
+        Args:
+
+            trainable (bool): If true, causes mean and var to be nn.Parameters
+                tunable via SGD (and also optimized by inputs).
+        """
+
         super().__init__()
         # Handle user passing in floats
         if not isinstance(init_mean, torch.Tensor):
@@ -270,9 +294,13 @@ class RunningMeanVar(nn.Module):
         """Minimal permitted variance to avoid division by zero."""
 
         self.use_mean: bool = use_mean
+        """Whether to normalize the data to 0 mean."""
+
         self.use_var: bool = use_var
+        """Whether to normalize the data to unit variance."""
 
     def normalize_batch(self, x: torch.Tensor, correction=1) -> torch.Tensor:
+        """Normalizes a batch of data, but does not update the recorded statistics."""
         # Don't use in-place operations in this method!
         y = x
         if self.use_mean:
@@ -284,6 +312,7 @@ class RunningMeanVar(nn.Module):
         return y
 
     def denormalize_batch(self, y: torch.Tensor, correction=1) -> torch.Tensor:
+        """Reverse of the normalization operation."""
         # Don't use in-place operations in this method!
         x = y
         if self.use_var:
@@ -298,6 +327,7 @@ class RunningMeanVar(nn.Module):
         return self.normalize_batch(x)
 
     def update(self, x: torch.Tensor):
+        """Update the statistics using a batch."""
         if len(x.shape) < len(self.mean.shape):
             x = x.unsqueeze(0)
         # Flatten all batch, time dimensions
@@ -325,6 +355,7 @@ class RunningMeanVar(nn.Module):
         self.count = new_total
 
     def corrected_var(self, correction=1):
+        """Computes the corrected variance."""
         d = self.count - correction
         if d <= 0:
             d = 1
@@ -332,6 +363,7 @@ class RunningMeanVar(nn.Module):
         return torch.clamp(cvar, self.min_var)
 
     def stick_preprocess(self, prefix: str, dst: dict):
+        """Provide statistics for the stick logging library."""
         dst[f"{prefix}.var"] = self.var.mean().item()
         dst[f"{prefix}.mean"] = self.mean.mean().item()
         dst[f"{prefix}.count"] = self.count
@@ -359,16 +391,16 @@ def pack_recursive(
             raise ValueError("Inconsistent lengths in field {prefix}")
 
     if isinstance(data, (list, tuple)):
-        if is_dataclass(data[0]):
+        if dataclasses.is_dataclass(data[0]):
             field_values = {}
-            for field in fields(data[0]):
+            for field in dataclasses.fields(data[0]):
                 prefix = f"{prefix}.{field}"
                 packed_field, new_lengths = pack_recursive(
                     [getattr(d, field.name) for d in data], prefix
                 )
                 update_lengths(new_lengths, prefix)
                 field_values[field.name] = packed_field
-            return replace(data[0], **field_values), lengths
+            return dataclasses.replace(data[0], **field_values), lengths
         elif isinstance(data[0], dict):
             out_dict = {}
             for k in data[0].keys():
@@ -475,7 +507,7 @@ def pad_packed(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
 
 @dataclass(eq=False)
 class DictDataset(torch.utils.data.Dataset):
-    """A simple in-memory map-stle torch.utils.data.Dataset.
+    """A simple in-memory map-style torch.utils.data.Dataset.
 
     Constructed from a dictionary of equal-length tensors, and produces
     dictionaries of tensors as data-points.
@@ -576,35 +608,6 @@ def kl_div(
     else:
         # Presumably implements the CustomTorchDist API
         return p_dist.kl_div(q_dist)
-
-
-def average_modules(m1, m2):
-    m1_sd = m1.state_dict()
-    m2_sd = m2.state_dict()
-    return average_state_dicts(m1_sd, m2_sd)
-
-
-def average_state_dicts(m1_sd, m2_sd):
-    if not isinstance(m1_sd, dict) and m1_sd == m2_sd:
-        return m1_sd
-    out_dict = {}
-    for k in m1_sd.keys():
-        if isinstance(m1_sd[k], torch.Tensor):
-            out_dict[k] = (m1_sd[k] + m2_sd[k]) / 2
-        elif isinstance(m1_sd, dict):
-            out_dict[k] = average_state_dicts(m1_sd[k], m2_sd[k])
-        elif m1_sd[k] == m2_sd[k]:
-            out_dict[k] = m1_sd[k]
-        else:
-            raise ValueError(
-                dedent(
-                    f"""\
-                Could not average state_dict values for key {k}:
-                Could not average {m1_sd[k]} and {m2_sd[k]}
-                """
-                )
-            )
-    return out_dict
 
 
 def force_concat(elements: Sequence[torch.Tensor]) -> torch.Tensor:

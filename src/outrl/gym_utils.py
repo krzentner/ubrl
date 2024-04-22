@@ -6,6 +6,12 @@ If you're using OutRL, the main reason is probably that you want to implement
 custom neural networks for your environment, which you can base off of the code
 in this module. We recommend you copy freely from this file instead of
 inheriting from the classes defined here.
+
+## Example
+
+```python
+.. include:: ../../examples/gym_example.py
+```
 """
 from typing import Optional, Any
 
@@ -14,7 +20,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from outrl import AgentOutput
+from outrl import Agent, AgentOutput
 from outrl.torch_utils import (
     force_concat,
     make_mlp,
@@ -26,7 +32,7 @@ from outrl.torch_utils import (
 )
 
 
-class GymAgent(nn.Module):
+class GymAgent(Agent):
     """Agent intended to be used with the Gym API."""
 
     def __init__(
@@ -45,10 +51,7 @@ class GymAgent(nn.Module):
             pi_hidden_sizes (Sizes): Sizes of latent representations for the
                 policy specific layers.
         """
-        super().__init__()
-
-        self.state_encoding_size = hidden_sizes[-1]
-        """This field is part of the OutRL API."""
+        super().__init__(hidden_sizes[-1])
 
         self.shared_layers = nn.Sequential(
             RunningMeanVar(

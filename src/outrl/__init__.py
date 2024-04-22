@@ -1,3 +1,7 @@
+"""
+.. include:: ../../README.md
+"""
+
 from dataclasses import dataclass
 from textwrap import dedent
 from typing import Any, Optional, TypeVar, Generator, Literal
@@ -49,30 +53,6 @@ from outrl.config import tunable, IntListDistribution, default_run_name
 _LOGGER = logging.getLogger("outrl")
 
 T = TypeVar("T")
-
-
-@dataclass(eq=False)
-class AgentOutput:
-    """Result from one episode when calling .forward() on an agent.
-
-    Differentiating both state_encodings and action_lls should affect
-    earlier layers in the agent.
-    """
-
-    state_encodings: torch.Tensor
-    """Differentiable representation of the observations in the episode."""
-
-    action_lls: torch.Tensor
-    """Differentiable log-likelihood of actions taken in the episode."""
-
-    action_dists: Optional[ActionDist] = None
-    """Distribution used to generate actions.
-
-    Will be used for the KL penalty if not None and cfg.use_approx_kl is False.
-
-    Will be used for entropy regularization if not None and cfg.approx_entropy
-    is False.
-    """
 
 
 @dataclass(eq=False)
@@ -166,14 +146,1289 @@ class _EpisodeData:
                         )
 
 
+@dataclass(eq=False)
+class _PolicyTrainingInputs:
+    """Values used to train the policy that are not present in _EpisodeData.
+
+    An instance of this class accompanies each _EpisodeData during policy
+    optimization.
+
+    These values are recomputed every train_step()."""
+
+    advantages: torch.Tensor
+    """Advantages for this episode. Used in PPO loss (when enabled)."""
+
+    exp_advantages: torch.Tensor
+    """Coefficients used in the AWR loss."""
+
+    vf_targets: torch.Tensor
+    """Target values for the value function loss."""
+
+    discounted_returns: torch.Tensor
+    """Discounted sum of future rewards. Used in logging."""
+
+    vf_returns: torch.Tensor
+    """Estimated returns from the value function. Used in logging."""
+
+
+_OPTIMIZER_FIELDS = [
+    "agent_optimizer",
+    "vf_optimizer",
+    "vf_lr_scheduler",
+    "agent_lr_scheduler",
+    "kl_coef_opt",
+    "awr_temperature_opt",
+]
+
+_SUBMODULE_FIELDS = [
+    "agent",
+    "vf",
+    "reward_normalizer",
+]
+
+_PARAM_FIELDS = [
+    "kl_coef",
+    "awr_temperature",
+]
+
+_IGNORED_FIELDS = ["_is_full_backward_hook"]
+
+
+class Trainer:
+    """An implementation of a bespoke reinforcement learning algorithm.
+
+    The trainer trains an Agent to acquire higher rewards according to the data
+    provided to it. To allow repeatedly adding new data to the Trainer, it is a
+    class instead of a function.
+
+    The typical sequence of methods called on this class are as follows:
+
+        1. Construction using a TrainerConfig (the default value is typically
+           fine) and Agent. Optionally, call Trainer.attempt_resume() to resume
+           from a prior checkpoint.
+
+        2. Repeated calls to Trainer.add_episode() to add new data and
+           Trainer.train_step() to process the data. Typically multiple
+           episodes (on the order of 10-100) should be added between each
+           Trainer.train_step() call.
+
+        3. Periodic calls to Trainer.add_eval_stats() and
+           Trainer.maybe_checkpoint().
+    """
+
+    def __init__(self, cfg: "TrainerConfig", agent: "Agent"):
+        """Constructs a Trainer."""
+
+        super().__init__()
+        self.cfg: "TrainerConfig" = cfg
+        """The configuration used to contruct the Trainer.
+
+        Modifying this field after constructing the Trainer *may* change the
+        Trainer's behavior, but is not guaranteed to and should be avoided
+        (except via load_state_dict()).
+        """
+
+        self.agent: "Agent" = agent
+        """The agent being optimized. Provides action (log-likelihoods) and
+        state encodings."""
+
+        self._state_encoding_size = self.agent.state_encoding_size
+
+        self.vf: nn.Module = make_mlp(
+            input_size=self._state_encoding_size,
+            hidden_sizes=self.cfg.vf_hidden_sizes,
+            output_size=0,
+            use_dropout=True,
+        )
+        """The value function. Feed-forward networks that predicts future
+        rewards from state_encodings."""
+
+        # Zero the initial VF output to stabilize training
+        vf_output = self.vf.get_submodule("output_linear")
+        vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
+
+        self.reward_normalizer: RunningMeanVar = RunningMeanVar(use_mean=False)
+        """Normalized used to make rewards have unit variance if
+        cfg.normalize_rewards is True."""
+
+        self.total_env_steps: int = 0
+        """Total number of environment steps passed to add_episode().
+        May not count timesteps only used to compute statistics passed to
+        add_eval_stats()."""
+
+        self.train_steps_so_far: int = 0
+        """Number of times train_step() has been called."""
+
+        self.last_eval_stats: dict[str, float] = {}
+        """Last stats passd to add_eval_stats()."""
+
+        self.primary_performance: float = float("-inf")
+        """Value of the "primary_performance" stat at the last add_eval_stats() call."""
+
+        self.best_checkpoint_primary_performance: float = float("-inf")
+        """Largest value of the "primary_performance" stat among all add_eval_stats() calls."""
+
+        self.train_steps_so_far_at_last_checkpoint: int = 0
+        """Number of (completed) train_step() calls at last periodic checkpoint."""
+
+        self.kl_coef: nn.Parameter = nn.Parameter(
+            torch.tensor(float(self.cfg.kl_coef_init))
+        )
+        """Dynamically adjusted parameter used for KL regularization."""
+
+        self.awr_temperature: nn.Parameter = nn.Parameter(
+            torch.tensor(float(self.cfg.temperature_init))
+        )
+        """Dynamically adjusted parameter used for temperature in the AWR loss."""
+
+        self._replay_buffer: list[_EpisodeData] = []
+        self._next_episode_number: int = 0
+        self._dtype = torch.float32
+
+        self._last_training_stats = {}
+
+        # This method is also called after loading the state dict to re-attach
+        # parameters
+        self._setup_optimizers()
+
+    def _setup_optimizers(self):
+        """(Re)create all of the optimizers to use the current parameters.
+
+        This method is called in __init__ and also in load_state_dict().
+        """
+        self.agent_optimizer = torch.optim.AdamW(
+            self.agent.parameters(),
+            lr=self.cfg.agent_lr_start,
+            weight_decay=self.cfg.agent_weight_decay,
+        )
+        self.agent_lr_scheduler = make_scheduler(
+            self.agent_optimizer,
+            self.cfg.agent_lr_schedule,
+            self.cfg.agent_lr_start,
+            self.cfg.agent_lr_end,
+            self.cfg.expected_train_steps,
+        )
+        self.vf_optimizer = torch.optim.AdamW(
+            self.vf.parameters(),
+            lr=self.cfg.vf_lr_start,
+            weight_decay=self.cfg.vf_weight_decay,
+        )
+        self.vf_lr_scheduler = make_scheduler(
+            self.vf_optimizer,
+            self.cfg.vf_lr_schedule,
+            self.cfg.vf_lr_start,
+            self.cfg.vf_lr_end,
+            self.cfg.expected_train_steps,
+        )
+
+        self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
+        self.awr_temperature_opt = torch.optim.AdamW(
+            [self.awr_temperature], lr=self.cfg.temperature_lr
+        )
+
+        self.total_agent_grad_steps = 0
+
+    def _primary_loss_function(
+        self, batch: list[tuple[_EpisodeData, _PolicyTrainingInputs, "AgentOutput"]]
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Reinforcement learning loss function.
+
+        Combines together losses from many sources to train both the agent and
+        value function.
+
+        Returns a loss which is usually near unit scale and a dictionary of
+        infos to log for this gradient step.
+
+        Note that lagrangian losses (for the KL and entropy) are optimized in
+        their related loss functions.
+        """
+
+        episode_data: list[_EpisodeData] = [b[0] for b in batch]
+        train_inputs: list[_PolicyTrainingInputs] = [b[1] for b in batch]
+        agent_outputs: list["AgentOutput"] = [b[2] for b in batch]
+
+        kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
+
+        ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
+
+        awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, agent_outputs)
+
+        # TODO: Tune awr_temperature
+
+        vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, agent_outputs)
+
+        loss = ppo_loss + awr_loss + vf_loss + kl_loss
+
+        # kl_infos, vf_infos, and ppo_infos will all get included in locals
+        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos)
+        return loss, locals()
+
+    def _ppo_loss(
+        self,
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
+        agent_outputs: list["AgentOutput"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        advantages, adv_len = pack_tensors(
+            [train_input.advantages for train_input in train_inputs]
+        )
+        log_probs = pack_tensors_check(
+            [agent_out.action_lls for agent_out in agent_outputs], adv_len
+        )
+
+        old_log_probs = pack_tensors_check(
+            [data.original_action_lls for data in episode_data], adv_len
+        )
+        assert not old_log_probs.requires_grad
+
+        ratio = torch.exp(log_probs - old_log_probs)
+        ratio_clipped = torch.clamp(
+            ratio, 1 / (1 + self.cfg.ppo_clip_epsilon), 1 + self.cfg.ppo_clip_epsilon
+        )
+
+        policy_gradient = ratio * advantages
+        clip_policy_gradient = ratio_clipped * advantages
+
+        # Mean is handled in the primary_loss_function
+        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
+        norm_coef = self.cfg.ppo_loss_coef / self.cfg.minibatch_target_timesteps
+        ppo_loss_scaled = norm_coef * ppo_loss.sum()
+        infos = locals()
+        del infos["self"]
+        del infos["adv_len"]
+        infos["clip_portion"] = (ratio_clipped != ratio).mean(dtype=torch.float32)
+        return (ppo_loss_scaled, infos)
+
+    def _awr_loss(
+        self,
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
+        agent_outputs: list["AgentOutput"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        del episode_data
+
+        # Dividing by temperature and normalizing are handled in preprocess
+        # TODO: Should advantage exponentiation happen every minibatch or not?
+        # temperature tuning happens every minibatch, so it seems like the
+        # temperature should be used every minibatch as well.
+        # But also it seems like having a constant temperature throughout a
+        # batch might be ideal.
+
+        # We'll probably add entropy regularization using a minibatch
+        # lagrangian anyways, so maybe it doesn't matter.
+        exp_adv, adv_len = pack_tensors(
+            [train_input.exp_advantages for train_input in train_inputs]
+        )
+
+        log_probs = pack_tensors_check(
+            [agent_out.action_lls for agent_out in agent_outputs], adv_len
+        )
+
+        awr_loss = -log_probs * exp_adv
+
+        log_probs_scale = log_probs.detach().abs().mean()
+        used_for_logging(log_probs_scale)
+        norm_coef = self.cfg.awr_loss_coef / (self.cfg.minibatch_target_timesteps)
+
+        awr_loss_scaled = norm_coef * awr_loss.sum()
+        # Don't want to log these here
+        infos = locals()
+        del infos["self"]
+        del infos["adv_len"]
+        return (awr_loss_scaled, infos)
+
+    def _vf_loss(
+        self,
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
+        agent_outputs: list["AgentOutput"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # For consistency with other loss functions, we still take
+        # episode_data, but don't use it.
+        del episode_data
+
+        vf_targets_packed, adv_len = pack_tensors(
+            [train_input.vf_targets for train_input in train_inputs]
+        )
+        state_enc_packed = pack_tensors_check(
+            [agent_out.state_encodings[:-1] for agent_out in agent_outputs], adv_len
+        )
+
+        critic_out = self.vf(state_enc_packed)
+        vf_loss = F.mse_loss(critic_out, vf_targets_packed)
+
+        discounted_returns = pack_tensors_check(
+            [train_input.discounted_returns for train_input in train_inputs], adv_len
+        )
+        minibatch_ev = explained_variance(critic_out, discounted_returns)
+        used_for_logging(minibatch_ev)
+
+        norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
+        vf_loss_scaled = norm_coef * vf_loss
+        infos = locals()
+        del infos["self"]
+        del infos["adv_len"]
+        return (vf_loss_scaled, infos)
+
+    def _kl_loss(
+        self,
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
+        agent_outputs: list["AgentOutput"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # For consistency with other loss functions, we still take
+        # train_inputs, but don't use it.
+        del train_inputs
+
+        original_kl_coef = self.kl_coef.detach().item()
+        used_for_logging(original_kl_coef)
+
+        log_probs, lengths = pack_tensors(
+            [agent_out.action_lls for agent_out in agent_outputs]
+        )
+        old_log_probs = pack_tensors_check(
+            [data.original_action_lls for data in episode_data], lengths
+        )
+        # Normalize to form a proper distribution across actions P(a)
+        log_probs -= log_probs.exp().sum().log()
+        old_log_probs -= old_log_probs.exp().sum().log()
+
+        # Approximate per-timestep KL by multiplying back in the number of timesteps
+        total_timesteps = sum(lengths)
+        approx_kl = total_timesteps * approx_kl_div(old_log_probs, log_probs)
+        total_approx_kl = approx_kl.sum()
+        used_for_logging(total_approx_kl)
+
+        # Compute KL Divergence
+        if self.cfg.use_approx_kl is False:
+            new_dists = [agent_out.action_dists for agent_out in agent_outputs]
+            assert new_dists[0] is not None
+            old_dists = [ep_data.original_action_dists for ep_data in episode_data]
+            assert old_dists[0] is not None
+            # TODO: Add options for other KL directions
+            kl = kl_div(old_dists, new_dists)
+        else:
+            kl = approx_kl
+
+        assert kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
+        assert approx_kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
+        kl = kl[torch.isfinite(kl)]
+
+        # Update KL loss coefficient
+        if self.cfg.kl_target_stat == "max":
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().max())
+        elif self.cfg.kl_target_stat == "mean":
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().mean())
+        else:
+            raise ValueError(f"Unknown kl_target_stat {self.cfg.kl_target_stat}")
+        self.kl_coef_opt.zero_grad()
+        kl_coef_loss.backward()
+        self.kl_coef_opt.step()
+        if self.kl_coef < self.cfg.kl_coef_min:
+            with torch.no_grad():
+                self.kl_coef.copy_(self.cfg.kl_coef_min)
+        # If the KL coef has become non-finite, it's probably because of
+        # infinite KL, so set to maximum.
+        if self.kl_coef > self.cfg.kl_coef_max or not torch.isfinite(self.kl_coef):
+            with torch.no_grad():
+                self.kl_coef.copy_(self.cfg.kl_coef_max)
+        kl_coef = self.kl_coef.detach()
+
+        kl_mean = kl.mean()
+        kl_max = kl.max()
+        used_for_logging(kl_mean, kl_max)
+
+        norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
+
+        kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
+        kl_loss_scaled = norm_coef * kl_symlog.sum()
+        infos = locals()
+        del infos["lengths"]
+        del infos["self"]
+        return kl_loss_scaled, infos
+
+    def _agent_minibatches(
+        self,
+        episodes: Optional[list[_EpisodeData]] = None,
+        extra_data: Optional[list[T]] = None,
+        minibatch_target_timesteps: Optional[int] = None,
+        desc: Optional[str] = None,
+        epochs: int = 1,
+        shuffle: bool = False,
+    ) -> Generator[
+        tuple[int, int, list[tuple[_EpisodeData, T, "AgentOutput"]]], None, None
+    ]:
+        """Runs the agent forward pass on minibatches drawn from the replay buffer.
+
+        Minibatches are a list of tuples of _EpisodeData from the input, data T
+        from the extra_data (None if not provided), and AgentOutput from the
+        agent forward pass.
+
+        This method handles sizing of minibatches to avoid OOM, shuffling of
+        episodes, rendering the progress bar, and running for multiple epochs.
+        Basically, this method plays a similar role to "Trainer" classes in
+        supervised learning libraries.
+
+        Yields: list[tuple[_EpisodeData, T, ForwardResult]]
+        """
+        if episodes is None:
+            episodes = self._replay_buffer
+
+        if extra_data is None or len(extra_data) == 0:
+            # pyright doesn't understand that extra_data = None -> T = None
+            extra_data = [None for _ in episodes]
+        assert extra_data is not None and len(extra_data) == len(episodes)
+
+        if shuffle:
+            shuffled_indices = torch.randperm(len(episodes))
+            episodes = [episodes[i] for i in shuffled_indices]
+            extra_data = [extra_data[i] for i in shuffled_indices]
+
+        minibatch_hard_cap = 2**64
+        if self.cfg.max_timesteps_per_forward is not None:
+            minibatch_hard_cap = self.cfg.max_timesteps_per_forward
+
+        minibatch_soft_cap = minibatch_hard_cap
+        if minibatch_target_timesteps is not None:
+            minibatch_soft_cap = min(minibatch_target_timesteps, minibatch_hard_cap)
+
+        with tqdm(
+            total=epochs * sum([ep.num_timesteps for ep in episodes]), desc=desc
+        ) as pbar:
+            for epoch in range(epochs):
+                next_ep_index = 0
+                minibatch_number = 0
+                while next_ep_index < len(episodes):
+                    start_batch_ep_index = next_ep_index
+                    batch = []
+                    num_batch_steps = 0
+                    # Accumulate episodes into batch until we run out of space
+                    while next_ep_index < len(episodes) and (
+                        num_batch_steps + episodes[next_ep_index].num_timesteps
+                        <= minibatch_hard_cap
+                    ):
+                        batch.append(
+                            (episodes[next_ep_index], extra_data[next_ep_index])
+                        )
+                        num_batch_steps += episodes[next_ep_index].num_timesteps
+                        next_ep_index += 1
+                        if num_batch_steps >= minibatch_soft_cap:
+                            break
+
+                    if len(batch) == 0:
+                        # We can't fit even a single forward pass in memory!
+                        # Crash in this case (maybe the user can decrease the episode
+                        # length, decrease the model size, enable gradient
+                        # checkpointing / implement BPT, or buy a bigger GPU).
+                        ep_steps = episodes[next_ep_index].num_timesteps
+                        max_steps = self.cfg.max_timesteps_per_forward
+                        raise RuntimeError(
+                            dedent(
+                                f"""\
+                            Cannot run .forward() on episode of length:
+                            {ep_steps} > {max_steps} = cfg.max_timesteps_per_forward
+                            Increase cfg.max_timesteps_per_forward, decrease model size,
+                            or find another way of increasing available memory.
+                            """
+                            )
+                        )
+
+                    try:
+                        forward_result = _call_agent_forward(
+                            self.agent, [data[0].episode for data in batch]
+                        )
+                        yield (
+                            epoch,
+                            minibatch_number,
+                            [
+                                (data[0], data[1], f_res)
+                                for (data, f_res) in zip(batch, forward_result)
+                            ],
+                        )
+                        minibatch_number += 1
+                        pbar.update(sum([data[0].num_timesteps for data in batch]))
+                    except RuntimeError as ex:
+                        if "Cannot allocate memory" not in str(ex):
+                            raise ex
+                        # Decrease to just one below the current size, which will
+                        # prevent the last episode from being in the batch.
+                        # This avoids dropping the max_timesteps_per_forward too low
+                        # from one unusually large trailing episode.
+                        # Note that this may still decrease by a large number of steps
+                        # (or set max_timesteps_per_forward when it was previously
+                        # None).
+                        self.cfg.max_timesteps_per_forward = num_batch_steps - 1
+                        minibatch_hard_cap = self.cfg.max_timesteps_per_forward
+                        warnings.warn(
+                            f"Decreasing cfg.max_timesteps_per_forward to "
+                            f"{self.cfg.max_timesteps_per_forward}",
+                        )
+                        # Retry the batch
+                        next_ep_index = start_batch_ep_index
+
+    def train_step(self):
+        """Runs one "policy step" of training.
+
+        This method should be called repeatedly until training is complete.
+        Unless training is completely off-policy, new episodes should be added
+        between each call to this method using add_episode().
+
+        All options for tuning this method are present in the TrainerConfig
+        passed on Trainer initialization.
+        """
+        if len(self._replay_buffer) > self.cfg.max_buffer_episodes:
+            self._replay_buffer = list(
+                self._replay_buffer[-self.cfg.max_buffer_episodes :]
+            )
+            assert len(self._replay_buffer) == self.cfg.max_buffer_episodes
+
+        errors = 0
+        start_time = time.monotonic()
+        if (
+            self.cfg.train_step_timeout_seconds is not None
+            and self.cfg.train_step_timeout_seconds > 0
+        ):
+            deadline = start_time + self.cfg.train_step_timeout_seconds
+        else:
+            deadline = start_time + float("inf")
+
+        timed_out = False
+
+        self.agent.train(mode=True)
+        self.vf.train(mode=True)
+
+        # Cached policy outputs for VF training.
+        # This avoids performing a full pass on the agent network when tuning
+        # the VF outside of the primary loss.
+        # The VF loss still tunes the full network in the primary loss.
+        observation_latent_cache = {}
+        action_lls_cache = {}
+
+        # Pre-train VF (usually only used for off-policy algorithms)
+        if self.cfg.vf_pre_training_epochs > 0:
+            with torch.no_grad():
+                for _, _, batch in self._agent_minibatches(desc="Caching latents"):
+                    for ep_data, _, agent_res in batch:
+                        observation_latent_cache[
+                            ep_data.episode_number
+                        ] = agent_res.state_encodings
+                        action_lls_cache[ep_data.episode_number] = agent_res.action_lls
+            timed_out = self._train_vf(
+                observation_latent_cache,
+                action_lls_cache,
+                self.cfg.vf_pre_training_epochs,
+                desc="Pre Training VF",
+                deadline=deadline,
+            )
+
+        train_inputs = self._preprocess()
+        self._log_dataset(train_inputs)
+
+        # Run primary training loop.
+        for _, batch_i, batch in self._agent_minibatches(
+            desc="Training Agent",
+            extra_data=train_inputs,
+            epochs=self.cfg.policy_epochs_per_train_step,
+            shuffle=True,
+            minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
+        ):
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            for ep_data, _, agent_res in batch:
+                observation_latent_cache[
+                    ep_data.episode_number
+                ] = agent_res.state_encodings.detach()
+                action_lls_cache[ep_data.episode_number] = agent_res.action_lls.detach()
+            loss, loss_infos = self._primary_loss_function(batch)
+            self.vf_optimizer.zero_grad()
+            self.agent_optimizer.zero_grad()
+            loss.backward()
+            self.total_agent_grad_steps += 1
+            if batch_i == 0 or (
+                self.cfg.log_grad_step_period > 0
+                and batch_i % self.cfg.log_grad_step_period == 0
+            ):
+                self._log_training_infos(loss_infos)
+            try:
+                clip_grad_norm_(
+                    self.agent.parameters(),
+                    max_norm=self.cfg.grad_norm_max,
+                    error_if_nonfinite=True,
+                )
+                clip_grad_norm_(
+                    self.vf.parameters(),
+                    max_norm=self.cfg.grad_norm_max,
+                    error_if_nonfinite=True,
+                )
+                self.vf_optimizer.step()
+                self.agent_optimizer.step()
+            except RuntimeError as ex:
+                # This seems to only trigger if the batch is so small the loss
+                # is NaN or so big we OOM.
+                # Because we checked for non-finite in grad_norm, this should
+                # reliably prevent corrupting the network, at the cost of
+                # potentially extremely slowing training on e.g. an over-fit
+                # VF or excessively off-policy data.
+                # TODO: Crash if we catch too many errors here
+                _LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
+                errors += 1
+                if errors > self.cfg.max_permitted_errors_per_train_step:
+                    raise ex
+            if self.cfg.recompute_train_inputs:
+                train_inputs = self._preprocess()
+
+        # Extra VF tuning after the primary training loop.
+        # This achieves similar objectives to PPG by simply not doing updates
+        # on the agent network in this phase.
+        # Inputs are guaranteed to be cached, since we ran at least one full
+        # epoch in the primary loop.
+        if self.cfg.vf_post_training_epochs > 0 and not timed_out:
+            timed_out = self._train_vf(
+                observation_latent_cache,
+                action_lls_cache,
+                self.cfg.vf_post_training_epochs,
+                desc="Post Training VF",
+                deadline=deadline,
+            )
+
+        # Update all the statistics.
+        self.agent_lr_scheduler.step()
+        self.vf_lr_scheduler.step()
+        self.agent.train(mode=False)
+        self.vf.train(mode=False)
+        stick.log("last_training_stats", self._last_training_stats, level=stick.RESULTS)
+        self.train_steps_so_far += 1
+
+        if timed_out:
+            _LOGGER.error("train_step() timed out")
+
+    def _train_vf(
+        self,
+        state_encodings: dict[int, torch.Tensor],
+        action_lls: dict[int, torch.Tensor],
+        training_epochs: int,
+        desc: str,
+        deadline: float,
+    ):
+        """Train just the VF using cached agent outputs.
+
+        state_encodings and action_lls are indexed by the `episode_number`
+        field of _EpisodeData, and should contain non-differentiable cached
+        components from each episode's AgentOutput.
+
+        This method does not tune the parameters of the agent.
+
+        Because this training is only tuning the memoryless VF tail, it uses
+        smaller minibatches of shuffled timesteps from across multiple
+        episodes.
+        """
+        state_enc_packed, obs_lens = pack_tensors(
+            [state_encodings[ep_data.episode_number] for ep_data in self._replay_buffer]
+        )
+        assert not state_enc_packed.requires_grad
+
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
+        if self.cfg.normalize_rewards:
+            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
+        else:
+            rewards_normed = padded_rewards
+
+        action_lls_now = pad_tensors(
+            [action_lls[ep_data.episode_number] for ep_data in self._replay_buffer]
+        )
+        assert not action_lls_now.requires_grad
+
+        original_action_lls = pad_tensors(
+            [data.original_action_lls for data in self._replay_buffer]
+        )
+
+        discount = 1 - self.cfg.discount_inv
+        gammas = discount * torch.ones_like(rewards_normed)
+
+        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
+
+        with tqdm(desc=desc, total=training_epochs * sum(episode_lengths)) as pbar:
+            for epoch in range(training_epochs):
+                if (
+                    epoch == 0
+                    or epoch == training_epochs
+                    or self.cfg.vf_recompute_targets
+                ):
+                    vf_x_packed = self.vf(state_enc_packed)
+                    vf_x = pad_packed(vf_x_packed, obs_lens)
+
+                    for i, episode_length in enumerate(episode_lengths):
+                        # zero vf_{t+1} in terminated episodes
+                        if self._replay_buffer[i].terminated:
+                            vf_x[i, episode_length] = 0.0
+                            terminated[i] = True
+
+                    with torch.no_grad():
+                        _, vf_targets = _v_trace_estimation(
+                            lmbda=self.cfg.v_trace_lambda,
+                            rho_max=self.cfg.v_trace_rho_max,
+                            c_max=self.cfg.v_trace_c_max,
+                            gammas=gammas,
+                            vf_x=vf_x,
+                            rewards=rewards_normed,
+                            action_lls=action_lls_now,
+                            original_action_lls=original_action_lls,
+                            terminated=terminated,
+                            episode_lengths=torch.tensor(episode_lengths),
+                        )
+
+                    vf_targets_packed = pack_padded(vf_targets, obs_lens)
+
+                # pyright doesn't understand that epoch 0 is guaranteed to happen first
+                dataset = DictDataset(
+                    state_encodings=state_enc_packed, vf_targets=vf_targets_packed
+                )
+                for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
+                    self.vf_optimizer.zero_grad()
+                    vf_out = self.vf(batch["state_encodings"])
+                    vf_loss = self.cfg.vf_loss_coef * F.mse_loss(
+                        vf_out, batch["vf_targets"]
+                    )
+                    vf_loss.backward()
+                    # If we have a NaN in this update, it's probably best to
+                    # just crash, since something is very wrong with the
+                    # training run.
+                    clip_grad_norm_(
+                        self.vf.parameters(),
+                        max_norm=self.cfg.grad_norm_max,
+                        error_if_nonfinite=True,
+                    )
+                    self.vf_optimizer.step()
+                    pbar.n += len(batch["state_encodings"])
+                    pbar.refresh()
+                    if time.monotonic() > deadline:
+                        return True
+        return False
+
+    def _log_training_infos(self, train_locals: dict[str, Any]):
+        training_stats = {
+            k: train_locals[k].item()
+            for k in ["loss", "vf_loss", "ppo_loss", "kl_loss", "awr_loss"]
+            if k in train_locals
+        }
+        training_stats["clip_portion"] = train_locals["ppo_infos"]["clip_portion"]
+        training_stats["kl_mean"] = train_locals["kl_infos"]["kl_mean"]
+        training_stats["kl_max"] = train_locals["kl_infos"]["kl_max"]
+        stick.log(
+            "training_stats",
+            training_stats,
+            level=stick.INFO,
+            step=self.total_agent_grad_steps,
+        )
+        self._last_training_stats = training_stats
+
+        stick.log(
+            "train_locals",
+            train_locals,
+            level=stick.TRACE,
+            step=self.total_agent_grad_steps,
+        )
+
+    def _log_dataset(self, train_inputs: list[_PolicyTrainingInputs]):
+        full_episode_rewards = pad_tensors(
+            [data.rewards for data in self._replay_buffer]
+        )
+        t_inputs = pack_recursive(train_inputs)[0]
+        dataset_stats = {
+            "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
+            "ev": explained_variance(
+                t_inputs.vf_returns,
+                t_inputs.discounted_returns,
+            ),
+            "disc_mean": t_inputs.discounted_returns.mean(),
+            "vf_mean": t_inputs.vf_returns.mean(),
+            "vf_target_mean": t_inputs.vf_targets.mean(),
+            "total_env_steps": self.total_env_steps,
+        }
+        for k in self._replay_buffer[0].infos.keys():
+            dataset_stats[k] = force_concat(
+                data.infos[k] for data in self._replay_buffer
+            ).mean()
+
+        stick.log(
+            "dataset_stats",
+            dataset_stats,
+            level=stick.RESULTS,
+            step=self.total_env_steps,
+        )
+
+        for k in self._replay_buffer[0].infos.keys():
+            dataset_stats[k] = force_concat(
+                data.infos[k] for data in self._replay_buffer
+            )
+
+        stick.log(
+            "dataset_stats_trace",
+            dataset_stats,
+            level=stick.TRACE,
+            step=self.total_env_steps,
+        )
+
+    def _preprocess(self) -> list[_PolicyTrainingInputs]:
+        """Compute training inputs from the replay buffer and value function.
+
+        Mostly this consists of the advantages and value function
+        targets. See the _PolicyTrainingInputs class for more
+        information.
+        """
+
+        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
+        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
+
+        # Compute vf_returns
+        self.agent.train(mode=False)
+        self.vf.train(mode=False)
+        with torch.no_grad():
+            agent_outputs = _call_agent_forward(
+                self.agent, [data.episode for data in self._replay_buffer]
+            )
+            state_enc_packed = pack_tensors_check(
+                [agent_out.state_encodings for agent_out in agent_outputs], obs_lens
+            )
+            vf_returns_packed = self.vf(state_enc_packed)
+        self.agent.train(mode=True)
+        self.vf.train(mode=True)
+
+        action_lls_now = pad_tensors(
+            [agent_out.action_lls for agent_out in agent_outputs]
+        )
+        original_action_lls = pad_tensors(
+            [data.original_action_lls for data in self._replay_buffer]
+        )
+        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
+
+        vf_returns = pad_packed(vf_returns_packed, obs_lens)
+        # Can't use valids mask, since vf_returns goes to t + 1
+        for i, episode_length in enumerate(episode_lengths):
+            # Everything after last valid observation should have been padded to zero
+            assert (vf_returns[i, episode_length + 1 :] == 0.0).all()
+
+            # zero vf_{t+1} in terminated episodes
+            if self._replay_buffer[i].terminated:
+                vf_returns[i, episode_length] = 0.0
+                terminated[i] = True
+
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
+        if self.cfg.normalize_rewards:
+            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
+        else:
+            rewards_normed = padded_rewards
+
+        discount = 1 - self.cfg.discount_inv
+        gammas = discount * torch.ones_like(rewards_normed)
+
+        padded_advantages, vf_targets = _v_trace_estimation(
+            lmbda=self.cfg.v_trace_lambda,
+            rho_max=self.cfg.v_trace_rho_max,
+            c_max=self.cfg.v_trace_c_max,
+            gammas=gammas,
+            vf_x=vf_returns,
+            rewards=rewards_normed,
+            action_lls=action_lls_now,
+            original_action_lls=original_action_lls,
+            terminated=terminated,
+            episode_lengths=torch.tensor(episode_lengths),
+        )
+
+        adv_packed = pack_padded(padded_advantages, episode_lengths)
+        assert not adv_packed.requires_grad
+
+        if self.cfg.normalize_advantages:
+            adv_packed = adv_packed - adv_packed.mean()
+            adv_packed = adv_packed / adv_packed.std()
+
+        heated_adv = adv_packed / self.awr_temperature.detach()
+        exp_advantages = heated_adv.exp()
+
+        max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
+        exp_advantages[~torch.isfinite(exp_advantages)] = 1 + max_exp_adv
+        rect_adv = exp_advantages - exp_advantages.min()
+
+        large_exp_adv = ~torch.isfinite(rect_adv) | (rect_adv > max_exp_adv)
+        clipped_exp_adv = rect_adv.clone()
+        clipped_exp_adv[large_exp_adv] = max_exp_adv
+
+        discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
+
+        train_inputs = [
+            _PolicyTrainingInputs(
+                advantages=adv,
+                discounted_returns=disc_ret,
+                vf_returns=vf_ret,
+                vf_targets=vf_target,
+                exp_advantages=exp_adv,
+            )
+            for (adv, disc_ret, vf_ret, vf_target, exp_adv) in zip(
+                unpack_tensors(adv_packed, episode_lengths),
+                unpad_tensors(discounted_returns, episode_lengths),
+                unpad_tensors(vf_returns, episode_lengths),
+                unpad_tensors(vf_targets, episode_lengths),
+                unpack_tensors(clipped_exp_adv, episode_lengths),
+            )
+        ]
+        assert len(train_inputs) == len(self._replay_buffer)
+        assert [
+            len(train_input.advantages) for train_input in train_inputs
+        ] == episode_lengths
+        assert [
+            len(train_input.discounted_returns) for train_input in train_inputs
+        ] == episode_lengths
+
+        infos = locals()
+        del infos["self"]
+        stick.log(
+            "preprocess",
+            infos,
+            level=stick.TRACE,
+            step=self.total_env_steps,
+        )
+
+        return train_inputs
+
+    def add_episode(
+        self,
+        episode: Any,
+        rewards: torch.Tensor,
+        action_lls: torch.Tensor,
+        terminated: bool,
+        action_dists: Optional[ActionDist] = None,
+        any_actions_possible: Optional[torch.Tensor] = None,
+        weight: float = 1.0,
+        infos: Optional[dict[str, torch.Tensor]] = None,
+    ):
+        """Add a new episode to the replay buffer.
+
+        Args:
+
+            episode (Any): The episode. Can be any value that the agent accepts
+                (in a list) to its forward method.
+            rewards (torch.Tensor): Float Tensor containing rewards achieved
+                after taking each action.
+            terminated (bool): True if the episode ended in a terminal state,
+                and False if the episode timed-out, was abandoned, or is still
+                ongoing.
+            action_dists (Optional[ActionDist]): Optional original action
+                distributions. Used to compute exact KL divergence and entropy
+                regularization depending on the config.
+            any_actions_possible (Optional[torch.Tensor]): Boolean Tensor
+                indicating if any actions were possible to take at this state.
+                This allows ignoring states where no action was possible (e.g.
+                the initial prompt in an LLM, or intermediate frames in a video
+                input when using frame-skip). Assumes always true if not
+                provided.
+            weight (float): Optional weight indicating importance of the
+                episode. May be adjusted by the learner.
+            infos (Optional[dict[str,torch.Tensor]]): extra information about
+                the episode. Will be summarized and logged every training step.
+
+        """
+        assert isinstance(rewards, torch.Tensor)
+        assert isinstance(action_lls, torch.Tensor)
+        assert not action_lls.requires_grad
+        num_timesteps = len(rewards)
+        self.total_env_steps += num_timesteps
+        if any_actions_possible is None:
+            any_actions_possible = torch.ones(num_timesteps, dtype=torch.bool)
+        else:
+            assert isinstance(any_actions_possible, torch.Tensor)
+
+        rewards = rewards.to(dtype=self._dtype)
+        self.reward_normalizer.update(rewards)
+        if infos is None:
+            infos = {}
+
+        self._replay_buffer.append(
+            _EpisodeData(
+                episode,
+                episode_number=self._next_episode_number,
+                num_timesteps=num_timesteps,
+                terminated=terminated,
+                original_action_lls=action_lls.to(dtype=self._dtype),
+                original_action_dists=action_dists,
+                rewards=rewards,
+                any_actions_possible=any_actions_possible,
+                weight=weight,
+                infos=infos,
+            )
+        )
+        self._next_episode_number += 1
+
+    def add_eval_stats(self, stats: dict[str, float], primary: str):
+        """Add evaluation statistics for the current agent.
+
+        Will be logged to {cfg.runs_dir}/{cfg.run_name}/eval_stats.csv.
+
+        The primary stat should be present in stats and indicates how to choose
+        the "best" agent for purposes of checkpointing and hyper-parameter
+        tuning.
+        """
+        assert "primary" not in stats
+        stats["primary"] = stats[primary]
+        stick.log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
+        self.primary_performance = stats[primary]
+        self.last_eval_stats = stats
+        hparams = self.cfg.to_dict()
+        hparams["metric-primary"] = stats[primary]
+        for k, v in stats.items():
+            hparams[k] = v
+        stick.log("hparams", hparams, step=self.total_env_steps)
+        _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
+
+    def attempt_resume(
+        self, prefer_best: bool = False, checkpoint_dir: Optional[str] = None
+    ):
+        """Attempt to resume from the checkpoint directory.
+
+        If checkpoint_dir is not passed, defaults to the current run directory:
+        {cfg.runs_dir}/{cfg.run_name}.
+
+        Prefers the most recent checkpoint, according to the train_step_[i}.pkl
+        name, or best.pkl if it exists and prefer_best is True.
+        """
+        if checkpoint_dir is None:
+            checkpoint_dir = os.path.join(self.cfg.runs_dir, self.cfg.run_name)
+        best_ckpt = os.path.join(checkpoint_dir, "best.pkl")
+        if prefer_best and os.path.exists(best_ckpt):
+            try:
+                with open(best_ckpt, "rb") as f:
+                    state = pickle.load(f)
+                    self.load_state_dict(state)
+                    _LOGGER.critical(
+                        f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
+                    )
+                    return True
+            except (pickle.UnpicklingError, ValueError) as ex:
+                _LOGGER.error(f"Could not load {best_ckpt}: {ex}")
+        checkpoints = glob(f"{checkpoint_dir}/train_step_*.pkl")
+        with_idx = [
+            (int(f_name.rsplit("_", 1)[-1].split(".", 1)[0]), f_name)
+            for f_name in checkpoints
+        ]
+        for idx, f_name in sorted(with_idx, reverse=True):
+            try:
+                with open(f_name, "rb") as f:
+                    state = pickle.load(f)
+                    self.load_state_dict(state)
+                    _LOGGER.critical(
+                        f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
+                    )
+                    return True
+            except (pickle.UnpicklingError, ValueError) as ex:
+                _LOGGER.error(f"Could not load {f_name}: {ex}")
+        return False
+
+    def maybe_checkpoint(self):
+        """Checkpoint to the run directory, depending on config values.
+
+        If cfg.checkpoint_best and the primary stat passed to add_eval_stats()
+        is at a maximal value, checkpoints to {cfg.runs_dir}/{cfg.run_name}/best.pkl.
+
+        Also periodically checkpoints to train_step_{i}.pkl every
+        cfg.checkpoint_interval train_step() calls.
+        """
+        checkpoint_interval = (
+            self.cfg.checkpoint_interval >= 0
+            and self.train_steps_so_far - self.train_steps_so_far_at_last_checkpoint
+            >= self.cfg.checkpoint_interval
+        )
+        checkpoint_best = (
+            self.cfg.checkpoint_best
+            and self.primary_performance > self.best_checkpoint_primary_performance
+        )
+        if checkpoint_interval or checkpoint_best:
+            state_dict = self.state_dict()
+            if checkpoint_interval:
+                f_name = os.path.join(
+                    self.cfg.runs_dir,
+                    self.cfg.run_name,
+                    f"train_step_{self.train_steps_so_far}.pkl",
+                )
+                if not os.path.exists(f_name):
+                    _LOGGER.info(f"Checkpointing to {f_name!r}")
+                    with open(
+                        f_name,
+                        "wb",
+                    ) as f:
+                        pickle.dump(state_dict, f)
+                    self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
+                else:
+                    _LOGGER.info(f"Checkpoint {f_name!r} already exists")
+            if checkpoint_best:
+                f_name = os.path.join(self.cfg.runs_dir, self.cfg.run_name, f"best.pkl")
+                _LOGGER.info(f"Checkpointing to {f_name!r}")
+                with open(f_name, "wb") as f:
+                    pickle.dump(state_dict, f)
+                self.best_checkpoint_primary_performance = self.primary_performance
+            return True
+        else:
+            return False
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the state of the Trainer as a dictionary.
+
+        Return value shares Tensors with the Trainer fields.
+
+        Note that the Trainer is *not* an nn.Module.
+
+        The returned dictionary is not "flat", and contains nested state
+        dictionaries for submodules, parameters, optimizers, and learning rate
+        schedulers.
+        """
+
+        state = {}
+        for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
+            state[k] = getattr(self, k).state_dict()
+        for k in _PARAM_FIELDS:
+            state[k] = getattr(self, k).data
+        for k, v in self.__dict__.items():
+            if (
+                k in _IGNORED_FIELDS
+                or k in _OPTIMIZER_FIELDS
+                or k in _SUBMODULE_FIELDS
+                or k in _PARAM_FIELDS
+            ):
+                continue
+            elif k == "cfg":
+                state[k] = v.to_dict()
+            elif k == "replay_buffer":
+                if self.cfg.checkpoint_replay_buffer:
+                    state[k] = v
+            else:
+                if hasattr(v, "state_dict"):
+                    _LOGGER.error(
+                        f"Field {k} was not expected to have a state_dict method"
+                    )
+                state[k] = v
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        """Load the state of the trainer from a dictionary.
+
+        Note that the Trainer is *not* an nn.Module.
+        """
+        state = state_dict
+        for k in _PARAM_FIELDS + _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
+            assert k in state, f"Missing {k!r} from state dict"
+        for k, v in state.items():
+            if k in _OPTIMIZER_FIELDS:
+                # We need to handle these fields once all parameters are loaded
+                continue
+            elif k == "cfg":
+                self.cfg = type(self.cfg).from_dict(v)
+            elif k in _PARAM_FIELDS:
+                setattr(self, k, nn.Parameter(v))
+            elif k in _SUBMODULE_FIELDS:
+                getattr(self, k).load_state_dict(v)
+            else:
+                field_now = getattr(self, k, None)
+                if field_now is None:
+                    _LOGGER.error(f"Attempting to set unknown field {k}")
+                else:
+                    if hasattr(field_now, "load_state_dict"):
+                        _LOGGER.error(
+                            f"Field {k} was not expected to have a load_state_dict method"
+                        )
+                setattr(self, k, v)
+
+        # Attach all of the optimizers again
+        # This method depends cfg, and all parameter and sub-module fields
+        self._setup_optimizers()
+
+        # Now we can load the optimizer state dictionaries
+        for k in _OPTIMIZER_FIELDS:
+            getattr(self, k).load_state_dict(state[k])
+
+        # Make sure optimizers are attached to parameters
+        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
+        assert self.vf_optimizer.param_groups[0]["params"][0] is next(
+            self.vf.parameters()
+        )
+        assert self.agent_optimizer.param_groups[0]["params"][0] is next(
+            self.agent.parameters()
+        )
+
+
+class Agent(nn.Module):
+    """Agent API optimized by OutRL.
+
+    You do not need to actually inherit from this class, it exists for
+    documentation purposes.
+    """
+
+    def __init__(self, state_encoding_size: int):
+        super().__init__()
+
+        self.state_encoding_size = state_encoding_size
+        """Species the dimensionality of encoded states in the
+        AgentOutput.state_encodings field."""
+
+    def forward(self, episodes: list[Any]) -> list["AgentOutput"]:
+        """Run the agent's forward pass. This is the main API entry point
+        between your agent and OutRL's trainer.
+
+        If you already need to use the forward pass for another purpose, you
+        can define outrl_forward() instead, but note that this will not invoke
+        torch forward hooks.
+
+        Episodes can be any value passed to Trainer.add_episode().
+        """
+        del episodes
+        raise NotImplementedError()
+
+
+@dataclass(eq=False)
+class AgentOutput:
+    """Result from one episode when calling .forward() on an agent.
+
+    Differentiating both state_encodings and action_lls should affect
+    earlier layers in the agent.
+    """
+
+    state_encodings: torch.Tensor
+    """Differentiable representation of the observations in the episode."""
+
+    action_lls: torch.Tensor
+    """Differentiable log-likelihood of actions taken in the episode."""
+
+    action_dists: Optional[ActionDist] = None
+    """Distribution used to generate actions.
+
+    Will be used for the KL penalty if not None and cfg.use_approx_kl is False.
+
+    Will be used for entropy regularization if not None and cfg.approx_entropy
+    is False.
+    """
+
+
+def _call_agent_forward(agent: Agent, episodes: list[Any]) -> list[AgentOutput]:
+    """Calls the outrl_forward method if available, otherwise calls the normal
+    forward method via __call__.
+    """
+    if hasattr(agent, "outrl_forward"):
+        return agent.outrl_forward(episodes)
+    else:
+        return agent(episodes)
+
+
 _GENERATED_FROM_TIME = "GENERATED_FROM_TIME"
+
+
+# TrainerConfig is after Trainer because that improves the documentation order.
 
 
 @dataclass
 class TrainerConfig(simple_parsing.Serializable):
     """Config structure for the Trainer.
 
-    Can be saved to / loaded from yaml.
+    Can be saved to and loaded from yaml.
     All fields have default values.
     Most fields can be tuned via optuna.
 
@@ -198,6 +1453,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Set to None to disable logging."""
 
     stderr_log_level: stick.LogLevels = stick.LogLevels.INFO
+    """Log level to stderr for stick and python logging."""
 
     pprint_logging: bool = True
     """Log to stdout using pprint. Because the pprint output engine defaults to
@@ -269,7 +1525,8 @@ class TrainerConfig(simple_parsing.Serializable):
     """Weight decay for the agent using AdamW."""
 
     ppo_clip_epsilon: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
-    """PPO loss will be clipped to only apply the loss when the log-likelihood is between 1 / (1 + ppo_clip_epsilon) and 1 + ppo_clip_epsilon.
+    """PPO loss will be clipped to only apply the loss when the log-likelihood
+    is between 1 / (1 + ppo_clip_epsilon) and 1 + ppo_clip_epsilon.
 
     Because the ppo_loss is disabled by default, this field also has no effect by default.
     Because OutRL uses regularized VF training, VF clipping is not used.
@@ -278,11 +1535,14 @@ class TrainerConfig(simple_parsing.Serializable):
     vf_lr_schedule: Optional[str] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
-    """Learning rate schedule for the value function parameters. Typically used to decrease the learning rate to near-zero near the end of training."""
+    """Learning rate schedule for the value function parameters. Typically used
+    to decrease the learning rate to near-zero near the end of training."""
+
     vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-4, 0.1, log=True))
     """Initial learning rate for the value function parameters. If the
     vf_lr_schedule is None, this learning rate will be used throughout
     training. """
+
     vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
     """Final learning rate for the value function parameters. If the
     vf_lr_schedule is None, this learning rate will not be used. """
@@ -480,6 +1740,7 @@ class TrainerConfig(simple_parsing.Serializable):
     temperature_min: float = tunable(0.05, FloatDistribution(0.0, 1.0))
     """Minimum AWR temperature. Small values exponentially increase the AWR
     loss. Limits of numerical precision make very low values impractical."""
+
     temperature_max: float = tunable(100, FloatDistribution(0.1, 1e5, log=True))
     """Maximum AWR temperature. Large values cause the AWR loss to ignore
     advantages and just perform behavioral cloning.
@@ -538,8 +1799,7 @@ class TrainerConfig(simple_parsing.Serializable):
     log_grad_step_period: int = 20
     """Log information every n training gradient steps.
 
-    This has moderate time costs (on the order of +10% to runtime) if set to
-    very low values (e.g. 1).
+    This has moderate time costs if set to very low values (e.g. 1).
     """
 
     max_permitted_errors_per_train_step: int = 10
@@ -569,1121 +1829,6 @@ class TrainerConfig(simple_parsing.Serializable):
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
-
-
-@dataclass(eq=False)
-class _PolicyTrainingInputs:
-    """Values used to train the policy that are not present in _EpisodeData.
-
-    An instance of this class accompanies each _EpisodeData during policy
-    optimization.
-
-    These values are recomputed every train_step()."""
-
-    advantages: torch.Tensor
-    """Advantages for this episode. Used in PPO loss (when enabled)."""
-
-    exp_advantages: torch.Tensor
-    """Coefficients used in the AWR loss."""
-
-    vf_targets: torch.Tensor
-    """Target values for the value function loss."""
-
-    discounted_returns: torch.Tensor
-    """Discounted sum of future rewards. Used in logging."""
-
-    vf_returns: torch.Tensor
-    """Estimated returns from the value function. Used in logging."""
-
-
-_OPTIMIZER_FIELDS = [
-    "agent_optimizer",
-    "vf_optimizer",
-    "vf_lr_scheduler",
-    "agent_lr_scheduler",
-    "kl_coef_opt",
-    "awr_temperature_opt",
-]
-
-_SUBMODULE_FIELDS = [
-    "agent",
-    "vf",
-    "reward_normalizer",
-]
-
-_PARAM_FIELDS = [
-    "kl_coef",
-    "awr_temperature",
-]
-
-_IGNORED_FIELDS = ["_is_full_backward_hook"]
-
-
-class Trainer:
-    def __init__(self, cfg: TrainerConfig, agent):
-        super().__init__()
-        self.cfg = cfg
-
-        self.agent = agent
-
-        self._state_encoding_size = self.agent.state_encoding_size
-
-        self.vf = make_mlp(
-            input_size=self._state_encoding_size,
-            hidden_sizes=self.cfg.vf_hidden_sizes,
-            output_size=0,
-            use_dropout=True,
-        )
-
-        # Zero the initial VF output to stabilize training
-        vf_output = self.vf.get_submodule("output_linear")
-        vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
-
-        self.reward_normalizer = RunningMeanVar(use_mean=False)
-
-        self._replay_buffer: list[_EpisodeData] = []
-        self._next_episode_number: int = 0
-        self._dtype = torch.float32
-
-        self.total_env_steps: int = 0
-        self.train_steps_so_far: int = 0
-
-        self.last_training_stats = {}
-        self.last_eval_stats = {}
-        self.primary_performance: float = float("-inf")
-        self.best_checkpoint_primary_performance: float = float("-inf")
-        self.train_steps_so_far_at_last_checkpoint = 0
-
-        self.kl_coef = nn.Parameter(torch.tensor(float(self.cfg.kl_coef_init)))
-
-        self.awr_temperature = nn.Parameter(
-            torch.tensor(float(self.cfg.temperature_init))
-        )
-
-        # This method is also called after loading the state dict to re-attach
-        # parameters
-        self._setup_optimizers()
-
-    def _setup_optimizers(self):
-        """(Re)create all of the optimizers to use the current parameters.
-
-        This method is called in __init__ and also in load_state_dict().
-        """
-        self.agent_optimizer = torch.optim.AdamW(
-            self.agent.parameters(),
-            lr=self.cfg.agent_lr_start,
-            weight_decay=self.cfg.agent_weight_decay,
-        )
-        self.agent_lr_scheduler = make_scheduler(
-            self.agent_optimizer,
-            self.cfg.agent_lr_schedule,
-            self.cfg.agent_lr_start,
-            self.cfg.agent_lr_end,
-            self.cfg.expected_train_steps,
-        )
-        self.vf_optimizer = torch.optim.AdamW(
-            self.vf.parameters(),
-            lr=self.cfg.vf_lr_start,
-            weight_decay=self.cfg.vf_weight_decay,
-        )
-        self.vf_lr_scheduler = make_scheduler(
-            self.vf_optimizer,
-            self.cfg.vf_lr_schedule,
-            self.cfg.vf_lr_start,
-            self.cfg.vf_lr_end,
-            self.cfg.expected_train_steps,
-        )
-
-        self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
-        self.awr_temperature_opt = torch.optim.AdamW(
-            [self.awr_temperature], lr=self.cfg.temperature_lr
-        )
-
-        self.total_agent_grad_steps = 0
-
-    def _primary_loss_function(
-        self, batch: list[tuple[_EpisodeData, _PolicyTrainingInputs, AgentOutput]]
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Reinforcement learning loss function.
-
-        Combines together losses from many sources to train both the agent and
-        value function.
-
-        Returns a loss which is usually near unit scale and a dictionary of
-        infos to log for this gradient step.
-
-        Note that lagrangian losses (for the KL and entropy) are optimized in
-        their related loss functions.
-        """
-
-        episode_data: list[_EpisodeData] = [b[0] for b in batch]
-        train_inputs: list[_PolicyTrainingInputs] = [b[1] for b in batch]
-        agent_outputs: list[AgentOutput] = [b[2] for b in batch]
-
-        kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
-
-        ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
-
-        awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, agent_outputs)
-
-        # TODO: Tune awr_temperature
-
-        vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, agent_outputs)
-
-        loss = ppo_loss + awr_loss + vf_loss + kl_loss
-
-        # kl_infos, vf_infos, and ppo_infos will all get included in locals
-        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos)
-        return loss, locals()
-
-    def _ppo_loss(
-        self,
-        episode_data: list[_EpisodeData],
-        train_inputs: list[_PolicyTrainingInputs],
-        agent_outputs: list[AgentOutput],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        advantages, adv_len = pack_tensors(
-            [train_input.advantages for train_input in train_inputs]
-        )
-        log_probs = pack_tensors_check(
-            [agent_out.action_lls for agent_out in agent_outputs], adv_len
-        )
-
-        old_log_probs = pack_tensors_check(
-            [data.original_action_lls for data in episode_data], adv_len
-        )
-        assert not old_log_probs.requires_grad
-
-        ratio = torch.exp(log_probs - old_log_probs)
-        ratio_clipped = torch.clamp(
-            ratio, 1 / (1 + self.cfg.ppo_clip_epsilon), 1 + self.cfg.ppo_clip_epsilon
-        )
-
-        policy_gradient = ratio * advantages
-        clip_policy_gradient = ratio_clipped * advantages
-
-        # Mean is handled in the primary_loss_function
-        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
-        norm_coef = self.cfg.ppo_loss_coef / self.cfg.minibatch_target_timesteps
-        ppo_loss_scaled = norm_coef * ppo_loss.sum()
-        infos = locals()
-        del infos["self"]
-        del infos["adv_len"]
-        infos["clip_portion"] = (ratio_clipped != ratio).mean(dtype=torch.float32)
-        return (ppo_loss_scaled, infos)
-
-    def _awr_loss(
-        self,
-        episode_data: list[_EpisodeData],
-        train_inputs: list[_PolicyTrainingInputs],
-        agent_outputs: list[AgentOutput],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        del episode_data
-
-        # Dividing by temperature and normalizing are handled in preprocess
-        # TODO: Should advantage exponentiation happen every minibatch or not?
-        # temperature tuning happens every minibatch, so it seems like the
-        # temperature should be used every minibatch as well.
-        # But also it seems like having a constant temperature throughout a
-        # batch might be ideal.
-
-        # We'll probably add entropy regularization using a minibatch
-        # lagrangian anyways, so maybe it doesn't matter.
-        exp_adv, adv_len = pack_tensors(
-            [train_input.exp_advantages for train_input in train_inputs]
-        )
-
-        log_probs = pack_tensors_check(
-            [agent_out.action_lls for agent_out in agent_outputs], adv_len
-        )
-
-        awr_loss = -log_probs * exp_adv
-
-        log_probs_scale = log_probs.detach().abs().mean()
-        used_for_logging(log_probs_scale)
-        norm_coef = self.cfg.awr_loss_coef / (self.cfg.minibatch_target_timesteps)
-        # Try to keep average awr_loss scale mostly constant
-        # if self.cfg.norm_exp_advantages:
-        #     total_timesteps = sum(len(data.rewards) for data in self._replay_buffer)
-        #     norm_coef *= total_timesteps
-
-        awr_loss_scaled = norm_coef * awr_loss.sum()
-        # Don't want to log these here
-        infos = locals()
-        del infos["self"]
-        del infos["adv_len"]
-        return (awr_loss_scaled, infos)
-
-    def _vf_loss(
-        self,
-        episode_data: list[_EpisodeData],
-        train_inputs: list[_PolicyTrainingInputs],
-        agent_outputs: list[AgentOutput],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # For consistency with other loss functions, we still take
-        # episode_data, but don't use it.
-        del episode_data
-
-        vf_targets_packed, adv_len = pack_tensors(
-            [train_input.vf_targets for train_input in train_inputs]
-        )
-        state_enc_packed = pack_tensors_check(
-            [agent_out.state_encodings[:-1] for agent_out in agent_outputs], adv_len
-        )
-
-        critic_out = self.vf(state_enc_packed)
-        vf_loss = F.mse_loss(critic_out, vf_targets_packed)
-
-        discounted_returns = pack_tensors_check(
-            [train_input.discounted_returns for train_input in train_inputs], adv_len
-        )
-        minibatch_ev = explained_variance(critic_out, discounted_returns)
-        used_for_logging(minibatch_ev)
-
-        norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
-        vf_loss_scaled = norm_coef * vf_loss
-        infos = locals()
-        del infos["self"]
-        del infos["adv_len"]
-        return (vf_loss_scaled, infos)
-
-    def _kl_loss(
-        self,
-        episode_data: list[_EpisodeData],
-        train_inputs: list[_PolicyTrainingInputs],
-        agent_outputs: list[AgentOutput],
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # For consistency with other loss functions, we still take
-        # train_inputs, but don't use it.
-        del train_inputs
-
-        original_kl_coef = self.kl_coef.detach().item()
-        used_for_logging(original_kl_coef)
-
-        log_probs, lengths = pack_tensors(
-            [agent_out.action_lls for agent_out in agent_outputs]
-        )
-        old_log_probs = pack_tensors_check(
-            [data.original_action_lls for data in episode_data], lengths
-        )
-        # Normalize to form a proper distribution across actions P(a)
-        log_probs -= log_probs.exp().sum().log()
-        old_log_probs -= old_log_probs.exp().sum().log()
-
-        # Approximate per-timestep KL by multiplying back in the number of timesteps
-        total_timesteps = sum(lengths)
-        approx_kl = total_timesteps * approx_kl_div(old_log_probs, log_probs)
-        total_approx_kl = approx_kl.sum()
-
-        # Compute KL Divergence
-        if self.cfg.use_approx_kl is False:
-            new_dists = [agent_out.action_dists for agent_out in agent_outputs]
-            assert new_dists[0] is not None
-            old_dists = [ep_data.original_action_dists for ep_data in episode_data]
-            assert old_dists[0] is not None
-            # TODO: Add options for other KL directions
-            kl = kl_div(old_dists, new_dists)
-        else:
-            kl = approx_kl
-
-        assert kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
-        assert approx_kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
-        kl = kl[torch.isfinite(kl)]
-
-        # Update KL loss coefficient
-        if self.cfg.kl_target_stat == "max":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().max())
-        elif self.cfg.kl_target_stat == "mean":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().mean())
-        else:
-            raise ValueError(f"Unknown kl_target_stat {self.cfg.kl_target_stat}")
-        self.kl_coef_opt.zero_grad()
-        kl_coef_loss.backward()
-        self.kl_coef_opt.step()
-        if self.kl_coef < self.cfg.kl_coef_min:
-            with torch.no_grad():
-                self.kl_coef.copy_(self.cfg.kl_coef_min)
-        # If the KL coef has become non-finite, it's probably because of
-        # infinite KL, so set to maximum.
-        if self.kl_coef > self.cfg.kl_coef_max or not torch.isfinite(self.kl_coef):
-            with torch.no_grad():
-                self.kl_coef.copy_(self.cfg.kl_coef_max)
-        kl_coef = self.kl_coef.detach()
-
-        kl_mean = kl.mean()
-        kl_max = kl.max()
-        used_for_logging(kl_mean, kl_max)
-
-        norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
-
-        kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
-        kl_loss_scaled = norm_coef * kl_symlog.sum()
-        infos = locals()
-        del infos["lengths"]
-        del infos["self"]
-        return kl_loss_scaled, infos
-
-    def _agent_minibatches(
-        self,
-        episodes: Optional[list[_EpisodeData]] = None,
-        extra_data: Optional[list[T]] = None,
-        minibatch_target_timesteps: Optional[int] = None,
-        desc: Optional[str] = None,
-        epochs: int = 1,
-        shuffle: bool = False,
-    ) -> Generator[
-        tuple[int, int, list[tuple[_EpisodeData, T, AgentOutput]]], None, None
-    ]:
-        """Runs the agent forward pass on minibatches drawn from the replay buffer.
-
-        Minibatches are a list of tuples of _EpisodeData from the input, data T
-        from the extra_data (None if not provided), and AgentOutput from the
-        agent forward pass.
-
-        This method handles sizing of minibatches to avoid OOM, shuffling of
-        episodes, rendering the progress bar, and running for multiple epochs.
-        Basically, this method plays a similar role to "Trainer" classes in
-        supervised learning libraries.
-
-        Yields: list[tuple[_EpisodeData, T, ForwardResult]]
-        """
-        if episodes is None:
-            episodes = self._replay_buffer
-
-        if extra_data is None or len(extra_data) == 0:
-            extra_data = [None for _ in episodes]
-        assert len(extra_data) == len(episodes)
-
-        if shuffle:
-            shuffled_indices = torch.randperm(len(episodes))
-            episodes = [episodes[i] for i in shuffled_indices]
-            extra_data = [extra_data[i] for i in shuffled_indices]
-
-        minibatch_hard_cap = 2**64
-        if self.cfg.max_timesteps_per_forward is not None:
-            minibatch_hard_cap = self.cfg.max_timesteps_per_forward
-
-        minibatch_soft_cap = minibatch_hard_cap
-        if minibatch_target_timesteps is not None:
-            minibatch_soft_cap = min(minibatch_target_timesteps, minibatch_hard_cap)
-
-        with tqdm(
-            total=epochs * sum([ep.num_timesteps for ep in episodes]), desc=desc
-        ) as pbar:
-            for epoch in range(epochs):
-                next_ep_index = 0
-                minibatch_number = 0
-                while next_ep_index < len(episodes):
-                    start_batch_ep_index = next_ep_index
-                    batch = []
-                    num_batch_steps = 0
-                    # Accumulate episodes into batch until we run out of space
-                    while next_ep_index < len(episodes) and (
-                        num_batch_steps + episodes[next_ep_index].num_timesteps
-                        <= minibatch_hard_cap
-                    ):
-                        batch.append(
-                            (episodes[next_ep_index], extra_data[next_ep_index])
-                        )
-                        num_batch_steps += episodes[next_ep_index].num_timesteps
-                        next_ep_index += 1
-                        if num_batch_steps >= minibatch_soft_cap:
-                            break
-
-                    if len(batch) == 0:
-                        # We can't fit even a single forward pass in memory!
-                        # Crash in this case (maybe the user can decrease the episode
-                        # length, decrease the model size, enable gradient
-                        # checkpointing / implement BPT, or buy a bigger GPU).
-                        ep_steps = episodes[next_ep_index].num_timesteps
-                        max_steps = self.cfg.max_timesteps_per_forward
-                        raise RuntimeError(
-                            dedent(
-                                f"""\
-                            Cannot run .forward() on episode of length:
-                            {ep_steps} > {max_steps} = cfg.max_timesteps_per_forward
-                            Increase cfg.max_timesteps_per_forward, decrease model size,
-                            or find another way of increasing available memory.
-                            """
-                            )
-                        )
-
-                    try:
-                        forward_result = self.agent([data[0].episode for data in batch])
-                        yield (
-                            epoch,
-                            minibatch_number,
-                            [
-                                (data[0], data[1], f_res)
-                                for (data, f_res) in zip(batch, forward_result)
-                            ],
-                        )
-                        minibatch_number += 1
-                        pbar.update(sum([data[0].num_timesteps for data in batch]))
-                    except RuntimeError as ex:
-                        if "Cannot allocate memory" not in str(ex):
-                            raise ex
-                        # Decrease to just one below the current size, which will
-                        # prevent the last episode from being in the batch.
-                        # This avoids dropping the max_timesteps_per_forward too low
-                        # from one unusually large trailing episode.
-                        # Note that this may still decrease by a large number of steps
-                        # (or set max_timesteps_per_forward when it was previously
-                        # None).
-                        self.cfg.max_timesteps_per_forward = num_batch_steps - 1
-                        minibatch_hard_cap = self.cfg.max_timesteps_per_forward
-                        warnings.warn(
-                            f"Decreasing cfg.max_timesteps_per_forward to "
-                            f"{self.cfg.max_timesteps_per_forward}",
-                        )
-                        # Retry the batch
-                        next_ep_index = start_batch_ep_index
-
-    def train_step(self):
-        """Runs one "policy step" of training.
-
-        This method should be called repeatedly until training is complete.
-        Unless training is completely off-policy, new episodes should be added
-        between each call to this method using add_episode().
-
-        All options for tuning this method are present in the TrainerConfig
-        passed on Trainer initialization.
-        """
-        if len(self._replay_buffer) > self.cfg.max_buffer_episodes:
-            self._replay_buffer = list(
-                self._replay_buffer[-self.cfg.max_buffer_episodes :]
-            )
-            assert len(self._replay_buffer) == self.cfg.max_buffer_episodes
-
-        errors = 0
-        start_time = time.monotonic()
-        if (
-            self.cfg.train_step_timeout_seconds is not None
-            and self.cfg.train_step_timeout_seconds > 0
-        ):
-            deadline = start_time + self.cfg.train_step_timeout_seconds
-        else:
-            deadline = start_time + float("inf")
-
-        timed_out = False
-
-        self.agent.train(mode=True)
-        self.vf.train(mode=True)
-
-        # Cached policy outputs for VF training.
-        # This avoids performing a full pass on the agent network when tuning
-        # the VF outside of the primary loss.
-        # The VF loss still tunes the full network in the primary loss.
-        observation_latent_cache = {}
-        action_lls_cache = {}
-
-        # Pre-train VF (usually only used for off-policy algorithms)
-        if self.cfg.vf_pre_training_epochs > 0:
-            with torch.no_grad():
-                for _, _, batch in self._agent_minibatches(desc="Caching latents"):
-                    for ep_data, _, agent_res in batch:
-                        observation_latent_cache[
-                            ep_data.episode_number
-                        ] = agent_res.state_encodings
-                        action_lls_cache[ep_data.episode_number] = agent_res.action_lls
-            timed_out = self._train_vf(
-                observation_latent_cache,
-                action_lls_cache,
-                self.cfg.vf_pre_training_epochs,
-                desc="Pre Training VF",
-                deadline=deadline,
-            )
-
-        train_inputs = self._preprocess()
-        self._log_dataset(train_inputs)
-
-        # Run primary training loop.
-        for _, batch_i, batch in self._agent_minibatches(
-            desc="Training Agent",
-            extra_data=train_inputs,
-            epochs=self.cfg.policy_epochs_per_train_step,
-            shuffle=True,
-            minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
-        ):
-            if time.monotonic() > deadline:
-                timed_out = True
-                break
-            for ep_data, _, agent_res in batch:
-                observation_latent_cache[
-                    ep_data.episode_number
-                ] = agent_res.state_encodings.detach()
-                action_lls_cache[ep_data.episode_number] = agent_res.action_lls.detach()
-            loss, loss_infos = self._primary_loss_function(batch)
-            self.vf_optimizer.zero_grad()
-            self.agent_optimizer.zero_grad()
-            loss.backward()
-            self.total_agent_grad_steps += 1
-            if batch_i == 0 or (
-                self.cfg.log_grad_step_period > 0
-                and batch_i % self.cfg.log_grad_step_period == 0
-            ):
-                self._log_training_infos(loss_infos)
-            try:
-                clip_grad_norm_(
-                    self.agent.parameters(),
-                    max_norm=self.cfg.grad_norm_max,
-                    error_if_nonfinite=True,
-                )
-                clip_grad_norm_(
-                    self.vf.parameters(),
-                    max_norm=self.cfg.grad_norm_max,
-                    error_if_nonfinite=True,
-                )
-                self.vf_optimizer.step()
-                self.agent_optimizer.step()
-            except RuntimeError as ex:
-                # This seems to only trigger if the batch is so small the loss
-                # is NaN or so big we OOM.
-                # Because we checked for non-finite in grad_norm, this should
-                # reliably prevent corrupting the network, at the cost of
-                # potentially extremely slowing training on e.g. an over-fit
-                # VF or excessively off-policy data.
-                # TODO: Crash if we catch too many errors here
-                _LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
-                errors += 1
-                if errors > self.cfg.max_permitted_errors_per_train_step:
-                    raise ex
-            if self.cfg.recompute_train_inputs:
-                train_inputs = self._preprocess()
-
-        # Extra VF tuning after the primary training loop.
-        # This achieves similar objectives to PPG by simply not doing updates
-        # on the agent network in this phase.
-        # Inputs are guaranteed to be cached, since we ran at least one full
-        # epoch in the primary loop.
-        if self.cfg.vf_post_training_epochs > 0 and not timed_out:
-            timed_out = self._train_vf(
-                observation_latent_cache,
-                action_lls_cache,
-                self.cfg.vf_post_training_epochs,
-                desc="Post Training VF",
-                deadline=deadline,
-            )
-
-        # Update all the statistics.
-        self.agent_lr_scheduler.step()
-        self.vf_lr_scheduler.step()
-        self.agent.train(mode=False)
-        self.vf.train(mode=False)
-        stick.log("last_training_stats", self.last_training_stats, level=stick.RESULTS)
-        self.train_steps_so_far += 1
-
-        if timed_out:
-            _LOGGER.error("train_step() timed out")
-
-    def _train_vf(
-        self,
-        state_encodings: dict[int, torch.Tensor],
-        action_lls: dict[int, torch.Tensor],
-        training_epochs: int,
-        desc: str,
-        deadline: float,
-    ):
-        """Train just the VF using cached agent outputs.
-
-        state_encodings and action_lls are indexed by the `episode_number`
-        field of _EpisodeData, and should contain non-differentiable cached
-        components from each episode's AgentOutput.
-
-        This method does not tune the parameters of the agent.
-
-        Because this training is only tuning the memoryless VF tail, it uses
-        smaller minibatches of shuffled timesteps from across multiple
-        episodes.
-        """
-        state_enc_packed, obs_lens = pack_tensors(
-            [state_encodings[ep_data.episode_number] for ep_data in self._replay_buffer]
-        )
-        assert not state_enc_packed.requires_grad
-
-        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
-        if self.cfg.normalize_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
-        else:
-            rewards_normed = padded_rewards
-
-        action_lls_now = pad_tensors(
-            [action_lls[ep_data.episode_number] for ep_data in self._replay_buffer]
-        )
-        assert not action_lls_now.requires_grad
-
-        original_action_lls = pad_tensors(
-            [data.original_action_lls for data in self._replay_buffer]
-        )
-
-        discount = 1 - self.cfg.discount_inv
-        gammas = discount * torch.ones_like(rewards_normed)
-
-        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
-        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
-
-        with tqdm(desc=desc, total=training_epochs * sum(episode_lengths)) as pbar:
-            for epoch in range(training_epochs):
-                if (
-                    epoch == 0
-                    or epoch == training_epochs
-                    or self.cfg.vf_recompute_targets
-                ):
-                    vf_x_packed = self.vf(state_enc_packed)
-                    vf_x = pad_packed(vf_x_packed, obs_lens)
-
-                    for i, episode_length in enumerate(episode_lengths):
-                        # zero vf_{t+1} in terminated episodes
-                        if self._replay_buffer[i].terminated:
-                            vf_x[i, episode_length] = 0.0
-                            terminated[i] = True
-
-                    with torch.no_grad():
-                        _, vf_targets = _v_trace_estimation(
-                            lmbda=self.cfg.v_trace_lambda,
-                            rho_max=self.cfg.v_trace_rho_max,
-                            c_max=self.cfg.v_trace_c_max,
-                            gammas=gammas,
-                            vf_x=vf_x,
-                            rewards=rewards_normed,
-                            action_lls=action_lls_now,
-                            original_action_lls=original_action_lls,
-                            terminated=terminated,
-                            episode_lengths=torch.tensor(episode_lengths),
-                        )
-
-                    vf_targets_packed = pack_padded(vf_targets, obs_lens)
-
-                dataset = DictDataset(
-                    state_encodings=state_enc_packed, vf_targets=vf_targets_packed
-                )
-                for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
-                    self.vf_optimizer.zero_grad()
-                    vf_out = self.vf(batch["state_encodings"])
-                    vf_loss = self.cfg.vf_loss_coef * F.mse_loss(
-                        vf_out, batch["vf_targets"]
-                    )
-                    vf_loss.backward()
-                    # If we have a NaN in this update, it's probably best to
-                    # just crash, since something is very wrong with the
-                    # training run.
-                    clip_grad_norm_(
-                        self.vf.parameters(),
-                        max_norm=self.cfg.grad_norm_max,
-                        error_if_nonfinite=True,
-                    )
-                    self.vf_optimizer.step()
-                    pbar.n += len(batch["state_encodings"])
-                    pbar.refresh()
-                    if time.monotonic() > deadline:
-                        return True
-        return False
-
-    def _log_training_infos(self, train_locals: dict[str, Any]):
-        training_stats = {
-            k: train_locals[k].item()
-            for k in ["loss", "vf_loss", "ppo_loss", "kl_loss", "awr_loss"]
-            if k in train_locals
-        }
-        training_stats["clip_portion"] = train_locals["ppo_infos"]["clip_portion"]
-        training_stats["kl_mean"] = train_locals["kl_infos"]["kl_mean"]
-        training_stats["kl_max"] = train_locals["kl_infos"]["kl_max"]
-        stick.log(
-            "training_stats",
-            training_stats,
-            level=stick.INFO,
-            step=self.total_agent_grad_steps,
-        )
-        self.last_training_stats = training_stats
-
-        stick.log(
-            "train_locals",
-            train_locals,
-            level=stick.TRACE,
-            step=self.total_agent_grad_steps,
-        )
-
-    def _log_dataset(self, train_inputs: list[_PolicyTrainingInputs]):
-        full_episode_rewards = pad_tensors(
-            [data.rewards for data in self._replay_buffer]
-        )
-        t_inputs = pack_recursive(train_inputs)[0]
-        dataset_stats = {
-            "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
-            "ev": explained_variance(
-                t_inputs.vf_returns,
-                t_inputs.discounted_returns,
-            ),
-            "disc_mean": t_inputs.discounted_returns.mean(),
-            "vf_mean": t_inputs.vf_returns.mean(),
-            "vf_target_mean": t_inputs.vf_targets.mean(),
-            "total_env_steps": self.total_env_steps,
-        }
-        for k in self._replay_buffer[0].infos.keys():
-            dataset_stats[k] = force_concat(
-                data.infos[k] for data in self._replay_buffer
-            ).mean()
-
-        stick.log(
-            "dataset_stats",
-            dataset_stats,
-            level=stick.RESULTS,
-            step=self.total_env_steps,
-        )
-
-        for k in self._replay_buffer[0].infos.keys():
-            dataset_stats[k] = force_concat(
-                data.infos[k] for data in self._replay_buffer
-            )
-
-        stick.log(
-            "dataset_stats_trace",
-            dataset_stats,
-            level=stick.TRACE,
-            step=self.total_env_steps,
-        )
-
-    def _preprocess(self) -> list[_PolicyTrainingInputs]:
-        """Compute training inputs from the replay buffer and value function.
-
-        Mostly this consists of the advantages and value function
-        targets. See the _PolicyTrainingInputs class for more
-        information.
-        """
-
-        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
-        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
-        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
-
-        # Compute vf_returns
-        self.agent.train(mode=False)
-        self.vf.train(mode=False)
-        with torch.no_grad():
-            agent_outputs = self.agent([data.episode for data in self._replay_buffer])
-            state_enc_packed = pack_tensors_check(
-                [agent_out.state_encodings for agent_out in agent_outputs], obs_lens
-            )
-            vf_returns_packed = self.vf(state_enc_packed)
-        self.agent.train(mode=True)
-        self.vf.train(mode=True)
-
-        action_lls_now = pad_tensors(
-            [agent_out.action_lls for agent_out in agent_outputs]
-        )
-        original_action_lls = pad_tensors(
-            [data.original_action_lls for data in self._replay_buffer]
-        )
-        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
-
-        vf_returns = pad_packed(vf_returns_packed, obs_lens)
-        # Can't use valids mask, since vf_returns goes to t + 1
-        for i, episode_length in enumerate(episode_lengths):
-            # Everything after last valid observation should have been padded to zero
-            assert (vf_returns[i, episode_length + 1 :] == 0.0).all()
-
-            # zero vf_{t+1} in terminated episodes
-            if self._replay_buffer[i].terminated:
-                vf_returns[i, episode_length] = 0.0
-                terminated[i] = True
-
-        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
-        if self.cfg.normalize_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
-        else:
-            rewards_normed = padded_rewards
-
-        discount = 1 - self.cfg.discount_inv
-        gammas = discount * torch.ones_like(rewards_normed)
-
-        padded_advantages, vf_targets = _v_trace_estimation(
-            lmbda=self.cfg.v_trace_lambda,
-            rho_max=self.cfg.v_trace_rho_max,
-            c_max=self.cfg.v_trace_c_max,
-            gammas=gammas,
-            vf_x=vf_returns,
-            rewards=rewards_normed,
-            action_lls=action_lls_now,
-            original_action_lls=original_action_lls,
-            terminated=terminated,
-            episode_lengths=torch.tensor(episode_lengths),
-        )
-
-        adv_packed = pack_padded(padded_advantages, episode_lengths)
-        assert not adv_packed.requires_grad
-
-        if self.cfg.normalize_advantages:
-            adv_packed = adv_packed - adv_packed.mean()
-            adv_packed = adv_packed / adv_packed.std()
-
-        heated_adv = adv_packed / self.awr_temperature.detach()
-        exp_advantages = heated_adv.exp()
-
-        max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-        exp_advantages[~torch.isfinite(exp_advantages)] = 1 + max_exp_adv
-        rect_adv = exp_advantages - exp_advantages.min()
-
-        large_exp_adv = ~torch.isfinite(rect_adv) | (rect_adv > max_exp_adv)
-        clipped_exp_adv = rect_adv.clone()
-        clipped_exp_adv[large_exp_adv] = max_exp_adv
-
-        discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
-
-        train_inputs = [
-            _PolicyTrainingInputs(
-                advantages=adv,
-                discounted_returns=disc_ret,
-                vf_returns=vf_ret,
-                vf_targets=vf_target,
-                exp_advantages=exp_adv,
-            )
-            for (adv, disc_ret, vf_ret, vf_target, exp_adv) in zip(
-                unpack_tensors(adv_packed, episode_lengths),
-                unpad_tensors(discounted_returns, episode_lengths),
-                unpad_tensors(vf_returns, episode_lengths),
-                unpad_tensors(vf_targets, episode_lengths),
-                unpack_tensors(clipped_exp_adv, episode_lengths),
-            )
-        ]
-        assert len(train_inputs) == len(self._replay_buffer)
-        assert [
-            len(train_input.advantages) for train_input in train_inputs
-        ] == episode_lengths
-        assert [
-            len(train_input.discounted_returns) for train_input in train_inputs
-        ] == episode_lengths
-
-        infos = locals()
-        del infos["self"]
-        stick.log(
-            "preprocess",
-            infos,
-            level=stick.TRACE,
-            step=self.total_env_steps,
-        )
-
-        return train_inputs
-
-    def add_episode(
-        self,
-        episode: Any,
-        rewards: torch.Tensor,
-        action_lls: torch.Tensor,
-        terminated: bool,
-        action_dists: Optional[ActionDist] = None,
-        any_actions_possible: Optional[torch.Tensor] = None,
-        weight: float = 1.0,
-        infos: Optional[dict[str, torch.Tensor]] = None,
-    ):
-        """Add a new episode to the replay buffer.
-
-        Args:
-
-            episode (Any): The episode. Can be any value that the agent accepts
-                (in a list) to its forward method.
-            rewards (torch.Tensor): Float Tensor containing rewards achieved
-                after taking each action.
-            terminated (bool): True if the episode ended in a terminal state,
-                and False if the episode timed-out, was abandoned, or is still
-                ongoing.
-            action_dists (Optional[ActionDist]): Optional original action
-                distributions. Used to compute exact KL divergence and entropy
-                regularization depending on the config.
-            any_actions_possible (torch.Tensor?): Boolean Tensor indicating if any
-                actions were possible to take at this state. This allows
-                ignoring states where no action was possible (e.g. the initial
-                prompt in an LLM, or intermediate frames in a video input when
-                using frame-skip). Assumes always true if not provided.
-            weight (float): Optional weight indicating importance of the
-                episode. May be adjusted by the learner.
-            infos (Optional[dict[str,torch.Tensor]]): extra information about
-                the episode. Will be summarized and logged every training step.
-
-        """
-        assert isinstance(rewards, torch.Tensor)
-        assert isinstance(action_lls, torch.Tensor)
-        assert not action_lls.requires_grad
-        num_timesteps = len(rewards)
-        self.total_env_steps += num_timesteps
-        if any_actions_possible is None:
-            any_actions_possible = torch.ones(num_timesteps, dtype=torch.bool)
-        else:
-            assert isinstance(any_actions_possible, torch.Tensor)
-
-        rewards = rewards.to(dtype=self._dtype)
-        self.reward_normalizer.update(rewards)
-        if infos is None:
-            infos = {}
-
-        self._replay_buffer.append(
-            _EpisodeData(
-                episode,
-                episode_number=self._next_episode_number,
-                num_timesteps=num_timesteps,
-                terminated=terminated,
-                original_action_lls=action_lls.to(dtype=self._dtype),
-                original_action_dists=action_dists,
-                rewards=rewards,
-                any_actions_possible=any_actions_possible,
-                weight=weight,
-                infos=infos,
-            )
-        )
-        self._next_episode_number += 1
-
-    def add_eval_stats(self, stats: dict[str, float], primary: str):
-        assert "primary" not in stats
-        stats["primary"] = stats[primary]
-        stick.log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
-        self.primary_performance = stats[primary]
-        self.last_eval_stats = stats
-        hparams = self.cfg.to_dict()
-        hparams["metric-primary"] = stats[primary]
-        for k, v in stats.items():
-            hparams[k] = v
-        stick.log("hparams", hparams, step=self.total_env_steps)
-        _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
-
-    def state_dict(self):
-        state = {}
-        for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
-            state[k] = getattr(self, k).state_dict()
-        for k in _PARAM_FIELDS:
-            state[k] = getattr(self, k).data
-        for k, v in self.__dict__.items():
-            if (
-                k in _IGNORED_FIELDS
-                or k in _OPTIMIZER_FIELDS
-                or k in _SUBMODULE_FIELDS
-                or k in _PARAM_FIELDS
-            ):
-                continue
-            elif k == "cfg":
-                state[k] = v.to_dict()
-            elif k == "replay_buffer":
-                if self.cfg.checkpoint_replay_buffer:
-                    state[k] = v
-            else:
-                if hasattr(v, "state_dict"):
-                    _LOGGER.error(
-                        f"Field {k} was not expected to have a state_dict method"
-                    )
-                state[k] = v
-        return state
-
-    def load_state_dict(self, state_dict):
-        state = state_dict
-        for k in _PARAM_FIELDS + _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS:
-            assert k in state, f"Missing {k!r} from state dict"
-        for k, v in state.items():
-            if k in _OPTIMIZER_FIELDS:
-                # We need to handle these fields once all parameters are loaded
-                continue
-            elif k == "cfg":
-                self.cfg = type(self.cfg).from_dict(v)
-            elif k in _PARAM_FIELDS:
-                setattr(self, k, nn.Parameter(v))
-            elif k in _SUBMODULE_FIELDS:
-                getattr(self, k).load_state_dict(v)
-            else:
-                field_now = getattr(self, k, None)
-                if field_now is None:
-                    _LOGGER.error(f"Attempting to set unknown field {k}")
-                else:
-                    if hasattr(field_now, "load_state_dict"):
-                        _LOGGER.error(
-                            f"Field {k} was not expected to have a load_state_dict method"
-                        )
-                setattr(self, k, v)
-
-        # Attach all of the optimizers again
-        # This method depends cfg, and all parameter and sub-module fields
-        self._setup_optimizers()
-
-        # Now we can load the optimizer state dictionaries
-        for k in _OPTIMIZER_FIELDS:
-            getattr(self, k).load_state_dict(state[k])
-
-        # Make sure optimizers are attached to parameters
-        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
-        assert self.vf_optimizer.param_groups[0]["params"][0] is next(
-            self.vf.parameters()
-        )
-        assert self.agent_optimizer.param_groups[0]["params"][0] is next(
-            self.agent.parameters()
-        )
-
-    def maybe_checkpoint(self):
-        checkpoint_interval = (
-            self.cfg.checkpoint_interval >= 0
-            and self.train_steps_so_far - self.train_steps_so_far_at_last_checkpoint
-            >= self.cfg.checkpoint_interval
-        )
-        checkpoint_best = (
-            self.cfg.checkpoint_best
-            and self.primary_performance > self.best_checkpoint_primary_performance
-        )
-        if checkpoint_interval or checkpoint_best:
-            state_dict = self.state_dict()
-            if checkpoint_interval:
-                f_name = os.path.join(
-                    self.cfg.runs_dir,
-                    self.cfg.run_name,
-                    f"train_step_{self.train_steps_so_far}.pkl",
-                )
-                if not os.path.exists(f_name):
-                    _LOGGER.info(f"Checkpointing to {f_name!r}")
-                    with open(
-                        f_name,
-                        "wb",
-                    ) as f:
-                        pickle.dump(state_dict, f)
-                    self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
-                else:
-                    _LOGGER.info(f"Checkpoint {f_name!r} already exists")
-            if checkpoint_best:
-                f_name = os.path.join(self.cfg.runs_dir, self.cfg.run_name, f"best.pkl")
-                _LOGGER.info(f"Checkpointing to {f_name!r}")
-                with open(f_name, "wb") as f:
-                    pickle.dump(state_dict, f)
-                self.best_checkpoint_primary_performance = self.primary_performance
-            return True
-        else:
-            return False
-
-    def attempt_resume(
-        self, prefer_best: bool = False, checkpoint_dir: Optional[str] = None
-    ):
-        if checkpoint_dir is None:
-            checkpoint_dir = os.path.join(self.cfg.runs_dir, self.cfg.run_name)
-        best_ckpt = os.path.join(checkpoint_dir, "best.pkl")
-        if prefer_best and os.path.exists(best_ckpt):
-            try:
-                with open(best_ckpt, "rb") as f:
-                    state = pickle.load(f)
-                    self.load_state_dict(state)
-                    _LOGGER.critical(
-                        f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
-                    )
-                    return True
-            except (pickle.UnpicklingError, ValueError) as ex:
-                _LOGGER.error(f"Could not load {best_ckpt}: {ex}")
-        checkpoints = glob(f"{checkpoint_dir}/train_step_*.pkl")
-        with_idx = [
-            (int(f_name.rsplit("_", 1)[-1].split(".", 1)[0]), f_name)
-            for f_name in checkpoints
-        ]
-        for idx, f_name in sorted(with_idx, reverse=True):
-            try:
-                with open(f_name, "rb") as f:
-                    state = pickle.load(f)
-                    self.load_state_dict(state)
-                    _LOGGER.critical(
-                        f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
-                    )
-                    return True
-            except (pickle.UnpicklingError, ValueError) as ex:
-                _LOGGER.error(f"Could not load {f_name}: {ex}")
-        return False
 
 
 def _discount_cumsum(x: torch.Tensor, discount: float):
@@ -1750,7 +1895,6 @@ def _v_trace_estimation(
         A tuple containing:
             torch.Tensor: A 2D tensor of estimated advantages.
             torch.Tensor: A 2D tensor of VF targets.
-
     """
     # The paper says to assume rho_max >= c_max, but the math should still work
     # either way.

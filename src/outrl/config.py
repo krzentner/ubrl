@@ -1,6 +1,10 @@
-"""This module handles
-Declare configs using dataclass, and automatically handle logging and hparam tuning."""
-from dataclasses import dataclass, field, fields
+"""Utilities for interacting with config files, logging, and hyper parameter
+optimization.
+
+"""
+
+from dataclasses import dataclass
+import dataclasses
 from typing import Any, Callable, List, Optional, Type, TypeVar, Union
 import os
 import random
@@ -20,12 +24,16 @@ import yaml
 from simple_parsing.helpers.serialization import save_yaml
 from simple_parsing.helpers.serialization import load as load_yaml
 
+import outrl
+
 T = TypeVar("T")
 
 _LOGGER = logging.getLogger("outrl")
 
 
 class CustomOptunaDistribution:
+    """A custom distribution for a tunable hyper paraemter."""
+
     def sample(self, name: str, trial: optuna.Trial) -> Any:
         del name, trial
         raise NotImplementedError()
@@ -80,13 +88,13 @@ def tunable(
         metadata = {}
     metadata[_OPTUNA_DISTRIBUTION] = distribution
     if isinstance(default_val, list):
-        return field(
+        return dataclasses.field(
             default_factory=lambda: copy.deepcopy(default_val),
             **kwargs,
             metadata=metadata,
         )
     else:
-        return field(default=default_val, **kwargs, metadata=metadata)
+        return dataclasses.field(default=default_val, **kwargs, metadata=metadata)
 
 
 def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any]):
@@ -100,7 +108,7 @@ def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any])
     """
     args = dict(overrides)
     missing_k = []
-    for f in fields(config):
+    for f in dataclasses.fields(config):
         if f.name in overrides:
             trial.set_user_attr(f.name, overrides[f.name])
             continue
@@ -127,8 +135,16 @@ def default_run_name() -> str:
     return f"{file_trail}_{now}"
 
 
-def prepare_training_directory(cfg: "outrl.TrainerConfig"):
+def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str]):
     """Creates a directory for logging and sets up logging."""
+    if log_dir is not None:
+        while log_dir.endswith("/"):
+            log_dir = log_dir[:-1]
+        runs_dir, run_name = os.path.split(log_dir)
+        assert run_name
+        assert runs_dir
+        cfg = dataclasses.replace(cfg, runs_dir=runs_dir, run_name=run_name)
+
     os.makedirs(os.path.join(cfg.runs_dir, cfg.run_name), exist_ok=True)
     save_yaml(cfg, os.path.join(cfg.runs_dir, cfg.run_name, "config.yaml"))
 
@@ -149,6 +165,8 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig"):
 
         stick.add_output(ArrowOutputEngine(log_dir=cfg.runs_dir, run_name=cfg.run_name))
 
+    return cfg
+
 
 def _run_self(args):
     import __main__
@@ -158,7 +176,7 @@ def _run_self(args):
     subprocess.run(cmd, capture_output=False, check=False)
 
 
-def storage_filename_to_storage(study_storage: str):
+def _storage_filename_to_storage(study_storage: str):
     if "://" not in study_storage and study_storage.endswith(".db"):
         study_storage = os.path.abspath(study_storage)
         study_storage = f"sqlite:///{study_storage}"
@@ -183,7 +201,7 @@ def cmd_sample_config(
     else:
         overrides = {}
 
-    study_storage = storage_filename_to_storage(study_storage)
+    study_storage = _storage_filename_to_storage(study_storage)
     study = optuna.load_study(storage=study_storage, study_name=study_name)
     trial = study.ask()
     cfg = suggest_config(trial, config_type, overrides)
@@ -194,6 +212,9 @@ def cmd_sample_config(
 
 
 def cmd_report_trial(config_file: str, run_dirs: list[str]):
+    """Low-level command for manually distributing hyper-parameter optimization.
+
+    Reports performance of a config file using multiple runs."""
     with open(config_file, "r") as f:
         config_data = yaml.safe_load(f)
     trial_number = config_data["optuna_trial_number"]
@@ -227,26 +248,165 @@ def cmd_report_trial(config_file: str, run_dirs: list[str]):
         study.tell(trial_number, state=optuna.trial.TrialState.FAIL)
 
 
+def cmd_tune(
+    runs_dir: str,
+    run_name: str,
+    override_config: str,
+    study_storage: str,
+    n_trials: int,
+    fixed_seeds: list[int],
+    n_seeds_per_trial: int,
+):
+    """Runs hyper parameter tuning, assuming the current script uses the
+    standard ExperimentInvocation()."""
+    run_dir = os.path.abspath(os.path.join(runs_dir, run_name))
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Load override config
+    if override_config is not None:
+        with open(override_config, "r") as f:
+            # Load "raw" values. suggest_config will call .from_dict to
+            # decode based on the type annotations.
+            overrides = yaml.safe_load(f)
+    else:
+        overrides = {}
+
+    save_yaml(overrides, os.path.join(run_dir, "overrides.yaml"))
+
+    # Setup basic stick logging
+    stick.init_extra(log_dir=runs_dir, run_name=run_name, stderr_log_level=stick.INFO)
+    from stick.pprint_output import PPrintOutputEngine
+
+    stick.add_output(PPrintOutputEngine("stdout"))
+
+    if study_storage:
+        storage_uri = _storage_filename_to_storage(study_storage)
+    else:
+        storage_uri = f"sqlite:///{run_dir}/optuna.db"
+
+    _LOGGER.info(f"Creating study {run_name!r} in storage {storage_uri!r}")
+
+    study = optuna.create_study(
+        storage=storage_uri,
+        study_name=run_name,
+        direction="maximize",
+        load_if_exists=True,
+    )
+
+    for trial_index in range(n_trials):
+        trial = study.ask()
+        cfg = suggest_config(trial, config_type, overrides)
+        config_path = os.path.join(run_dir, f"trial_{trial_index}.yaml")
+        save_yaml(cfg, config_path)
+
+        if fixed_seeds:
+            seeds = fixed_seeds
+        else:
+            seeds = []
+
+        # Choose args.n_seeds_per_trial unique seeds less than 10k
+        max_seed = 10000
+        while len(seeds) < n_seeds_per_trial:
+            s = random.randrange(max_seed)
+            while s in seeds:
+                s = (s + 1) % max_seed
+            seeds.append(s)
+
+        seed_results = []
+        # Run a training run for each seed
+        for s in seeds:
+            sub_run_name = f"{run_name}_trial={trial_index}_seed={s}"
+            _run_self(
+                [
+                    "train",
+                    "--config",
+                    config_path,
+                    "--seed",
+                    s,
+                    "--run_name",
+                    sub_run_name,
+                    "--runs_dir",
+                    runs_dir,
+                ]
+            )
+            try:
+                eval_stats = stick.load_log_file(
+                    os.path.join(runs_dir, sub_run_name, "eval_stats.csv")
+                )
+                max_primary_stat = max(eval_stats["primary"])
+                last_primary_stat = eval_stats["primary"][-1]
+                stick.log(
+                    "seed_results",
+                    {
+                        "trial": trial_index,
+                        "seed": s,
+                        "max_primary_stat": max_primary_stat,
+                        "last_primary_stat": last_primary_stat,
+                    },
+                )
+                seed_results.append(max_primary_stat)
+            except (ValueError, FileNotFoundError):
+                pass
+        if len(seed_results) == len(seeds):
+            # Bottom quartile
+            trial_result = 0.5 * min(seed_results) + 0.5 * sum(seed_results) / len(
+                seed_results
+            )
+            study.tell(trial, trial_result, state=optuna.trial.TrialState.COMPLETE)
+        else:
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+
 class ExperimentInvocation:
     """Provides a standard command line interface to outrl launcher scripts.
 
     After construction, additional arguments can be added to the parser.
 
-    Call .run() to actually run the command specified on command line.
+    Call ExperimentInvocation.run() to actually run the command specified on
+    command line.
 
     Commands:
 
         train: Parses the config file / command line arguments and runs the
             provided train_fn to produce an agent.
+            --config path to load a config file
+            --log-dir the directory to log to (will be split into cfg.runs_dir
+                and cfg.run_name)
+            Config file values can also be overridden by passing them here.
+
         tune: Runs hparam tuning using optuna using the provided train
             function to maximize the primary_performance stat passed to
             outrl.Trainer.add_eval_stats().
+            --runs_dir Directory to keep runs in. (default: runs)
+            --run_name
+            --n_trials
+            --override-config Path to partial config file with override
+                values. Used to restrict the search space of the tuning.
+            --n-seeds-per-trial Number of seeds to run for each trial / hyper
+                pararmeter configuration. The minimum performance across these
+                seeds will be used as the overall trial performance. This
+                avoids finding hyper parameter configurations that only work
+                for one seed. (default: 2)
+            --fixed-seeds A fixed set of seeds to use for each trial. Overrides
+                --n-seeds-per-trial.
+            --study-storage (default: sqlite:///runs/optuna.db)
+
         create-study: Low-level command for manually distributing hyper
             parameter tuning. Creates a new optuna study.
+            --study-storage (default: sqlite:///runs/optuna.db)
+            --study-name
+
         sample-config: Low-level command for manually distributing hyper
             parameter tuning. Creates a new config as part of an optuna study.
+            --study-storage (default: sqlite:///runs/optuna.db)
+            --study-name
+            --override-config
+            --out-path Path to write sampled config file to.
+
         report-trial: Low-level command for manually distributing hyper
             parameter tuning. Reports results of running a trial.
+            --config Config generated by sample-config.
+            --run-dirs List of directories where experiments were run.
     """
 
     def __init__(
@@ -263,11 +423,11 @@ class ExperimentInvocation:
         subp.required = True
 
         def _train():
-            prepare_training_directory(self.args.cfg)
-            train_fn(self.args.cfg)
+            cfg = prepare_training_directory(self.args.cfg, self.args.log_dir)
+            train_fn(cfg)
 
         def _create_study():
-            study_storage = storage_filename_to_storage(self.args.study_storage)
+            study_storage = _storage_filename_to_storage(self.args.study_storage)
             optuna.create_study(storage=study_storage, study_name=self.args.study_name)
 
         def _sample_config():
@@ -283,108 +443,15 @@ class ExperimentInvocation:
             cmd_report_trial(self.args.config_file, self.args.run_dirs)
 
         def _tune():
-            runs_dir = self.args.runs_dir
-            run_name = self.args.run_name
-            run_dir = os.path.abspath(os.path.join(runs_dir, run_name))
-            os.makedirs(run_dir, exist_ok=True)
-
-            # Load override config
-            if self.args.override_config is not None:
-                with open(self.args.override_config, "r") as f:
-                    # Load "raw" values. suggest_config will call .from_dict to
-                    # decode based on the type annotations.
-                    overrides = yaml.safe_load(f)
-            else:
-                overrides = {}
-
-            save_yaml(overrides, os.path.join(run_dir, "overrides.yaml"))
-
-            # Setup basic stick logging
-            stick.init_extra(
-                log_dir=runs_dir, run_name=run_name, stderr_log_level=stick.INFO
+            cmd_tune(
+                runs_dir=self.args.runs_dir,
+                run_name=self.args.run_name,
+                override_config=self.args.override_config,
+                study_storage=self.args.study_storage,
+                n_trials=self.args.n_trials,
+                fixed_seeds=self.args.fixed_seeds,
+                n_seeds_per_trial=self.args.n_seeds_per_trial,
             )
-            from stick.pprint_output import PPrintOutputEngine
-
-            stick.add_output(PPrintOutputEngine("stdout"))
-
-            if self.args.study_storage:
-                storage_uri = storage_filename_to_storage(self.args.study_storage)
-            else:
-                storage_uri = f"sqlite:///{run_dir}/optuna.db"
-
-            _LOGGER.info(f"Creating study {run_name!r} in storage {storage_uri!r}")
-
-            study = optuna.create_study(
-                storage=storage_uri,
-                study_name=run_name,
-                direction="maximize",
-                load_if_exists=True,
-            )
-
-            for trial_index in range(self.args.n_trials):
-                trial = study.ask()
-                cfg = suggest_config(trial, config_type, overrides)
-                config_path = os.path.join(run_dir, f"trial_{trial_index}.yaml")
-                save_yaml(cfg, config_path)
-
-                if self.args.fixed_seeds:
-                    seeds = self.args.fixed_seeds
-                else:
-                    seeds = []
-
-                # Choose args.n_seeds_per_trial unique seeds less than 10k
-                max_seed = 10000
-                while len(seeds) < self.args.n_seeds_per_trial:
-                    s = random.randrange(max_seed)
-                    while s in seeds:
-                        s = (s + 1) % max_seed
-                    seeds.append(s)
-
-                seed_results = []
-                # Run a training run for each seed
-                for s in seeds:
-                    sub_run_name = f"{run_name}_trial={trial_index}_seed={s}"
-                    _run_self(
-                        [
-                            "train",
-                            "--config",
-                            config_path,
-                            "--seed",
-                            s,
-                            "--run_name",
-                            sub_run_name,
-                            "--runs_dir",
-                            runs_dir,
-                        ]
-                    )
-                    try:
-                        eval_stats = stick.load_log_file(
-                            os.path.join(runs_dir, sub_run_name, "eval_stats.csv")
-                        )
-                        max_primary_stat = max(eval_stats["primary"])
-                        last_primary_stat = eval_stats["primary"][-1]
-                        stick.log(
-                            "seed_results",
-                            {
-                                "trial": trial_index,
-                                "seed": s,
-                                "max_primary_stat": max_primary_stat,
-                                "last_primary_stat": last_primary_stat,
-                            },
-                        )
-                        seed_results.append(max_primary_stat)
-                    except (ValueError, FileNotFoundError):
-                        pass
-                if len(seed_results) == len(seeds):
-                    # Bottom quartile
-                    trial_result = 0.5 * min(seed_results) + 0.5 * sum(
-                        seed_results
-                    ) / len(seed_results)
-                    study.tell(
-                        trial, trial_result, state=optuna.trial.TrialState.COMPLETE
-                    )
-                else:
-                    study.tell(trial, state=optuna.trial.TrialState.FAIL)
 
         train_parser = subp.add_parser(
             "train",
@@ -393,13 +460,16 @@ class ExperimentInvocation:
         )
         train_parser.set_defaults(func=_train)
         train_parser.add_argument("--config", default=None, type=str)
+        train_parser.add_argument("--log-dir", default=None, type=str)
 
         # "High-level" hyper parameter tuning command
         tune_parser = subp.add_parser(
             "tune", help="Automatically tune hyper parameters"
         )
         tune_parser.set_defaults(func=_tune)
-        tune_parser.add_argument("--runs_dir", type=str, default="runs")
+        tune_parser.add_argument(
+            "--runs_dir", type=str, default="runs", help="Directory to keep runs in."
+        )
         tune_parser.add_argument(
             "--run_name", type=str, default="tune_" + default_run_name()
         )
@@ -439,21 +509,29 @@ class ExperimentInvocation:
                 """
             ),
         )
-        tune_parser.add_argument("--study-storage", type=str, default=None)
+        tune_parser.add_argument(
+            "--study-storage", type=str, default="sqlite:///runs/optuna.db"
+        )
 
         # "Low level" optuna commands. Useful for distributed hparam tuning.
         create_parser = subp.add_parser("create-study", help="Create an optuna study")
         create_parser.set_defaults(func=_create_study)
-        create_parser.add_argument("--study-storage", type=str)
+        create_parser.add_argument(
+            "--study-storage", type=str, default="sqlite:///runs/optuna.db"
+        )
         create_parser.add_argument("--study-name", type=str)
 
         sample_parser = subp.add_parser(
             "sample-config", help="Sample a new config using optuna"
         )
         sample_parser.set_defaults(func=_sample_config)
-        sample_parser.add_argument("--study-storage", type=str)
+        sample_parser.add_argument(
+            "--study-storage", type=str, default="sqlite:///runs/optuna.db"
+        )
         sample_parser.add_argument("--study-name", type=str)
-        sample_parser.add_argument("--out-path", type=str)
+        sample_parser.add_argument(
+            "--out-path", type=str, help="Path to write sampled config file to."
+        )
         sample_parser.add_argument("--override-config", type=str, default=None)
 
         report_trial = subp.add_parser(
@@ -497,6 +575,10 @@ class ExperimentInvocation:
         self.args, _ = self.parser.parse_known_args()
 
     def run(self):
+        """Runs the command provided on the command line.
+
+        Typically used to run the provided train function.
+        """
         self.args = self.parser.parse_args()
         self.args.func()
         if self.args.done_token:
