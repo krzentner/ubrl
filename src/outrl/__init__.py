@@ -27,6 +27,7 @@ from optuna.distributions import (
 )
 
 import stick
+import stick.flat_utils
 
 from outrl.torch_utils import (
     force_concat,
@@ -770,7 +771,6 @@ class Trainer:
                 # reliably prevent corrupting the network, at the cost of
                 # potentially extremely slowing training on e.g. an over-fit
                 # VF or excessively off-policy data.
-                # TODO: Crash if we catch too many errors here
                 _LOGGER.error(f"RuntimeError in agent optimizations: {ex}")
                 errors += 1
                 if errors > self.cfg.max_permitted_errors_per_train_step:
@@ -1084,6 +1084,8 @@ class Trainer:
 
         infos = locals()
         del infos["self"]
+        del infos["episode_lengths"]
+        del infos["obs_lens"]
         stick.log(
             "preprocess",
             infos,
@@ -1354,6 +1356,13 @@ class Trainer:
         assert self.agent_optimizer.param_groups[0]["params"][0] is next(
             self.agent.parameters()
         )
+
+    def stick_preprocess(self, key, dst):
+        """Flatten fields for the stick logging library."""
+        for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS + _PARAM_FIELDS:
+            stick.flat_utils.flatten(getattr(self, k), f"{key}.{k}", dst)
+        for k, v in self.__dict__.items():
+            stick.flat_utils.flatten(v, f"{key}.{k}", dst)
 
 
 class Agent(nn.Module):
@@ -1753,7 +1762,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Note that this is not used in the PPO loss.
     """
 
-    advantage_clip: float = tunable(12.0, FloatDistribution(0.1, 20.0))
+    advantage_clip: float = tunable(8.0, FloatDistribution(0.1, 8.0))
     """Max exponent value for advantages in AWR loss.
 
     Large values can lead to NaN errors.
@@ -1921,8 +1930,6 @@ def _v_trace_estimation(
 
     gamma_c = gammas * c
 
-    # TODO: Do we need a (1 - lmbda) on the right here? Double-check the math.
-    # I don't think we do, since we recursive
     delta_V = rho * (rewards + gammas * vf_x[:, 1:] - vf_x[:, :-1])
 
     # In the paper: v_{s_t} - V(x_t)
