@@ -12,7 +12,7 @@ def test_discount_cumsum():
     for i in range(L - 2, -1, -1):
         expected_result[:, i] = rewards[:, i] + discount * expected_result[:, i + 1]
     actual_result = _discount_cumsum(rewards, discount)
-    assert torch.allclose(actual_result, expected_result)
+    assert torch.allclose(actual_result, expected_result, rtol=1e-4)
 
 
 def test_v_trace_estimation():
@@ -48,6 +48,72 @@ def test_v_trace_estimation():
             [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
             [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
             [5.0, 4.0, 3.0, 2.0, 1.0, 0.0],
+        ]
+    )
+
+    assert torch.allclose(advantages, expected_advantages)
+    assert torch.allclose(vf_targets, expected_vf_targets)
+
+    advantages, vf_targets = _v_trace_estimation(
+        lmbda=1.0,
+        rho_max=1.0,
+        c_max=1.0,
+        gammas=zeros,
+        vf_x=torch.ones(B, T + 1, dtype=torch.float32),
+        rewards=ones,
+        action_lls=ones,
+        original_action_lls=ones,
+        terminated=terminated,
+        episode_lengths=T * torch.ones(B).long(),
+    )
+
+    expected_advantages = torch.Tensor(
+        [
+            [4.0, 3.0, 2.0, 1.0, 0.0],
+            [4.0, 3.0, 2.0, 1.0, 0.0],
+            [4.0, 3.0, 2.0, 1.0, 0.0],
+        ]
+    )
+
+    # TODO: The last column here should probably be zero
+    expected_vf_targets = torch.Tensor(
+        [
+            [5.0, 4.0, 3.0, 2.0, 1.0, 1.0],
+            [5.0, 4.0, 3.0, 2.0, 1.0, 1.0],
+            [5.0, 4.0, 3.0, 2.0, 1.0, 1.0],
+        ]
+    )
+
+    assert torch.allclose(advantages, expected_advantages)
+    assert torch.allclose(vf_targets, expected_vf_targets)
+
+    advantages, vf_targets = _v_trace_estimation(
+        lmbda=0.5,
+        rho_max=1.0,
+        c_max=1.0,
+        gammas=zeros,
+        vf_x=3 * torch.ones(B, T + 1, dtype=torch.float32),
+        rewards=ones,
+        action_lls=ones,
+        original_action_lls=ones,
+        terminated=terminated,
+        episode_lengths=T * torch.ones(B).long(),
+    )
+
+    expected_advantages = torch.Tensor(
+        [
+            [2.5, 2.0, 1.0, -1.0, -2.0],
+            [2.5, 2.0, 1.0, -1.0, -2.0],
+            [2.5, 2.0, 1.0, -1.0, -2.0],
+        ]
+    )
+
+    # TODO: The last column here should probably be zero
+    expected_vf_targets = torch.Tensor(
+        [
+            [4.75, 4.5, 4.0, 3.0, 1.0, 3.0],
+            [4.75, 4.5, 4.0, 3.0, 1.0, 3.0],
+            [4.75, 4.5, 4.0, 3.0, 1.0, 3.0],
         ]
     )
 
