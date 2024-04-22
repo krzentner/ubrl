@@ -677,11 +677,11 @@ class Trainer:
         All options for tuning this method are present in the TrainerConfig
         passed on Trainer initialization.
         """
-        if len(self._replay_buffer) > self.cfg.max_buffer_episodes:
+        if len(self._replay_buffer) > self.cfg.replay_buffer_episodes:
             self._replay_buffer = list(
-                self._replay_buffer[-self.cfg.max_buffer_episodes :]
+                self._replay_buffer[-self.cfg.replay_buffer_episodes :]
             )
-            assert len(self._replay_buffer) == self.cfg.max_buffer_episodes
+            assert len(self._replay_buffer) == self.cfg.replay_buffer_episodes
 
         errors = 0
         start_time = time.monotonic()
@@ -1475,7 +1475,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Log level to log to TensorBoard. Defaults to INFO to avoid slowing down
     TensorBoard with too many keys."""
 
-    max_buffer_episodes: int = 128
+    replay_buffer_episodes: int = 128
     """Maximum number of episodes to keep in replay buffer."""
 
     max_timesteps_per_forward: Optional[int] = None
