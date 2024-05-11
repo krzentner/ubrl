@@ -25,10 +25,18 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 
+dependencies = [
+  "tqdm",
+  "optuna>=3.5.0",
+  "simple-parsing>=0.1.5",
+  "torch>=2.0",
+]
+
 [project.urls]
 "Homepage" = "https://github.com/krzentner/outrl"
 "Bug Reports" = "https://github.com/krzentner/outrl/issues"
 "Source" = "https://github.com/krzentner/outrl"
+
 
 # Below is poetry setup for developing this package
 [tool.poetry.dependencies]

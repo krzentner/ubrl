@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Any, Optional, TypeVar, Generator, Literal
+from typing import Any, Optional, TypeVar, Generator, Literal, Union
 import os
 import random
 import warnings
@@ -27,9 +27,10 @@ from optuna.distributions import (
 )
 
 import stick
-import stick.flat_utils
 
 from outrl.torch_utils import (
+    approx_entropy_of,
+    entropy_of,
     force_concat,
     make_mlp,
     pack_recursive,
@@ -45,8 +46,8 @@ from outrl.torch_utils import (
     make_scheduler,
     DictDataset,
     ActionDist,
-    kl_div,
-    approx_kl_div,
+    kl_div_of,
+    approx_kl_div_of,
     used_for_logging,
 )
 from outrl.config import tunable, IntListDistribution, default_run_name
@@ -179,6 +180,7 @@ _OPTIMIZER_FIELDS = [
     "agent_lr_scheduler",
     "kl_coef_opt",
     "awr_temperature_opt",
+    "entropy_coef_opt",
 ]
 
 _SUBMODULE_FIELDS = [
@@ -190,6 +192,7 @@ _SUBMODULE_FIELDS = [
 _PARAM_FIELDS = [
     "kl_coef",
     "awr_temperature",
+    "entropy_coef",
 ]
 
 _IGNORED_FIELDS = ["_is_full_backward_hook"]
@@ -277,10 +280,19 @@ class Trainer:
         )
         """Dynamically adjusted parameter used for KL regularization."""
 
+        self.entropy_coef: nn.Parameter = nn.Parameter(
+            torch.tensor(0.0)
+        )
+        """Dynamically adjusted parameter used for entropy enforcing."""
+
         self.awr_temperature: nn.Parameter = nn.Parameter(
             torch.tensor(float(self.cfg.temperature_init))
         )
         """Dynamically adjusted parameter used for temperature in the AWR loss."""
+
+        self.starting_entropy: Optional[float] = None
+        """Initial mean entropy of action distributions, measured immediately
+        at the start of cfg.entropy_schedule_start_train_step."""
 
         self._replay_buffer: list[_EpisodeData] = []
         self._next_episode_number: int = 0
@@ -326,6 +338,9 @@ class Trainer:
         self.awr_temperature_opt = torch.optim.AdamW(
             [self.awr_temperature], lr=self.cfg.temperature_lr
         )
+        self.entropy_coef_opt = torch.optim.AdamW(
+            [self.entropy_coef], lr=self.cfg.entropy_coef_lr
+        )
 
         self.total_agent_grad_steps = 0
 
@@ -350,6 +365,8 @@ class Trainer:
 
         kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
 
+        entropy_loss, entropy_infos = self._entropy_loss(episode_data, train_inputs, agent_outputs)
+
         ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
 
         awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, agent_outputs)
@@ -358,10 +375,11 @@ class Trainer:
 
         vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, agent_outputs)
 
-        loss = ppo_loss + awr_loss + vf_loss + kl_loss
+        loss = ppo_loss + awr_loss + vf_loss + kl_loss + entropy_loss
 
-        # kl_infos, vf_infos, and ppo_infos will all get included in locals
-        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos)
+        # *_infos will all get included in locals of this method
+        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos,
+                         entropy_infos)
         return loss, locals()
 
     def _ppo_loss(
@@ -496,7 +514,7 @@ class Trainer:
 
         # Approximate per-timestep KL by multiplying back in the number of timesteps
         total_timesteps = sum(lengths)
-        approx_kl = total_timesteps * approx_kl_div(old_log_probs, log_probs)
+        approx_kl = total_timesteps * approx_kl_div_of(old_log_probs, log_probs)
         total_approx_kl = approx_kl.sum()
         used_for_logging(total_approx_kl)
 
@@ -507,7 +525,7 @@ class Trainer:
             old_dists = [ep_data.original_action_dists for ep_data in episode_data]
             assert old_dists[0] is not None
             # TODO: Add options for other KL directions
-            kl = kl_div(old_dists, new_dists)
+            kl = kl_div_of(old_dists, new_dists)
         else:
             kl = approx_kl
 
@@ -541,12 +559,92 @@ class Trainer:
 
         norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
 
+        # Gradient will be dL/dKL / (KL + 1) (less sensitive to
+        # outliers)
+        # Some approx KL values can be negative, so use the proper
+        # symlog
         kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
+
         kl_loss_scaled = norm_coef * kl_symlog.sum()
         infos = locals()
         del infos["lengths"]
         del infos["self"]
         return kl_loss_scaled, infos
+
+    def _entropy_target(self) -> Optional[float]:
+        if self.starting_entropy is not None and self.cfg.entropy_schedule == "linear":
+            # 1 at cfg.entropy_schedule_start_train_step
+            # 0 at (and after) cfg.expected_train_steps
+            step_fraction = max(0,
+                                  1 - (self.train_steps_so_far - self.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.entropy_schedule_start_train_step))
+            assert step_fraction >= 0
+            assert step_fraction <= 1
+            final_target_entropy = self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            target = step_fraction * self.starting_entropy + (1 - step_fraction) * final_target_entropy
+            return target
+        else:
+            return None
+
+    def _entropy_loss(
+        self,
+        episode_data: list[_EpisodeData],
+        train_inputs: list[_PolicyTrainingInputs],
+        agent_outputs: list["AgentOutput"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        approx_entropy, entropy = self._entropy_of(
+            [agent_out.action_lls for agent_out in agent_outputs],
+            [agent_out.action_dists for agent_out in agent_outputs])
+        entropy_target = self._entropy_target()
+        if entropy_target is not None:
+
+            # Tune temperature
+            exp_adv = torch.cat([train_input.exp_advantages for train_input in train_inputs])
+            temperature_loss = (self.awr_temperature * entropy_target + self.awr_temperature * torch.log(exp_adv.mean()))
+            temperature_loss_norm = temperature_loss * len(exp_adv) / self.cfg.minibatch_target_timesteps
+            self.awr_temperature_opt.zero_grad()
+            temperature_loss_norm.backward()
+            self.awr_temperature_opt.step()
+
+            if self.awr_temperature < self.cfg.temperature_min:
+                with torch.no_grad():
+                    self.awr_temperature.copy_(self.cfg.temperature_min)
+            if self.awr_temperature > self.cfg.temperature_max or not torch.isfinite(self.awr_temperature):
+                with torch.no_grad():
+                    self.awr_temperature.copy_(self.cfg.temperature_max)
+
+            # Tune entropy_coef
+            entropy_coef_loss = self.entropy_coef * (entropy_target - entropy.detach().mean())
+            self.entropy_coef_opt.zero_grad()
+            entropy_coef_loss.backward()
+            self.entropy_coef_opt.step()
+
+            if self.entropy_coef < self.cfg.entropy_coef_min:
+                with torch.no_grad():
+                    self.entropy_coef.copy_(self.cfg.entropy_coef_min)
+            if self.entropy_coef > self.cfg.entropy_coef_max:
+                with torch.no_grad():
+                    self.entropy_coef.copy_(self.cfg.entropy_coef_max)
+            # Unclear why entropy_coef became non-finite, so set back
+            # to zero
+            if not torch.isfinite(self.entropy_coef):
+                with torch.no_grad():
+                    self.entropy_coef.copy_(0.0)
+
+            entropy_coef = self.entropy_coef.detach()
+            norm_coef = entropy_coef / self.cfg.minibatch_target_timesteps
+            entropy_diff = entropy - entropy_target
+
+            # We want to decrease the difference, so don't multiply in
+            # the symlog sign.
+            entropy_diff_symlog = torch.log(entropy_diff.abs() + 1)
+            entropy_loss = norm_coef * entropy_diff_symlog.sum()
+        else:
+            entropy_loss = torch.tensor(0.0)
+
+        used_for_logging(approx_entropy)
+        infos = locals()
+        del infos["self"]
+        return entropy_loss, infos
 
     def _agent_minibatches(
         self,
@@ -682,6 +780,7 @@ class Trainer:
                 self._replay_buffer[-self.cfg.replay_buffer_episodes :]
             )
             assert len(self._replay_buffer) == self.cfg.replay_buffer_episodes
+        self._maybe_record_starting_entropy()
 
         errors = 0
         start_time = time.monotonic()
@@ -797,8 +896,9 @@ class Trainer:
         self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
         self.vf.train(mode=False)
-        stick.log("last_training_stats", self._last_training_stats, level=stick.RESULTS)
+        stick.log_row("last_training_stats", self._last_training_stats, level=stick.RESULTS)
         self.train_steps_so_far += 1
+        self._maybe_record_starting_entropy()
 
         if timed_out:
             _LOGGER.error("train_step() timed out")
@@ -916,7 +1016,7 @@ class Trainer:
         training_stats["clip_portion"] = train_locals["ppo_infos"]["clip_portion"]
         training_stats["kl_mean"] = train_locals["kl_infos"]["kl_mean"]
         training_stats["kl_max"] = train_locals["kl_infos"]["kl_max"]
-        stick.log(
+        stick.log_row(
             "training_stats",
             training_stats,
             level=stick.INFO,
@@ -924,7 +1024,7 @@ class Trainer:
         )
         self._last_training_stats = training_stats
 
-        stick.log(
+        stick.log_row(
             "train_locals",
             train_locals,
             level=stick.TRACE,
@@ -952,7 +1052,7 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             ).mean()
 
-        stick.log(
+        stick.log_row(
             "dataset_stats",
             dataset_stats,
             level=stick.RESULTS,
@@ -964,7 +1064,7 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             )
 
-        stick.log(
+        stick.log_row(
             "dataset_stats_trace",
             dataset_stats,
             level=stick.TRACE,
@@ -1041,7 +1141,7 @@ class Trainer:
         adv_packed = pack_padded(padded_advantages, episode_lengths)
         assert not adv_packed.requires_grad
 
-        if self.cfg.normalize_advantages:
+        if self.cfg.normalize_awr_advantages:
             adv_packed = adv_packed - adv_packed.mean()
             adv_packed = adv_packed / adv_packed.std()
 
@@ -1049,7 +1149,8 @@ class Trainer:
         exp_advantages = heated_adv.exp()
 
         max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-        exp_advantages[~torch.isfinite(exp_advantages)] = 1 + max_exp_adv
+        exp_advantages_clip_mask = ~torch.isfinite(exp_advantages)
+        exp_advantages[exp_advantages_clip_mask] = 1 + max_exp_adv
         rect_adv = exp_advantages - exp_advantages.min()
 
         large_exp_adv = ~torch.isfinite(rect_adv) | (rect_adv > max_exp_adv)
@@ -1086,7 +1187,7 @@ class Trainer:
         del infos["self"]
         del infos["episode_lengths"]
         del infos["obs_lens"]
-        stick.log(
+        stick.log_row(
             "preprocess",
             infos,
             level=stick.TRACE,
@@ -1174,14 +1275,14 @@ class Trainer:
         """
         assert "primary" not in stats
         stats["primary"] = stats[primary]
-        stick.log("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
+        stick.log_row("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats
         hparams = self.cfg.to_dict()
         hparams["metric-primary"] = stats[primary]
         for k, v in stats.items():
             hparams[k] = v
-        stick.log("hparams", hparams, step=self.total_env_steps)
+        stick.log_row("hparams", hparams, step=self.total_env_steps)
         _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
 
     def attempt_resume(
@@ -1357,12 +1458,48 @@ class Trainer:
             self.agent.parameters()
         )
 
-    def stick_preprocess(self, key, dst):
-        """Flatten fields for the stick logging library."""
-        for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS + _PARAM_FIELDS:
-            stick.flat_utils.flatten(getattr(self, k), f"{key}.{k}", dst)
-        for k, v in self.__dict__.items():
-            stick.flat_utils.flatten(v, f"{key}.{k}", dst)
+    def _entropy_of(self,
+                    action_lls: list[torch.Tensor],
+                    action_dists: list[ActionDist]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Computes the approximate entropy (and exact entropy, if possible).
+        """
+        approx_entropy = approx_entropy_of(torch.cat(
+            action_lls))
+        entropy = None
+        if not self.cfg.use_approx_entropy:
+            try:
+                if None not in action_dists:
+                    entropy = entropy_of(action_dists)
+                # Mixed case is warned on add_episode()
+            except NotImplementedError:
+                pass
+        if entropy is None:
+            entropy = approx_entropy
+        return approx_entropy, entropy
+
+    def _maybe_record_starting_entropy(self):
+        """Record starting_etropy if train_steps_so_far >= cfg.entropy_schedule_start_train_step.
+        """
+        if self.starting_entropy is None and self.train_steps_so_far >= self.cfg.entropy_schedule_start_train_step:
+
+            original_action_lls = [ep_data.original_action_lls
+                                   for ep_data in self._replay_buffer]
+            original_dists = [ep_data.original_action_dists
+                              for ep_data in self._replay_buffer]
+            approx_entropy, entropy = self._entropy_of(
+                original_action_lls, original_dists)
+            del approx_entropy
+            self.starting_entropy = entropy.mean().item()
+
+
+@stick.declare_summarizer(Trainer)
+def summarize_trainer(trainer, key, dst):
+    """Summarize fields for the stick logging library."""
+    for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS + _PARAM_FIELDS:
+        stick.summarize(getattr(trainer, k), f"{key}.{k}", dst)
+    for k, v in trainer.__dict__.items():
+        stick.summarize(v, f"{key}.{k}", dst)
 
 
 class Agent(nn.Module):
@@ -1487,6 +1624,7 @@ class TrainerConfig(simple_parsing.Serializable):
 
     minibatch_target_timesteps: int = tunable(64, IntDistribution(1, 50000, log=True))
     """Attempt to keep timesteps in each minibatch to this number of timesteps.
+    In practice, this acts a divisor on most losses.
 
     Will still run whole episodes if they exceed this cap.
     """
@@ -1516,7 +1654,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Loss coefficient for the main RL loss. Usually does not need to be
     tuned."""
 
-    agent_lr_schedule: Optional[str] = tunable(
+    agent_lr_schedule: Literal[None, "linear"] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
     """Learning rate schedule for the agent. Typically used to decrease the
@@ -1541,7 +1679,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Because OutRL uses regularized VF training, VF clipping is not used.
     """
 
-    vf_lr_schedule: Optional[str] = tunable(
+    vf_lr_schedule: Literal[None, "linear"] = tunable(
         "linear", CategoricalDistribution([None, "linear"])
     )
     """Learning rate schedule for the value function parameters. Typically used
@@ -1736,26 +1874,88 @@ class TrainerConfig(simple_parsing.Serializable):
     """Approximate the action entropy using action log-likelihoods even if
     exact action distributions are provided by the agent."""
 
-    entropy_target: float = tunable(-10.0, FloatDistribution(-100.0, 0.0))
-    # TODO: Should this be in mean log-likelihood or entropy?
+    entropy_schedule: Optional[Literal["linear"]] = None
+    """Whether to schedule an entropy loss.
+
+    With None, no entropy schedule will be applied, and entropy_coef_init will
+    be used throughout training.
+
+    With "linear", entropy will be scaled down from the initial entropy at
+    start of training to a fraction of that `entropy_schedule_end_fraction`.
+    """
+
+    entropy_schedule_end_fraction: float = tunable(0.1, FloatDistribution(0.0, 1.0))
+    """Portion of "starting entropy" to attempt to maintain at end of
+    training."""
+
+    entropy_schedule_start_train_step: int = 1
+    """Train step at which to measure the "starting entropy".
+
+    This indicates at the end of which train step entropy should be measured.
+    The default value measures the entropy after one train step.
+    """
+
+    entropy_coef_init: float = tunable(0.01, FloatDistribution(0, 1.0))
+    """Entropy regularizer coefficient.
+
+    Will be adjusted by the entropy schedule if entropy_schedule is set.
+
+    If both entropy_coef_init and entropy_coef_lr are 0, entropy regularization
+    is disabled.
+    """
+
+    entropy_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
+    """How quickly to adapt the loss coefficient for the entropy regularizer.
+
+    If set to 0, the entropy regularization coefficient will not be tuned
+    during training.
+    """
+
+    entropy_coef_min: float = tunable(-1, FloatDistribution(-100, 0))
+    """Minimum value for the loss coefficient of the entropy regularizer.
+
+    Negative values actively decrease the entropy.
+    """
+
+    entropy_coef_max: float = tunable(10, FloatDistribution(0, 100))
+    """Maximum value for the loss coefficient of the entropy regularizer.
+    """
 
     temperature_init: float = tunable(1.0, FloatDistribution(1e-2, 1e3, log=True))
     """Initial AWR temperature. If temperature_lr is 0, this value will be used
-    throughout training."""
+    throughout training.
+
+    Very low values result in a sparse loss that only attempts to repeat
+    very high-advantage actions.
+
+    High values cause the AWR loss to ignore advantages and just perform
+    behavioral cloning.
+    """
 
     temperature_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
-    """How quickly to tune the AWR temperature."""
+    """How quickly to tune the AWR temperature.
+
+    The temperature is tuned to follow the entropy schedule and complements
+    entropy regularization. If set to 0, the temperature will not be adjusted
+    during training.
+    """
 
     temperature_min: float = tunable(0.05, FloatDistribution(0.0, 1.0))
     """Minimum AWR temperature. Small values exponentially increase the AWR
-    loss. Limits of numerical precision make very low values impractical."""
+    loss.
 
-    temperature_max: float = tunable(100, FloatDistribution(0.1, 1e5, log=True))
-    """Maximum AWR temperature. Large values cause the AWR loss to ignore
-    advantages and just perform behavioral cloning.
+    Very low values result in a sparse loss that only attempts to repeat
+    very high-advantage actions.
     """
 
-    normalize_advantages: bool = tunable(True, CategoricalDistribution([False, True]))
+    # Does this parameter need to exist? Seems kinda useless
+    temperature_max: float = tunable(100, FloatDistribution(0.1, 1e5, log=True))
+    """Maximum AWR temperature. Large temperature values cause the
+    AWR loss to ignore advantages and just perform behavioral
+    cloning.
+    """
+
+    normalize_awr_advantages: bool = tunable(True, CategoricalDistribution([False, True]))
     """Whether to normalize the advantages across the batch before computing
     the AWR coefficients.
 

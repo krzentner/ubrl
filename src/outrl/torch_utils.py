@@ -574,14 +574,20 @@ def split_shuffled_indices(
     return indices[:split_i], indices[split_i:]
 
 
-def approx_kl_div(P_lls: torch.Tensor, Q_lls: torch.Tensor) -> torch.Tensor:
+def approx_entropy_of(P_lls: torch.Tensor) -> torch.Tensor:
+    """Apprxoimate the entropy from log likelihoods."""
+    Px = P_lls.exp()
+    return -(Px * P_lls)
+
+
+def approx_kl_div_of(P_lls: torch.Tensor, Q_lls: torch.Tensor) -> torch.Tensor:
     """A simpler alternative to calling torch.nn.functional.kl_div with the
     arguments in opposite order and the log_target flag set."""
     Px = P_lls.exp()
     return Px * (P_lls - Q_lls)
 
 
-def kl_div(
+def kl_div_of(
     p_dist: Union[ActionDist, list[ActionDist]],
     q_dist: Union[ActionDist, list[ActionDist]],
 ) -> torch.Tensor:
@@ -601,13 +607,35 @@ def kl_div(
     if isinstance(p_dist, list):
         assert isinstance(q_dist, list)
         assert len(p_dist) == len(q_dist)
-        return torch.cat([kl_div(p, q) for (p, q) in zip(p_dist, q_dist)])
+        return torch.cat([kl_div_of(p, q) for (p, q) in zip(p_dist, q_dist)])
     elif isinstance(p_dist, torch.distributions.Distribution):
         assert isinstance(q_dist, torch.distributions.Distribution)
         return torch.distributions.kl.kl_divergence(p_dist, q_dist)
     else:
         # Presumably implements the CustomTorchDist API
         return p_dist.kl_div(q_dist)
+
+
+def entropy_of(
+    p_dist: Union[ActionDist, list[ActionDist]],
+) -> torch.Tensor:
+    """Compute the KL divergence for each timestep in p_dist and q_dist.
+
+    p_dist and q_dist can be lists of per-timestep action distributions, or a
+    single distribution with a timestep batch dimension.
+
+    The distribution can either be a torch.distributions.Distribution, or any
+    other object that implements a self.kl_div(other) method, as shown in the
+    CustomTorchDist class.
+
+    The return value of this function should be differentiable back to
+    parameters.
+    """
+
+    if isinstance(p_dist, list):
+        return torch.cat([entropy_of(p) for p in p_dist])
+    else:
+        return p_dist.entropy()
 
 
 def force_concat(elements: Sequence[torch.Tensor]) -> torch.Tensor:
