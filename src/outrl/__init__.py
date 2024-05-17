@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import Any, Optional, TypeVar, Generator, Literal, Union
+from typing import Any, Optional, TypeVar, Generator, Literal
 import os
 import random
 import warnings
@@ -12,6 +12,7 @@ import logging
 import pickle
 from glob import glob
 import time
+import math
 
 import torch
 import torch.nn as nn
@@ -29,7 +30,6 @@ from optuna.distributions import (
 import stick
 
 from outrl.torch_utils import (
-    approx_entropy_of,
     entropy_of,
     force_concat,
     make_mlp,
@@ -565,22 +565,31 @@ class Trainer:
         # symlog
         kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
 
-        kl_loss_scaled = norm_coef * kl_symlog.sum()
+        kl_loss_scaled = (norm_coef * kl_symlog).sum()
         infos = locals()
         del infos["lengths"]
         del infos["self"]
         return kl_loss_scaled, infos
 
     def _entropy_target(self) -> Optional[float]:
-        if self.starting_entropy is not None and self.cfg.entropy_schedule == "linear":
-            # 1 at cfg.entropy_schedule_start_train_step
-            # 0 at (and after) cfg.expected_train_steps
-            step_fraction = max(0,
-                                  1 - (self.train_steps_so_far - self.cfg.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.cfg.entropy_schedule_start_train_step))
+        if self.starting_entropy is not None:
+            # 0 at cfg.entropy_schedule_start_train_step
+            # 1 at (and after) cfg.expected_train_steps
+            step_fraction = min(1,
+                                  ((1 + self.train_steps_so_far) - self.cfg.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.cfg.entropy_schedule_start_train_step))
             assert step_fraction >= 0
             assert step_fraction <= 1
-            final_target_entropy = self.cfg.entropy_schedule_end_fraction * self.starting_entropy
-            target = step_fraction * self.starting_entropy + (1 - step_fraction) * final_target_entropy
+            final_entropy = self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            if self.cfg.entropy_schedule == "linear":
+                mix = step_fraction
+            elif self.cfg.entropy_schedule == "cosine":
+                # Cosine curve from 1 to 0
+                mix = 0.5 * (1 + math.cos(step_fraction * math.pi))
+            else:
+                raise NotImplementedError(f"Unknown entropy schedule {self.cfg.entropy_schedule}")
+            assert mix >= 0
+            assert mix <= 1
+            target = (1 - mix) * self.starting_entropy + mix * final_entropy
             return target
         else:
             return None
@@ -632,12 +641,7 @@ class Trainer:
 
             entropy_coef = self.entropy_coef.detach()
             norm_coef = entropy_coef / self.cfg.minibatch_target_timesteps
-            entropy_diff = entropy - entropy_target
-
-            # We want to decrease the difference, so don't multiply in
-            # the symlog sign.
-            entropy_diff_symlog = torch.log(entropy_diff.abs() + 1)
-            entropy_loss = norm_coef * entropy_diff_symlog.sum()
+            entropy_loss = (norm_coef * entropy).sum()
         else:
             entropy_loss = torch.tensor(0.0)
 
@@ -1464,14 +1468,13 @@ class Trainer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes the approximate entropy (and exact entropy, if possible).
         """
-        approx_entropy = approx_entropy_of(torch.cat(
-            action_lls))
+        approx_entropy = -torch.cat(action_lls)
         entropy = None
         if not self.cfg.use_approx_entropy:
             try:
+                # Mixed case is warned on add_episode()
                 if None not in action_dists:
                     entropy = entropy_of(action_dists)
-                # Mixed case is warned on add_episode()
             except NotImplementedError:
                 pass
         if entropy is None:
@@ -1874,7 +1877,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Approximate the action entropy using action log-likelihoods even if
     exact action distributions are provided by the agent."""
 
-    entropy_schedule: Literal[None, "linear"] = None
+    entropy_schedule: Literal[None, "linear", "cosine"] = None
     """Whether to schedule an entropy loss.
 
     With None, no entropy schedule will be applied, and entropy_coef_init will
@@ -1904,14 +1907,14 @@ class TrainerConfig(simple_parsing.Serializable):
     is disabled.
     """
 
-    entropy_coef_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
+    entropy_coef_lr: float = tunable(0.001, FloatDistribution(1e-5, 0.01, log=True))
     """How quickly to adapt the loss coefficient for the entropy regularizer.
 
     If set to 0, the entropy regularization coefficient will not be tuned
     during training.
     """
 
-    entropy_coef_min: float = tunable(-1, FloatDistribution(-100, 0))
+    entropy_coef_min: float = tunable(-10, FloatDistribution(-100, 0))
     """Minimum value for the loss coefficient of the entropy regularizer.
 
     Negative values actively decrease the entropy.
