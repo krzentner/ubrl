@@ -1,0 +1,10 @@
+-c requirements.txt
+pdoc
+pytest
+py-spy
+pytest
+ipdb
+gymnasium
+optuna-dashboard
+tensorboardX
+pip-tools

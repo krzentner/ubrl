@@ -1,0 +1,4 @@
+tqdm>=4.0
+optuna>=3.5.0
+simple-parsing>=0.1.5
+kogiri>=0.2.0
