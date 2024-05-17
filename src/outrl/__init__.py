@@ -576,7 +576,7 @@ class Trainer:
             # 1 at cfg.entropy_schedule_start_train_step
             # 0 at (and after) cfg.expected_train_steps
             step_fraction = max(0,
-                                  1 - (self.train_steps_so_far - self.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.entropy_schedule_start_train_step))
+                                  1 - (self.train_steps_so_far - self.cfg.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.cfg.entropy_schedule_start_train_step))
             assert step_fraction >= 0
             assert step_fraction <= 1
             final_target_entropy = self.cfg.entropy_schedule_end_fraction * self.starting_entropy
@@ -1460,7 +1460,7 @@ class Trainer:
 
     def _entropy_of(self,
                     action_lls: list[torch.Tensor],
-                    action_dists: list[ActionDist]
+                    action_dists: list[Optional[ActionDist]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes the approximate entropy (and exact entropy, if possible).
         """
@@ -1874,7 +1874,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Approximate the action entropy using action log-likelihoods even if
     exact action distributions are provided by the agent."""
 
-    entropy_schedule: Optional[Literal["linear"]] = None
+    entropy_schedule: Literal[None, "linear"] = None
     """Whether to schedule an entropy loss.
 
     With None, no entropy schedule will be applied, and entropy_coef_init will
@@ -1904,7 +1904,7 @@ class TrainerConfig(simple_parsing.Serializable):
     is disabled.
     """
 
-    entropy_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
+    entropy_coef_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
     """How quickly to adapt the loss coefficient for the entropy regularizer.
 
     If set to 0, the entropy regularization coefficient will not be tuned
@@ -1932,7 +1932,7 @@ class TrainerConfig(simple_parsing.Serializable):
     behavioral cloning.
     """
 
-    temperature_lr: float = tunable(0.01, FloatDistribution(1e-4, 1.0, log=True))
+    temperature_lr: float = tunable(0.0, FloatDistribution(0, 0.1))
     """How quickly to tune the AWR temperature.
 
     The temperature is tuned to follow the entropy schedule and complements

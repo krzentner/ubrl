@@ -575,7 +575,7 @@ def split_shuffled_indices(
 
 
 def approx_entropy_of(P_lls: torch.Tensor) -> torch.Tensor:
-    """Apprxoimate the entropy from log likelihoods."""
+    """Approximate the entropy from log likelihoods."""
     Px = P_lls.exp()
     return -(Px * P_lls)
 
