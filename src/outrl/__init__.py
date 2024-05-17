@@ -584,7 +584,7 @@ class Trainer:
                 mix = step_fraction
             elif self.cfg.entropy_schedule == "cosine":
                 # Cosine curve from 1 to 0
-                mix = 0.5 * (1 + math.cos(step_fraction * math.pi))
+                mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
             else:
                 raise NotImplementedError(f"Unknown entropy schedule {self.cfg.entropy_schedule}")
             assert mix >= 0
