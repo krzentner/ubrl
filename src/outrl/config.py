@@ -16,7 +16,7 @@ import subprocess
 import logging
 from pprint import pprint
 
-import stick
+import kogiri
 import optuna
 import argparse
 import simple_parsing
@@ -148,22 +148,24 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str
     os.makedirs(os.path.join(cfg.runs_dir, cfg.run_name), exist_ok=True)
     save_yaml(cfg, os.path.join(cfg.runs_dir, cfg.run_name, "config.yaml"))
 
-    # stick will handle seeding for us
-    stick.init_extra(
-        log_dir=cfg.runs_dir,
+    # kogiri will handle seeding for us
+    kogiri.init_extra(
+        runs_dir=cfg.runs_dir,
         run_name=cfg.run_name,
         config=cfg.to_dict(),
         stderr_log_level=cfg.stderr_log_level,
         tb_log_level=cfg.tb_log_level,
     )
     if cfg.pprint_logging:
-        from stick.pprint_output import PPrintOutputEngine
+        from kogiri.pprint_output import PPrintOutputEngine
 
-        stick.add_output(PPrintOutputEngine("stdout"))
+        kogiri.add_output(PPrintOutputEngine("stdout"))
     if cfg.parquet_logging:
-        from stick.arrow_output import ArrowOutputEngine
+        from kogiri.arrow_output import ArrowOutputEngine
 
-        stick.add_output(ArrowOutputEngine(log_dir=cfg.runs_dir, run_name=cfg.run_name))
+        kogiri.add_output(
+            ArrowOutputEngine(runs_dir=cfg.runs_dir, run_name=cfg.run_name)
+        )
 
     return cfg
 
@@ -224,7 +226,7 @@ def cmd_report_trial(config_file: str, run_dirs: list[str]):
     seed_results = []
     for run_dir in run_dirs:
         try:
-            eval_stats = stick.load_log_file(os.path.join(run_dir, "eval_stats.csv"))
+            eval_stats = kogiri.load_log_file(os.path.join(run_dir, "eval_stats.csv"))
             max_primary_stat = max(eval_stats["primary"])
             last_primary_stat = eval_stats["primary"][-1]
             pprint(
@@ -256,6 +258,7 @@ def cmd_tune(
     n_trials: int,
     fixed_seeds: list[int],
     n_seeds_per_trial: int,
+    config_type: type,
 ):
     """Runs hyper parameter tuning, assuming the current script uses the
     standard ExperimentInvocation()."""
@@ -273,11 +276,13 @@ def cmd_tune(
 
     save_yaml(overrides, os.path.join(run_dir, "overrides.yaml"))
 
-    # Setup basic stick logging
-    stick.init_extra(log_dir=runs_dir, run_name=run_name, stderr_log_level=stick.INFO)
-    from stick.pprint_output import PPrintOutputEngine
+    # Setup basic kogiri logging
+    kogiri.init_extra(
+        runs_dir=runs_dir, run_name=run_name, stderr_log_level=kogiri.INFO
+    )
+    from kogiri.pprint_output import PPrintOutputEngine
 
-    stick.add_output(PPrintOutputEngine("stdout"))
+    kogiri.add_output(PPrintOutputEngine("stdout"))
 
     if study_storage:
         storage_uri = _storage_filename_to_storage(study_storage)
@@ -330,12 +335,12 @@ def cmd_tune(
                 ]
             )
             try:
-                eval_stats = stick.load_log_file(
+                eval_stats = kogiri.load_log_file(
                     os.path.join(runs_dir, sub_run_name, "eval_stats.csv")
                 )
                 max_primary_stat = max(eval_stats["primary"])
                 last_primary_stat = eval_stats["primary"][-1]
-                stick.log(
+                kogiri.log_row(
                     "seed_results",
                     {
                         "trial": trial_index,
@@ -451,6 +456,7 @@ class ExperimentInvocation:
                 n_trials=self.args.n_trials,
                 fixed_seeds=self.args.fixed_seeds,
                 n_seeds_per_trial=self.args.n_seeds_per_trial,
+                config_type=config_type,
             )
 
         train_parser = subp.add_parser(

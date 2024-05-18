@@ -27,7 +27,7 @@ from optuna.distributions import (
     IntDistribution,
 )
 
-import stick
+import kogiri
 
 from outrl.torch_utils import (
     entropy_of,
@@ -280,9 +280,7 @@ class Trainer:
         )
         """Dynamically adjusted parameter used for KL regularization."""
 
-        self.entropy_coef: nn.Parameter = nn.Parameter(
-            torch.tensor(0.0)
-        )
+        self.entropy_coef: nn.Parameter = nn.Parameter(torch.tensor(0.0))
         """Dynamically adjusted parameter used for entropy enforcing."""
 
         self.awr_temperature: nn.Parameter = nn.Parameter(
@@ -365,7 +363,9 @@ class Trainer:
 
         kl_loss, kl_infos = self._kl_loss(episode_data, train_inputs, agent_outputs)
 
-        entropy_loss, entropy_infos = self._entropy_loss(episode_data, train_inputs, agent_outputs)
+        entropy_loss, entropy_infos = self._entropy_loss(
+            episode_data, train_inputs, agent_outputs
+        )
 
         ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
 
@@ -378,8 +378,7 @@ class Trainer:
         loss = ppo_loss + awr_loss + vf_loss + kl_loss + entropy_loss
 
         # *_infos will all get included in locals of this method
-        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos,
-                         entropy_infos)
+        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos, entropy_infos)
         return loss, locals()
 
     def _ppo_loss(
@@ -575,18 +574,31 @@ class Trainer:
         if self.starting_entropy is not None:
             # 0 at cfg.entropy_schedule_start_train_step
             # 1 at (and after) cfg.expected_train_steps
-            step_fraction = min(1,
-                                  ((1 + self.train_steps_so_far) - self.cfg.entropy_schedule_start_train_step) / (self.cfg.expected_train_steps - self.cfg.entropy_schedule_start_train_step))
+            step_fraction = min(
+                1,
+                (
+                    (1 + self.train_steps_so_far)
+                    - self.cfg.entropy_schedule_start_train_step
+                )
+                / (
+                    self.cfg.expected_train_steps
+                    - self.cfg.entropy_schedule_start_train_step
+                ),
+            )
             assert step_fraction >= 0
             assert step_fraction <= 1
-            final_entropy = self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            final_entropy = (
+                self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            )
             if self.cfg.entropy_schedule == "linear":
                 mix = step_fraction
             elif self.cfg.entropy_schedule == "cosine":
                 # Cosine curve from 1 to 0
                 mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
             else:
-                raise NotImplementedError(f"Unknown entropy schedule {self.cfg.entropy_schedule}")
+                raise NotImplementedError(
+                    f"Unknown entropy schedule {self.cfg.entropy_schedule}"
+                )
             assert mix >= 0
             assert mix <= 1
             target = (1 - mix) * self.starting_entropy + mix * final_entropy
@@ -602,14 +614,21 @@ class Trainer:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         approx_entropy, entropy = self._entropy_of(
             [agent_out.action_lls for agent_out in agent_outputs],
-            [agent_out.action_dists for agent_out in agent_outputs])
+            [agent_out.action_dists for agent_out in agent_outputs],
+        )
         entropy_target = self._entropy_target()
         if entropy_target is not None:
-
             # Tune temperature
-            exp_adv = torch.cat([train_input.exp_advantages for train_input in train_inputs])
-            temperature_loss = (self.awr_temperature * entropy_target + self.awr_temperature * torch.log(exp_adv.mean()))
-            temperature_loss_norm = temperature_loss * len(exp_adv) / self.cfg.minibatch_target_timesteps
+            exp_adv = torch.cat(
+                [train_input.exp_advantages for train_input in train_inputs]
+            )
+            temperature_loss = (
+                self.awr_temperature * entropy_target
+                + self.awr_temperature * torch.log(exp_adv.mean())
+            )
+            temperature_loss_norm = (
+                temperature_loss * len(exp_adv) / self.cfg.minibatch_target_timesteps
+            )
             self.awr_temperature_opt.zero_grad()
             temperature_loss_norm.backward()
             self.awr_temperature_opt.step()
@@ -617,12 +636,16 @@ class Trainer:
             if self.awr_temperature < self.cfg.temperature_min:
                 with torch.no_grad():
                     self.awr_temperature.copy_(self.cfg.temperature_min)
-            if self.awr_temperature > self.cfg.temperature_max or not torch.isfinite(self.awr_temperature):
+            if self.awr_temperature > self.cfg.temperature_max or not torch.isfinite(
+                self.awr_temperature
+            ):
                 with torch.no_grad():
                     self.awr_temperature.copy_(self.cfg.temperature_max)
 
             # Tune entropy_coef
-            entropy_coef_loss = self.entropy_coef * (entropy_target - entropy.detach().mean())
+            entropy_coef_loss = self.entropy_coef * (
+                entropy_target - entropy.detach().mean()
+            )
             self.entropy_coef_opt.zero_grad()
             entropy_coef_loss.backward()
             self.entropy_coef_opt.step()
@@ -900,7 +923,9 @@ class Trainer:
         self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
         self.vf.train(mode=False)
-        stick.log_row("last_training_stats", self._last_training_stats, level=stick.RESULTS)
+        kogiri.log_row(
+            "last_training_stats", self._last_training_stats, level=kogiri.RESULTS
+        )
         self.train_steps_so_far += 1
         self._maybe_record_starting_entropy()
 
@@ -1020,18 +1045,18 @@ class Trainer:
         training_stats["clip_portion"] = train_locals["ppo_infos"]["clip_portion"]
         training_stats["kl_mean"] = train_locals["kl_infos"]["kl_mean"]
         training_stats["kl_max"] = train_locals["kl_infos"]["kl_max"]
-        stick.log_row(
+        kogiri.log_row(
             "training_stats",
             training_stats,
-            level=stick.INFO,
+            level=kogiri.INFO,
             step=self.total_agent_grad_steps,
         )
         self._last_training_stats = training_stats
 
-        stick.log_row(
+        kogiri.log_row(
             "train_locals",
             train_locals,
-            level=stick.TRACE,
+            level=kogiri.TRACE,
             step=self.total_agent_grad_steps,
         )
 
@@ -1056,10 +1081,10 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             ).mean()
 
-        stick.log_row(
+        kogiri.log_row(
             "dataset_stats",
             dataset_stats,
-            level=stick.RESULTS,
+            level=kogiri.RESULTS,
             step=self.total_env_steps,
         )
 
@@ -1068,10 +1093,10 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             )
 
-        stick.log_row(
+        kogiri.log_row(
             "dataset_stats_trace",
             dataset_stats,
-            level=stick.TRACE,
+            level=kogiri.TRACE,
             step=self.total_env_steps,
         )
 
@@ -1191,10 +1216,10 @@ class Trainer:
         del infos["self"]
         del infos["episode_lengths"]
         del infos["obs_lens"]
-        stick.log_row(
+        kogiri.log_row(
             "preprocess",
             infos,
-            level=stick.TRACE,
+            level=kogiri.TRACE,
             step=self.total_env_steps,
         )
 
@@ -1279,14 +1304,16 @@ class Trainer:
         """
         assert "primary" not in stats
         stats["primary"] = stats[primary]
-        stick.log_row("eval_stats", stats, step=self.total_env_steps, level=stick.RESULTS)
+        kogiri.log_row(
+            "eval_stats", stats, step=self.total_env_steps, level=kogiri.RESULTS
+        )
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats
         hparams = self.cfg.to_dict()
         hparams["metric-primary"] = stats[primary]
         for k, v in stats.items():
             hparams[k] = v
-        stick.log_row("hparams", hparams, step=self.total_env_steps)
+        kogiri.log_row("hparams", hparams, step=self.total_env_steps)
         _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
 
     def attempt_resume(
@@ -1462,12 +1489,10 @@ class Trainer:
             self.agent.parameters()
         )
 
-    def _entropy_of(self,
-                    action_lls: list[torch.Tensor],
-                    action_dists: list[Optional[ActionDist]]
+    def _entropy_of(
+        self, action_lls: list[torch.Tensor], action_dists: list[Optional[ActionDist]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Computes the approximate entropy (and exact entropy, if possible).
-        """
+        """Computes the approximate entropy (and exact entropy, if possible)."""
         approx_entropy = -torch.cat(action_lls)
         entropy = None
         if not self.cfg.use_approx_entropy:
@@ -1482,27 +1507,31 @@ class Trainer:
         return approx_entropy, entropy
 
     def _maybe_record_starting_entropy(self):
-        """Record starting_etropy if train_steps_so_far >= cfg.entropy_schedule_start_train_step.
-        """
-        if self.starting_entropy is None and self.train_steps_so_far >= self.cfg.entropy_schedule_start_train_step:
-
-            original_action_lls = [ep_data.original_action_lls
-                                   for ep_data in self._replay_buffer]
-            original_dists = [ep_data.original_action_dists
-                              for ep_data in self._replay_buffer]
+        """Record starting_etropy if train_steps_so_far >= cfg.entropy_schedule_start_train_step."""
+        if (
+            self.starting_entropy is None
+            and self.train_steps_so_far >= self.cfg.entropy_schedule_start_train_step
+        ):
+            original_action_lls = [
+                ep_data.original_action_lls for ep_data in self._replay_buffer
+            ]
+            original_dists = [
+                ep_data.original_action_dists for ep_data in self._replay_buffer
+            ]
             approx_entropy, entropy = self._entropy_of(
-                original_action_lls, original_dists)
+                original_action_lls, original_dists
+            )
             del approx_entropy
             self.starting_entropy = entropy.mean().item()
 
 
-@stick.declare_summarizer(Trainer)
+@kogiri.declare_summarizer(Trainer)
 def summarize_trainer(trainer, key, dst):
-    """Summarize fields for the stick logging library."""
+    """Summarize fields for the kogiri logging library."""
     for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS + _PARAM_FIELDS:
-        stick.summarize(getattr(trainer, k), f"{key}.{k}", dst)
+        kogiri.summarize(getattr(trainer, k), f"{key}.{k}", dst)
     for k, v in trainer.__dict__.items():
-        stick.summarize(v, f"{key}.{k}", dst)
+        kogiri.summarize(v, f"{key}.{k}", dst)
 
 
 class Agent(nn.Module):
@@ -1601,8 +1630,8 @@ class TrainerConfig(simple_parsing.Serializable):
 
     Set to None to disable logging."""
 
-    stderr_log_level: stick.LogLevels = stick.LogLevels.INFO
-    """Log level to stderr for stick and python logging."""
+    stderr_log_level: kogiri.LogLevels = kogiri.LogLevels.INFO
+    """Log level to stderr for kogiri and python logging."""
 
     pprint_logging: bool = True
     """Log to stdout using pprint. Because the pprint output engine defaults to
@@ -1611,7 +1640,7 @@ class TrainerConfig(simple_parsing.Serializable):
     parquet_logging: bool = False
     """Log to parquet files using pyarrow."""
 
-    tb_log_level: stick.LogLevels = stick.LogLevels.INFO
+    tb_log_level: kogiri.LogLevels = kogiri.LogLevels.INFO
     """Log level to log to TensorBoard. Defaults to INFO to avoid slowing down
     TensorBoard with too many keys."""
 
@@ -1657,8 +1686,8 @@ class TrainerConfig(simple_parsing.Serializable):
     """Loss coefficient for the main RL loss. Usually does not need to be
     tuned."""
 
-    agent_lr_schedule: Literal[None, "linear"] = tunable(
-        "linear", CategoricalDistribution([None, "linear"])
+    agent_lr_schedule: Literal[None, "linear", "cosine"] = tunable(
+        "cosine", CategoricalDistribution([None, "linear", "cosine"])
     )
     """Learning rate schedule for the agent. Typically used to decrease the
     learning rate to near-zero near the end of training."""
@@ -1682,8 +1711,8 @@ class TrainerConfig(simple_parsing.Serializable):
     Because OutRL uses regularized VF training, VF clipping is not used.
     """
 
-    vf_lr_schedule: Literal[None, "linear"] = tunable(
-        "linear", CategoricalDistribution([None, "linear"])
+    vf_lr_schedule: Literal[None, "linear", "cosine"] = tunable(
+        "cosine", CategoricalDistribution([None, "linear", "cosine"])
     )
     """Learning rate schedule for the value function parameters. Typically used
     to decrease the learning rate to near-zero near the end of training."""
@@ -1877,7 +1906,9 @@ class TrainerConfig(simple_parsing.Serializable):
     """Approximate the action entropy using action log-likelihoods even if
     exact action distributions are provided by the agent."""
 
-    entropy_schedule: Literal[None, "linear", "cosine"] = None
+    entropy_schedule: Literal[None, "linear", "cosine"] = tunable(
+        "cosine", CategoricalDistribution([None, "linear", "cosine"])
+    )
     """Whether to schedule an entropy loss.
 
     With None, no entropy schedule will be applied, and entropy_coef_init will
@@ -1958,7 +1989,9 @@ class TrainerConfig(simple_parsing.Serializable):
     cloning.
     """
 
-    normalize_awr_advantages: bool = tunable(True, CategoricalDistribution([False, True]))
+    normalize_awr_advantages: bool = tunable(
+        True, CategoricalDistribution([False, True])
+    )
     """Whether to normalize the advantages across the batch before computing
     the AWR coefficients.
 
@@ -2039,7 +2072,7 @@ class TrainerConfig(simple_parsing.Serializable):
         runs_dir = os.path.abspath(self.runs_dir)
         object.__setattr__(self, "runs_dir", runs_dir)
         if isinstance(self.stderr_log_level, str):
-            stderr_log_level = stick.LOG_LEVELS[self.stderr_log_level]
+            stderr_log_level = kogiri.LOG_LEVELS[self.stderr_log_level]
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
 

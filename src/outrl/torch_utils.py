@@ -670,6 +670,10 @@ def make_scheduler(
         return torch.optim.lr_scheduler.LinearLR(
             opt, start_factor=1.0, end_factor=end / start, total_iters=expected_steps
         )
+    elif name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, eta_min=end, T_max=expected_steps
+        )
     else:
         raise NotImplementedError(f"LR scheduling of type {name} is not implemented")
 
