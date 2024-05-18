@@ -132,7 +132,11 @@ def default_run_name() -> str:
     main_file = getattr(sys.modules.get("__main__"), "__file__", "interactive")
     file_trail = os.path.splitext(os.path.basename(main_file))[0]
     now = datetime.datetime.now().isoformat()
-    return f"{file_trail}_{now}"
+    run_name = f"{file_trail}_{now}"
+    # Replace colons on windows
+    if os.name == "nt":
+        run_name = run_name.replace(":", "_")
+    return run_name
 
 
 def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str]):
