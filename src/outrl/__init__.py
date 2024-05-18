@@ -1692,7 +1692,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Learning rate schedule for the agent. Typically used to decrease the
     learning rate to near-zero near the end of training."""
 
-    agent_lr_start: float = tunable(1e-3, FloatDistribution(1e-4, 5e-2, log=True))
+    agent_lr_start: float = tunable(1e-2, FloatDistribution(1e-4, 5e-2, log=True))
     """Initial learning rate for the agent. If the agent_lr_schedule is None,
     this learning rate will be used throughout training. """
 
