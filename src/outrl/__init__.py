@@ -30,6 +30,7 @@ from optuna.distributions import (
 import kogiri
 
 from outrl.torch_utils import (
+    approx_entropy_of,
     entropy_of,
     force_concat,
     make_mlp,
@@ -587,9 +588,12 @@ class Trainer:
             )
             assert step_fraction >= 0
             assert step_fraction <= 1
-            final_entropy = (
-                self.cfg.entropy_schedule_end_fraction * self.starting_entropy
-            )
+            if self.cfg.entropy_schedule_end_target is not None:
+                final_entropy = self.cfg.entropy_schedule_end_target
+            else:
+                final_entropy = (
+                    self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+                )
             if self.cfg.entropy_schedule == "linear":
                 mix = step_fraction
             elif self.cfg.entropy_schedule == "cosine":
@@ -1462,8 +1466,9 @@ class Trainer:
             elif k in _SUBMODULE_FIELDS:
                 getattr(self, k).load_state_dict(v)
             else:
-                field_now = getattr(self, k, None)
-                if field_now is None:
+                missing = object()
+                field_now = getattr(self, k, missing)
+                if field_now is missing:
                     _LOGGER.error(f"Attempting to set unknown field {k}")
                 else:
                     if hasattr(field_now, "load_state_dict"):
@@ -1493,7 +1498,8 @@ class Trainer:
         self, action_lls: list[torch.Tensor], action_dists: list[Optional[ActionDist]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes the approximate entropy (and exact entropy, if possible)."""
-        approx_entropy = -torch.cat(action_lls)
+        approx_entropy = approx_entropy_of(
+            torch.cat(action_lls))
         entropy = None
         if not self.cfg.use_approx_entropy:
             try:
@@ -1918,9 +1924,16 @@ class TrainerConfig(simple_parsing.Serializable):
     start of training to a fraction of that `entropy_schedule_end_fraction`.
     """
 
-    entropy_schedule_end_fraction: float = tunable(0.1, FloatDistribution(0.0, 1.0))
+    entropy_schedule_end_target: Optional[float] = None
+    """Target entropy at end of schedule.
+
+    Overrides entropy_schedule_end_fraction."""
+
+    entropy_schedule_end_fraction: float = tunable(0.01, FloatDistribution(1e-6, 1.0, log=True))
     """Portion of "starting entropy" to attempt to maintain at end of
-    training."""
+    training.
+
+    Only used if entropy_schedule_end_target is None."""
 
     entropy_schedule_start_train_step: int = 1
     """Train step at which to measure the "starting entropy".
@@ -1938,7 +1951,7 @@ class TrainerConfig(simple_parsing.Serializable):
     is disabled.
     """
 
-    entropy_coef_lr: float = tunable(0.001, FloatDistribution(1e-5, 0.01, log=True))
+    entropy_coef_lr: float = tunable(0.01, FloatDistribution(1e-5, 0.01, log=True))
     """How quickly to adapt the loss coefficient for the entropy regularizer.
 
     If set to 0, the entropy regularization coefficient will not be tuned

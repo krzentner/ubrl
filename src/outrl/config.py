@@ -150,7 +150,11 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str
         cfg = dataclasses.replace(cfg, runs_dir=runs_dir, run_name=run_name)
 
     os.makedirs(os.path.join(cfg.runs_dir, cfg.run_name), exist_ok=True)
-    save_yaml(cfg, os.path.join(cfg.runs_dir, cfg.run_name, "config.yaml"))
+    config_path = os.path.join(cfg.runs_dir, cfg.run_name, "config.yaml")
+    if not os.path.exists(config_path):
+        save_yaml(cfg, config_path)
+    else:
+        _LOGGER.warn(f"Config file {config_path!r} already exists")
 
     # kogiri will handle seeding for us
     kogiri.init_extra(

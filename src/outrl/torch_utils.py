@@ -574,6 +574,11 @@ def split_shuffled_indices(
     return indices[:split_i], indices[split_i:]
 
 
+def approx_entropy_of(P_lls: torch.Tensor) -> torch.Tensor:
+    """Approximate the entropy from log likelihoods."""
+    return -P_lls
+
+
 def approx_kl_div_of(P_lls: torch.Tensor, Q_lls: torch.Tensor) -> torch.Tensor:
     """A simpler alternative to calling torch.nn.functional.kl_div with the
     arguments in opposite order and the log_target flag set."""
