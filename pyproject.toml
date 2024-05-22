@@ -30,6 +30,7 @@ dependencies = [
   "optuna>=3.5.0",
   "simple-parsing>=0.1.5",
   "torch>=2.0",
+  "noko>=0.2.0",
 ]
 
 [project.urls]
@@ -58,10 +59,6 @@ py-spy = "^0.3.14"
 pytest = "^7.3.1"
 ipdb = "^0.13.13"
 visdom = "^0.2.4"
-
-[tool.poetry.group.local.dependencies]
-stick = {path = "stick", extras = ["recommended"]}
-
 
 [tool.poetry.group.torch.dependencies]
 torch = {version = "^2.2.1+cpu", source = "pytorch_cpu"}

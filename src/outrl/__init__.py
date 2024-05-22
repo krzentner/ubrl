@@ -27,7 +27,7 @@ from optuna.distributions import (
     IntDistribution,
 )
 
-import kogiri
+import noko
 
 from outrl.torch_utils import (
     approx_entropy_of,
@@ -927,8 +927,8 @@ class Trainer:
         self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
         self.vf.train(mode=False)
-        kogiri.log_row(
-            "last_training_stats", self._last_training_stats, level=kogiri.RESULTS
+        noko.log_row(
+            "last_training_stats", self._last_training_stats, level=noko.RESULTS
         )
         self.train_steps_so_far += 1
         self._maybe_record_starting_entropy()
@@ -1049,18 +1049,18 @@ class Trainer:
         training_stats["clip_portion"] = train_locals["ppo_infos"]["clip_portion"]
         training_stats["kl_mean"] = train_locals["kl_infos"]["kl_mean"]
         training_stats["kl_max"] = train_locals["kl_infos"]["kl_max"]
-        kogiri.log_row(
+        noko.log_row(
             "training_stats",
             training_stats,
-            level=kogiri.INFO,
+            level=noko.INFO,
             step=self.total_agent_grad_steps,
         )
         self._last_training_stats = training_stats
 
-        kogiri.log_row(
+        noko.log_row(
             "train_locals",
             train_locals,
-            level=kogiri.TRACE,
+            level=noko.TRACE,
             step=self.total_agent_grad_steps,
         )
 
@@ -1085,10 +1085,10 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             ).mean()
 
-        kogiri.log_row(
+        noko.log_row(
             "dataset_stats",
             dataset_stats,
-            level=kogiri.RESULTS,
+            level=noko.RESULTS,
             step=self.total_env_steps,
         )
 
@@ -1097,10 +1097,10 @@ class Trainer:
                 data.infos[k] for data in self._replay_buffer
             )
 
-        kogiri.log_row(
+        noko.log_row(
             "dataset_stats_trace",
             dataset_stats,
-            level=kogiri.TRACE,
+            level=noko.TRACE,
             step=self.total_env_steps,
         )
 
@@ -1220,10 +1220,10 @@ class Trainer:
         del infos["self"]
         del infos["episode_lengths"]
         del infos["obs_lens"]
-        kogiri.log_row(
+        noko.log_row(
             "preprocess",
             infos,
-            level=kogiri.TRACE,
+            level=noko.TRACE,
             step=self.total_env_steps,
         )
 
@@ -1308,8 +1308,8 @@ class Trainer:
         """
         assert "primary" not in stats
         stats["primary"] = stats[primary]
-        kogiri.log_row(
-            "eval_stats", stats, step=self.total_env_steps, level=kogiri.RESULTS
+        noko.log_row(
+            "eval_stats", stats, step=self.total_env_steps, level=noko.RESULTS
         )
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats
@@ -1317,7 +1317,7 @@ class Trainer:
         hparams["metric-primary"] = stats[primary]
         for k, v in stats.items():
             hparams[k] = v
-        kogiri.log_row("hparams", hparams, step=self.total_env_steps)
+        noko.log_row("hparams", hparams, step=self.total_env_steps)
         _LOGGER.info(f"Eval primary stat ({primary}): {stats[primary]}")
 
     def attempt_resume(
@@ -1531,13 +1531,13 @@ class Trainer:
             self.starting_entropy = entropy.mean().item()
 
 
-@kogiri.declare_summarizer(Trainer)
+@noko.declare_summarizer(Trainer)
 def summarize_trainer(trainer, key, dst):
-    """Summarize fields for the kogiri logging library."""
+    """Summarize fields for the noko logging library."""
     for k in _SUBMODULE_FIELDS + _OPTIMIZER_FIELDS + _PARAM_FIELDS:
-        kogiri.summarize(getattr(trainer, k), f"{key}.{k}", dst)
+        noko.summarize(getattr(trainer, k), f"{key}.{k}", dst)
     for k, v in trainer.__dict__.items():
-        kogiri.summarize(v, f"{key}.{k}", dst)
+        noko.summarize(v, f"{key}.{k}", dst)
 
 
 class Agent(nn.Module):
@@ -1636,8 +1636,8 @@ class TrainerConfig(simple_parsing.Serializable):
 
     Set to None to disable logging."""
 
-    stderr_log_level: kogiri.LogLevels = kogiri.LogLevels.INFO
-    """Log level to stderr for kogiri and python logging."""
+    stderr_log_level: noko.LogLevels = noko.LogLevels.INFO
+    """Log level to stderr for noko and python logging."""
 
     pprint_logging: bool = True
     """Log to stdout using pprint. Because the pprint output engine defaults to
@@ -1646,7 +1646,7 @@ class TrainerConfig(simple_parsing.Serializable):
     parquet_logging: bool = False
     """Log to parquet files using pyarrow."""
 
-    tb_log_level: kogiri.LogLevels = kogiri.LogLevels.INFO
+    tb_log_level: noko.LogLevels = noko.LogLevels.INFO
     """Log level to log to TensorBoard. Defaults to INFO to avoid slowing down
     TensorBoard with too many keys."""
 
@@ -2085,7 +2085,7 @@ class TrainerConfig(simple_parsing.Serializable):
         runs_dir = os.path.abspath(self.runs_dir)
         object.__setattr__(self, "runs_dir", runs_dir)
         if isinstance(self.stderr_log_level, str):
-            stderr_log_level = kogiri.LOG_LEVELS[self.stderr_log_level]
+            stderr_log_level = noko.LOG_LEVELS[self.stderr_log_level]
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
 

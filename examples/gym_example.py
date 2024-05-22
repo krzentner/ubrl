@@ -11,7 +11,7 @@ except ImportError:
     import gym
 from optuna.distributions import FloatDistribution
 
-import stick
+import noko
 from outrl import Trainer, TrainerConfig
 from outrl.gym_utils import make_gym_agent, collect, episode_stats
 from outrl.config import ExperimentInvocation, tunable, IntListDistribution
@@ -97,11 +97,11 @@ def train(cfg: GymConfig):
             max_episode_length=cfg.max_episode_length,
             full_episodes_only=False,
         )
-        stick.log(
+        noko.log_row(
             "train_stats",
             episode_stats(train_episodes),
             step=trainer.total_env_steps,
-            level=stick.RESULTS,
+            level=noko.RESULTS,
         )
         for episode in train_episodes:
             trainer.add_episode(

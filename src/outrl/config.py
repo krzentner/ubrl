@@ -16,7 +16,7 @@ import subprocess
 import logging
 from pprint import pprint
 
-import kogiri
+import noko
 import optuna
 import argparse
 import simple_parsing
@@ -156,8 +156,8 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str
     else:
         _LOGGER.warn(f"Config file {config_path!r} already exists")
 
-    # kogiri will handle seeding for us
-    kogiri.init_extra(
+    # noko will handle seeding for us
+    noko.init_extra(
         runs_dir=cfg.runs_dir,
         run_name=cfg.run_name,
         config=cfg.to_dict(),
@@ -165,13 +165,13 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str
         tb_log_level=cfg.tb_log_level,
     )
     if cfg.pprint_logging:
-        from kogiri.pprint_output import PPrintOutputEngine
+        from noko.pprint_output import PPrintOutputEngine
 
-        kogiri.add_output(PPrintOutputEngine("stdout"))
+        noko.add_output(PPrintOutputEngine("stdout"))
     if cfg.parquet_logging:
-        from kogiri.arrow_output import ArrowOutputEngine
+        from noko.arrow_output import ArrowOutputEngine
 
-        kogiri.add_output(
+        noko.add_output(
             ArrowOutputEngine(runs_dir=cfg.runs_dir, run_name=cfg.run_name)
         )
 
@@ -234,7 +234,7 @@ def cmd_report_trial(config_file: str, run_dirs: list[str]):
     seed_results = []
     for run_dir in run_dirs:
         try:
-            eval_stats = kogiri.load_log_file(os.path.join(run_dir, "eval_stats.csv"))
+            eval_stats = noko.load_log_file(os.path.join(run_dir, "eval_stats.csv"))
             max_primary_stat = max(eval_stats["primary"])
             last_primary_stat = eval_stats["primary"][-1]
             pprint(
@@ -284,13 +284,13 @@ def cmd_tune(
 
     save_yaml(overrides, os.path.join(run_dir, "overrides.yaml"))
 
-    # Setup basic kogiri logging
-    kogiri.init_extra(
-        runs_dir=runs_dir, run_name=run_name, stderr_log_level=kogiri.INFO
+    # Setup basic noko logging
+    noko.init_extra(
+        runs_dir=runs_dir, run_name=run_name, stderr_log_level=noko.INFO
     )
-    from kogiri.pprint_output import PPrintOutputEngine
+    from noko.pprint_output import PPrintOutputEngine
 
-    kogiri.add_output(PPrintOutputEngine("stdout"))
+    noko.add_output(PPrintOutputEngine("stdout"))
 
     if study_storage:
         storage_uri = _storage_filename_to_storage(study_storage)
@@ -343,12 +343,12 @@ def cmd_tune(
                 ]
             )
             try:
-                eval_stats = kogiri.load_log_file(
+                eval_stats = noko.load_log_file(
                     os.path.join(runs_dir, sub_run_name, "eval_stats.csv")
                 )
                 max_primary_stat = max(eval_stats["primary"])
                 last_primary_stat = eval_stats["primary"][-1]
-                kogiri.log_row(
+                noko.log_row(
                     "seed_results",
                     {
                         "trial": trial_index,

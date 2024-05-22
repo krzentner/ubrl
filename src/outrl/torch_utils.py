@@ -362,8 +362,8 @@ class RunningMeanVar(nn.Module):
         cvar = self.var * self.count / d
         return torch.clamp(cvar, self.min_var)
 
-    def stick_preprocess(self, prefix: str, dst: dict):
-        """Provide statistics for the stick logging library."""
+    def noko_preprocess(self, prefix: str, dst: dict):
+        """Provide statistics for the noko logging library."""
         dst[f"{prefix}.var"] = self.var.mean().item()
         dst[f"{prefix}.mean"] = self.mean.mean().item()
         dst[f"{prefix}.count"] = self.count
