@@ -1149,9 +1149,11 @@ class Trainer:
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
             softmax_adv = softmax_clip(heated_adv,
                                        max_exp_adv)
+            awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
             normed_exp_adv = softmax_adv * len(softmax_adv)
             assert 0.9 <= normed_exp_adv.mean() <= 1.1
         else:
+            awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
 
         discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
@@ -1180,6 +1182,7 @@ class Trainer:
             len(train_input.discounted_returns) for train_input in train_inputs
         ] == episode_lengths
 
+        used_for_logging(awr_clip_ratio)
         infos = locals()
         del infos["self"]
         del infos["episode_lengths"]
