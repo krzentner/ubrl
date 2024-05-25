@@ -180,7 +180,6 @@ _OPTIMIZER_FIELDS = [
     "vf_lr_scheduler",
     "agent_lr_scheduler",
     "kl_coef_opt",
-    "awr_temperature_opt",
     "entropy_coef_opt",
 ]
 
@@ -192,7 +191,6 @@ _SUBMODULE_FIELDS = [
 
 _PARAM_FIELDS = [
     "kl_coef",
-    "awr_temperature",
     "entropy_coef",
 ]
 
@@ -284,11 +282,6 @@ class Trainer:
         self.entropy_coef: nn.Parameter = nn.Parameter(torch.tensor(0.0))
         """Dynamically adjusted parameter used for entropy enforcing."""
 
-        self.awr_temperature: nn.Parameter = nn.Parameter(
-            torch.tensor(float(self.cfg.temperature_init))
-        )
-        """Dynamically adjusted parameter used for temperature in the AWR loss."""
-
         self.starting_entropy: Optional[float] = None
         """Initial mean entropy of action distributions, measured immediately
         at the start of cfg.entropy_schedule_start_train_step."""
@@ -334,9 +327,6 @@ class Trainer:
         )
 
         self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
-        self.awr_temperature_opt = torch.optim.AdamW(
-            [self.awr_temperature], lr=self.cfg.temperature_lr
-        )
         self.entropy_coef_opt = torch.optim.AdamW(
             [self.entropy_coef], lr=self.cfg.entropy_coef_lr
         )
@@ -371,8 +361,6 @@ class Trainer:
         ppo_loss, ppo_infos = self._ppo_loss(episode_data, train_inputs, agent_outputs)
 
         awr_loss, awr_infos = self._awr_loss(episode_data, train_inputs, agent_outputs)
-
-        # TODO: Tune awr_temperature
 
         vf_loss, vf_infos = self._vf_loss(episode_data, train_inputs, agent_outputs)
 
@@ -622,30 +610,6 @@ class Trainer:
         )
         entropy_target = self._entropy_target()
         if entropy_target is not None:
-            # Tune temperature
-            exp_adv = torch.cat(
-                [train_input.exp_advantages for train_input in train_inputs]
-            )
-            temperature_loss = (
-                self.awr_temperature * entropy_target
-                + self.awr_temperature * torch.log(exp_adv.mean())
-            )
-            temperature_loss_norm = (
-                temperature_loss * len(exp_adv) / self.cfg.minibatch_target_timesteps
-            )
-            self.awr_temperature_opt.zero_grad()
-            temperature_loss_norm.backward()
-            self.awr_temperature_opt.step()
-
-            if self.awr_temperature < self.cfg.temperature_min:
-                with torch.no_grad():
-                    self.awr_temperature.copy_(self.cfg.temperature_min)
-            if self.awr_temperature > self.cfg.temperature_max or not torch.isfinite(
-                self.awr_temperature
-            ):
-                with torch.no_grad():
-                    self.awr_temperature.copy_(self.cfg.temperature_max)
-
             # Tune entropy_coef
             entropy_coef_loss = self.entropy_coef * (
                 entropy_target - entropy.detach().mean()
@@ -1178,17 +1142,16 @@ class Trainer:
             adv_packed = adv_packed - adv_packed.mean()
             adv_packed = adv_packed / adv_packed.std()
 
-        heated_adv = adv_packed / self.awr_temperature.detach()
-        exp_advantages = heated_adv.exp()
-
-        max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-        exp_advantages_clip_mask = ~torch.isfinite(exp_advantages)
-        exp_advantages[exp_advantages_clip_mask] = 1 + max_exp_adv
-        rect_adv = exp_advantages - exp_advantages.min()
-
-        large_exp_adv = ~torch.isfinite(rect_adv) | (rect_adv > max_exp_adv)
-        clipped_exp_adv = rect_adv.clone()
-        clipped_exp_adv[large_exp_adv] = max_exp_adv
+        # This 1000 is documented in the awr_temperature docstring
+        if self.cfg.awr_temperature < 1000:
+            heated_adv = adv_packed / self.cfg.awr_temperature
+            max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
+            softmax_adv = softmax_clip(heated_adv,
+                                       max_exp_adv)
+            normed_exp_adv = softmax_adv * len(softmax_adv)
+            assert 0.9 <= normed_exp_adv.mean() <= 1.1
+        else:
+            normed_exp_adv = torch.ones_like(adv_packed)
 
         discounted_returns = _discount_cumsum(padded_rewards, discount=discount)
 
@@ -1205,7 +1168,7 @@ class Trainer:
                 unpad_tensors(discounted_returns, episode_lengths),
                 unpad_tensors(vf_returns, episode_lengths),
                 unpad_tensors(vf_targets, episode_lengths),
-                unpack_tensors(clipped_exp_adv, episode_lengths),
+                unpack_tensors(normed_exp_adv, episode_lengths),
             )
         ]
         assert len(train_inputs) == len(self._replay_buffer)
@@ -1968,38 +1931,16 @@ class TrainerConfig(simple_parsing.Serializable):
     """Maximum value for the loss coefficient of the entropy regularizer.
     """
 
-    temperature_init: float = tunable(1.0, FloatDistribution(1e-2, 1e3, log=True))
-    """Initial AWR temperature. If temperature_lr is 0, this value will be used
-    throughout training.
+    awr_temperature: float = tunable(1.0, FloatDistribution(1e-2, 1e3, log=True))
+    """AWR temperature.
 
     Very low values result in a sparse loss that only attempts to repeat
     very high-advantage actions.
 
     High values cause the AWR loss to ignore advantages and just perform
     behavioral cloning.
-    """
 
-    temperature_lr: float = tunable(0.0, FloatDistribution(0, 0.1))
-    """How quickly to tune the AWR temperature.
-
-    The temperature is tuned to follow the entropy schedule and complements
-    entropy regularization. If set to 0, the temperature will not be adjusted
-    during training.
-    """
-
-    temperature_min: float = tunable(0.05, FloatDistribution(0.0, 1.0))
-    """Minimum AWR temperature. Small values exponentially increase the AWR
-    loss.
-
-    Very low values result in a sparse loss that only attempts to repeat
-    very high-advantage actions.
-    """
-
-    # Does this parameter need to exist? Seems kinda useless
-    temperature_max: float = tunable(100, FloatDistribution(0.1, 1e5, log=True))
-    """Maximum AWR temperature. Large temperature values cause the
-    AWR loss to ignore advantages and just perform behavioral
-    cloning.
+    If set to >=1000, will literally just perform behavioral cloning.
     """
 
     normalize_awr_advantages: bool = tunable(
