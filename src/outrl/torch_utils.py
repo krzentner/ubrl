@@ -574,6 +574,19 @@ def split_shuffled_indices(
     return indices[:split_i], indices[split_i:]
 
 
+def softmax_clip(x: torch.Tensor,
+                 max_exp: torch.Tensor) -> torch.Tensor:
+    """Compute softmax of input, clipping exponential values to a
+    maximal value.
+    """
+    x_exp = x.exp()
+    clip_mask = ~torch.isfinite(x_exp) | (x_exp > max_exp)
+    clipped_x_exp = x_exp.clone()
+    clipped_x_exp[clip_mask] = max_exp
+    norm_clipped_x_exp = clipped_x_exp / clipped_x_exp.sum()
+    return norm_clipped_x_exp
+
+
 def approx_entropy_of(P_lls: torch.Tensor) -> torch.Tensor:
     """Approximate the entropy from log likelihoods."""
     return -P_lls

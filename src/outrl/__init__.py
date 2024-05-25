@@ -39,6 +39,7 @@ from outrl.torch_utils import (
     pack_tensors_check,
     pad_packed,
     pad_tensors,
+    softmax_clip,
     unpad_tensors,
     pack_padded,
     explained_variance,
