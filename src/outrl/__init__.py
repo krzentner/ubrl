@@ -291,8 +291,6 @@ class Trainer:
         self._next_episode_number: int = 0
         self._dtype = torch.float32
 
-        self._last_training_stats = {}
-
         # This method is also called after loading the state dict to re-attach
         # parameters
         self._setup_optimizers()
@@ -522,16 +520,33 @@ class Trainer:
         assert approx_kl.shape == (sum(ep.num_timesteps for ep in episode_data),)
         kl = kl[torch.isfinite(kl)]
 
+        if self.cfg.kl_apply_symlog:
+            # Gradient will be dL/dKL / (KL + 1) (less sensitive to
+            # outliers)
+            # Some approx KL values can be negative, so use the proper
+            # symlog
+            kl_rescaled = torch.sign(kl) * torch.log(kl.abs() + 1)
+        else:
+            kl_rescaled = kl
+
         # Update KL loss coefficient
         if self.cfg.kl_target_stat == "max":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().max())
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl_rescaled.detach().max())
         elif self.cfg.kl_target_stat == "mean":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().mean())
+            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl_rescaled.detach().mean())
         else:
             raise ValueError(f"Unknown kl_target_stat {self.cfg.kl_target_stat}")
         self.kl_coef_opt.zero_grad()
         kl_coef_loss.backward()
-        self.kl_coef_opt.step()
+        try:
+            clip_grad_norm_([self.kl_coef],
+                            max_norm=self.cfg.grad_norm_max,
+                            error_if_nonfinite=True)
+            self.kl_coef_opt.step()
+        except RuntimeError:
+            # Probably inf gradients, don't apply them
+            pass
+
         if self.kl_coef < self.cfg.kl_coef_min:
             with torch.no_grad():
                 self.kl_coef.copy_(self.cfg.kl_coef_min)
@@ -548,13 +563,7 @@ class Trainer:
 
         norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
 
-        # Gradient will be dL/dKL / (KL + 1) (less sensitive to
-        # outliers)
-        # Some approx KL values can be negative, so use the proper
-        # symlog
-        kl_symlog = torch.sign(kl) * torch.log(kl.abs() + 1)
-
-        kl_loss_scaled = (norm_coef * kl_symlog).sum()
+        kl_loss_scaled = (norm_coef * kl_rescaled).sum()
         infos = locals()
         del infos["lengths"]
         del infos["self"]
@@ -617,7 +626,14 @@ class Trainer:
             )
             self.entropy_coef_opt.zero_grad()
             entropy_coef_loss.backward()
-            self.entropy_coef_opt.step()
+            try:
+                clip_grad_norm_([self.entropy_coef],
+                                max_norm=self.cfg.grad_norm_max,
+                                error_if_nonfinite=True)
+                self.entropy_coef_opt.step()
+            except RuntimeError:
+                # Probably inf gradients, don't apply them
+                pass
 
             if self.entropy_coef < self.cfg.entropy_coef_min:
                 with torch.no_grad():
@@ -892,9 +908,6 @@ class Trainer:
         self.vf_lr_scheduler.step()
         self.agent.train(mode=False)
         self.vf.train(mode=False)
-        noko.log_row(
-            "last_training_stats", self._last_training_stats, level=noko.RESULTS
-        )
         self.train_steps_so_far += 1
         self._maybe_record_starting_entropy()
 
@@ -1020,8 +1033,6 @@ class Trainer:
             level=noko.INFO,
             step=self.total_agent_grad_steps,
         )
-        self._last_training_stats = training_stats
-
         noko.log_row(
             "train_locals",
             train_locals,
@@ -1827,7 +1838,7 @@ class TrainerConfig(simple_parsing.Serializable):
     size of policy updates to within a maximal value (kl_soft_target).
     """
 
-    kl_coef_min: float = tunable(0.0, FloatDistribution(0.0, 1.0))
+    kl_coef_min: float = tunable(0.05, FloatDistribution(1e-3, 1.0, log=True))
     """Minimum value of the KL coefficient. Setting this to a non-zero value
     can help stabilize training very low-entropy continuous action space
     policies using the PPO loss, but is typically unnecessary.
@@ -1848,6 +1859,15 @@ class TrainerConfig(simple_parsing.Serializable):
 
     Constraining the mean KL divergence is typical, but constraining the max KL
     can improve stability during long runs with little disadvantage.
+    """
+
+    kl_apply_symlog: bool = tunable(True, CategoricalDistribution([True, False]))
+    """Apply the "symmetric logarithm" to the KL before
+    calculating the KL penalty and updating the KL coefficient.
+
+    This makes the KL less sensitive to outliers.
+    In particular, it causes the error on the KL to be divided by
+    KL + 1.
     """
 
     kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
