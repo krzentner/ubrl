@@ -123,7 +123,10 @@ def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any])
             missing_k.append(f.name)
     cfg = config.from_dict(args)
     for k in missing_k:
-        trial.set_user_attr(k, getattr(cfg, k))
+        try:
+            trial.set_user_attr(k, getattr(cfg, k))
+        except TypeError:
+            trial.set_user_attr(k, repr(getattr(cfg, k)))
     return cfg
 
 
