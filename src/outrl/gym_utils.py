@@ -18,6 +18,7 @@ from typing import Optional, Any
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributions import TransformedDistribution, AffineTransform
 from tqdm import tqdm
 
 from outrl import Agent, AgentOutput
@@ -180,7 +181,7 @@ class GymAgent(Agent):
         ]
 
 
-class GymBoxAgent(GymAgent):
+class GymBoxGaussianAgent(GymAgent):
     """GymAgent producing a continuous action distribution suitable for the
     "Box" action space.
 
@@ -196,6 +197,8 @@ class GymBoxAgent(GymAgent):
         pi_hidden_sizes: list[int],
         init_std: float,
         min_std: float,
+        loc: np.ndarray,
+        scale: np.ndarray,
     ):
         super().__init__(
             obs_size=obs_size,
@@ -214,22 +217,24 @@ class GymBoxAgent(GymAgent):
         nn.init.zeros_(self.action_mean.bias)
         self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
         self.min_std = min_std
+        self.loc = torch.from_numpy(loc)
+        self.scale = torch.from_numpy(scale)
 
     def run_net(
         self, obs: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         state_encodings = self.shared_layers(obs)
         pi_x = self.pi_layers(state_encodings)
-        mean = self.action_mean(pi_x)
+        mean = self.action_mean(pi_x) + self.loc
+        mean_adjusted = mean + self.loc
         std_pre_clamp = self.action_logstd(pi_x).exp()
         std = torch.clamp(std_pre_clamp, min=self.min_std)
-        params = dict(mean=mean, std=std)
+        std_adjusted = std * self.scale
+        params = dict(mean=mean_adjusted, std=std_adjusted)
         return (
             state_encodings,
             params,
             {
-                # "action_mean": mean.mean(dim=-1),
-                # "action_stddev": std.mean(dim=-1),
                 "action_stddev_unclamped": std_pre_clamp.mean(dim=-1),
             },
         )
@@ -320,13 +325,17 @@ def make_gym_agent(
 
     if obs_space == "Box" and act_space == "Box":
         action_size = flatten_shape(env.action_space.shape)
-        return GymBoxAgent(
+        loc = (env.action_space.high + env.action_space.low) / 2
+        scale = (env.action_space.high - env.action_space.low) / 2
+        return GymBoxGaussianAgent(
             obs_size=obs_size,
             action_size=action_size,
             hidden_sizes=hidden_sizes,
             pi_hidden_sizes=pi_hidden_sizes,
             init_std=init_std,
             min_std=min_std,
+            loc=loc,
+            scale=scale,
         )
     elif obs_space == "Box" and act_space == "Discrete":
         action_size = env.action_space.n

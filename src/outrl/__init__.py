@@ -800,7 +800,11 @@ class Trainer:
             self.cfg.train_step_timeout_seconds is not None
             and self.cfg.train_step_timeout_seconds > 0
         ):
-            deadline = start_time + self.cfg.train_step_timeout_seconds
+            # Allow extra time for first train_step
+            if self.train_steps_so_far == 0:
+                deadline = start_time + self.cfg.first_train_step_timeout_coef * self.cfg.train_step_timeout_seconds
+            else:
+                deadline = start_time + self.cfg.train_step_timeout_seconds
         else:
             deadline = start_time + float("inf")
 
@@ -816,8 +820,13 @@ class Trainer:
         observation_latent_cache = {}
         action_lls_cache = {}
 
+        pre_train_epochs = self.cfg.vf_pre_training_epochs
+        if self.train_steps_so_far == 0:
+            pre_train_epochs = max(self.cfg.vf_warmup_training_epochs,
+                                   pre_train_epochs)
+
         # Pre-train VF (usually only used for off-policy algorithms)
-        if self.cfg.vf_pre_training_epochs > 0:
+        if pre_train_epochs > 0:
             with torch.no_grad():
                 for _, _, batch in self._agent_minibatches(desc="Caching latents"):
                     for ep_data, _, agent_res in batch:
@@ -828,7 +837,7 @@ class Trainer:
             timed_out = self._train_vf(
                 observation_latent_cache,
                 action_lls_cache,
-                self.cfg.vf_pre_training_epochs,
+                pre_train_epochs,
                 desc="Pre Training VF",
                 deadline=deadline,
             )
@@ -1046,12 +1055,12 @@ class Trainer:
         )
         t_inputs = pack_recursive(train_inputs)[0]
         dataset_stats = {
-            "ep_rew": full_episode_rewards.sum(dim=-1).mean(dim=0),
-            "ev": explained_variance(
+            "episode_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
+            "vf_explained_variance": explained_variance(
                 t_inputs.vf_returns,
                 t_inputs.discounted_returns,
             ),
-            "disc_mean": t_inputs.discounted_returns.mean(),
+            "discounted_rewards": t_inputs.discounted_returns.mean(),
             "vf_mean": t_inputs.vf_returns.mean(),
             "vf_target_mean": t_inputs.vf_targets.mean(),
             "total_env_steps": self.total_env_steps,
@@ -1638,18 +1647,18 @@ class TrainerConfig(simple_parsing.Serializable):
     Defaults to no limit. Automatically decreases on (most) memory errors.
     """
 
-    minibatch_target_timesteps: int = tunable(64, IntDistribution(1, 50000, log=True))
+    minibatch_target_timesteps: int = tunable(1024, IntDistribution(1, 50000, log=True))
     """Attempt to keep timesteps in each minibatch to this number of timesteps.
     In practice, this acts a divisor on most losses.
 
     Will still run whole episodes if they exceed this cap.
     """
 
-    policy_epochs_per_train_step: int = tunable(3, IntDistribution(1, 100, log=True))
+    policy_epochs_per_train_step: int = tunable(15, IntDistribution(1, 100, log=True))
     """Number of times to iterate over all data in replay buffer each time
     train_step() is called."""
 
-    normalize_rewards: bool = tunable(False, CategoricalDistribution([True, False]))
+    normalize_rewards: bool = tunable(True, CategoricalDistribution([True, False]))
     """Normalize rewards to have zero mean and unit variance."""
 
     expected_train_steps: int = 1000
@@ -1659,6 +1668,19 @@ class TrainerConfig(simple_parsing.Serializable):
     """train_step() will exit early if this number of seconds of wall-clock
     time is exceeded during it. The current gradient step will still finish
     first, so this timeout is only approximately enforced.
+
+    See also `first_train_step_timeout_coef`, which increases the
+    timeout for the very first train step to accomodate JIT
+    compilation and VF warmup.
+    """
+
+    first_train_step_timeout_coef: float = 5.0
+    """Multiple of the normal train_step() timeout to use for the
+    first train_step. Useful for accomodating additional time
+    needed for JIT compilation or VF warmup (see
+    `vf_warmup_training_epochs`).
+
+    Has no effect if train_step_timeout_seconds is None.
     """
 
     ppo_loss_coef: float = tunable(0.0, FloatDistribution(0.0, 1000.0))
@@ -1676,15 +1698,15 @@ class TrainerConfig(simple_parsing.Serializable):
     """Learning rate schedule for the agent. Typically used to decrease the
     learning rate to near-zero near the end of training."""
 
-    agent_lr_start: float = tunable(1e-2, FloatDistribution(1e-4, 5e-2, log=True))
+    agent_lr_start: float = tunable(2e-4, FloatDistribution(1e-5, 5e-2, log=True))
     """Initial learning rate for the agent. If the agent_lr_schedule is None,
     this learning rate will be used throughout training. """
 
-    agent_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-3, log=True))
+    agent_lr_end: float = tunable(1e-5, FloatDistribution(1e-8, 1e-3, log=True))
     """Final learning rate for the agent. If the agent_lr_schedule is None,
     this learning rate will not be used."""
 
-    agent_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
+    agent_weight_decay: float = tunable(1e-8, FloatDistribution(1e-10, 1e-2, log=True))
     """Weight decay for the agent using AdamW."""
 
     ppo_clip_epsilon: float = tunable(0.2, FloatDistribution(0.05, 2.0, log=True))
@@ -1701,19 +1723,19 @@ class TrainerConfig(simple_parsing.Serializable):
     """Learning rate schedule for the value function parameters. Typically used
     to decrease the learning rate to near-zero near the end of training."""
 
-    vf_lr_start: float = tunable(3e-3, FloatDistribution(1e-4, 0.1, log=True))
+    vf_lr_start: float = tunable(2e-3, FloatDistribution(1e-4, 0.1, log=True))
     """Initial learning rate for the value function parameters. If the
     vf_lr_schedule is None, this learning rate will be used throughout
     training. """
 
-    vf_lr_end: float = tunable(1e-6, FloatDistribution(1e-8, 1e-4, log=True))
+    vf_lr_end: float = tunable(1e-5, FloatDistribution(1e-8, 1e-4, log=True))
     """Final learning rate for the value function parameters. If the
     vf_lr_schedule is None, this learning rate will not be used. """
 
-    vf_weight_decay: float = tunable(1e-6, FloatDistribution(1e-8, 1e-2, log=True))
+    vf_weight_decay: float = tunable(1e-5, FloatDistribution(1e-8, 1e-2, log=True))
     """Weight decay for the value function parameters using AdamW."""
 
-    vf_minibatch_size: int = tunable(512, IntDistribution(1, 2**32, log=True))
+    vf_minibatch_size: int = tunable(64, IntDistribution(1, 2**32, log=True))
     """Number of timesteps used in minibatches when pre-training and
     post-training the value function from frozen state encodings.
 
@@ -1722,14 +1744,25 @@ class TrainerConfig(simple_parsing.Serializable):
     met precisely (except for one trailing odd-sized minibatch).
     """
 
-    vf_pre_training_epochs: int = tunable(10, IntDistribution(0, 20))
+    vf_warmup_training_epochs: int = tunable(30, IntDistribution(0, 1000))
+    """Number of epochs of value function training to run from
+    frozen state encodings on the very first train_step() before
+    training the agent.
+
+    Because OutRL uses an AWR-style loss, training the VF before
+    the policy is expected.
+    """
+
+
+    vf_pre_training_epochs: int = tunable(3, IntDistribution(0, 20))
     """Number of epochs of value function training to run from frozen state
     encodings each train_step() before training the agent.
 
     Because OutRL uses an AWR-style loss, training the VF before the policy is
     expected.
     """
-    vf_post_training_epochs: int = tunable(1, IntDistribution(0, 20))
+
+    vf_post_training_epochs: int = tunable(3, IntDistribution(0, 20))
     """Number of epochs of value function training to run from frozen state
     encodings each train_step() after training the agent.
 
@@ -1792,7 +1825,7 @@ class TrainerConfig(simple_parsing.Serializable):
     This hyper parameter can have a very significant effect.
     """
 
-    v_trace_lambda: float = tunable(0.95, FloatDistribution(0.0, 1.0))
+    v_trace_lambda: float = tunable(0.33, FloatDistribution(0.0, 1.0))
     """Lambda parameter to v-trace advantage estimation.
 
     Controls the bias-variance tradeoff between pure belmann bootstraps and
@@ -1800,7 +1833,7 @@ class TrainerConfig(simple_parsing.Serializable):
     matches v-trace as originally proposed.
     """
 
-    v_trace_rho_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
+    v_trace_rho_max: float = tunable(3.0, FloatDistribution(1.0, 1e3, log=True))
     """The "value function truncation" importance weight maximum in v-trace.
 
     Setting this value to very large values disables it, performing maximally
@@ -1810,7 +1843,7 @@ class TrainerConfig(simple_parsing.Serializable):
     off-policy actions can contribute to estimated advantages.
     """
 
-    v_trace_c_max: float = tunable(1.0, FloatDistribution(1.0, 1e3, log=True))
+    v_trace_c_max: float = tunable(3.0, FloatDistribution(1.0, 1e3, log=True))
     """The "trace-cutting" importance weight maximum in v-trace.
 
     Setting this value to very large values disables it, performing maximally
@@ -1821,7 +1854,7 @@ class TrainerConfig(simple_parsing.Serializable):
     advantages.
     """
 
-    kl_coef_init: float = tunable(0.0, FloatDistribution(0.0, 100.0))
+    kl_coef_init: float = tunable(0.1, FloatDistribution(0.0, 100.0))
     """Initial loss coefficient for KL penalty / regularization of the agent.
 
     The KL coefficient will be tuned using a lagrangian style loss to keep the
@@ -1831,20 +1864,20 @@ class TrainerConfig(simple_parsing.Serializable):
     or applied approximately using action_lls otherwise.
     """
 
-    kl_coef_lr: float = tunable(0.1, FloatDistribution(1e-4, 1.0, log=True))
+    kl_coef_lr: float = tunable(0.01, FloatDistribution(1e-6, 0.1, log=True))
     """How quickly to adapt the loss coefficient for KL penalty.
 
     The KL coefficient will be tuned using a lagrangian style loss to keep the
     size of policy updates to within a maximal value (kl_soft_target).
     """
 
-    kl_coef_min: float = tunable(0.05, FloatDistribution(1e-3, 1.0, log=True))
+    kl_coef_min: float = tunable(0.01, FloatDistribution(1e-3, 1.0, log=True))
     """Minimum value of the KL coefficient. Setting this to a non-zero value
     can help stabilize training very low-entropy continuous action space
     policies using the PPO loss, but is typically unnecessary.
     """
 
-    kl_coef_max: float = tunable(1e3, FloatDistribution(0.1, 1e6, log=True))
+    kl_coef_max: float = tunable(100.0, FloatDistribution(1e-2, 1e6, log=True))
     """Maximum value of the KL coefficient. Necessary to ensure eventual
     convergence of the KL penalty.
 
@@ -1861,7 +1894,7 @@ class TrainerConfig(simple_parsing.Serializable):
     can improve stability during long runs with little disadvantage.
     """
 
-    kl_apply_symlog: bool = tunable(True, CategoricalDistribution([True, False]))
+    kl_apply_symlog: bool = tunable(False, CategoricalDistribution([True, False]))
     """Apply the "symmetric logarithm" to the KL before
     calculating the KL penalty and updating the KL coefficient.
 
@@ -1870,7 +1903,7 @@ class TrainerConfig(simple_parsing.Serializable):
     KL + 1.
     """
 
-    kl_soft_target: float = tunable(0.25, FloatDistribution(1e-3, 10.0, log=True))
+    kl_soft_target: float = tunable(0.5, FloatDistribution(1e-3, 10.0, log=True))
     """Target per-timestep KL divergence per train-step.
 
     If this value is exceeded, the kl_coef will become non-zero to limit the
@@ -1916,7 +1949,7 @@ class TrainerConfig(simple_parsing.Serializable):
 
     Overrides entropy_schedule_end_fraction."""
 
-    entropy_schedule_end_fraction: float = tunable(0.01, FloatDistribution(1e-6, 1.0, log=True))
+    entropy_schedule_end_fraction: float = tunable(0.5, FloatDistribution(1e-6, 1.0, log=True))
     """Portion of "starting entropy" to attempt to maintain at end of
     training.
 
@@ -1929,7 +1962,7 @@ class TrainerConfig(simple_parsing.Serializable):
     The default value measures the entropy after one train step.
     """
 
-    entropy_coef_init: float = tunable(0.01, FloatDistribution(0, 1.0))
+    entropy_coef_init: float = tunable(0.1, FloatDistribution(0, 1.0))
     """Entropy regularizer coefficient.
 
     Will be adjusted by the entropy schedule if entropy_schedule is set.
@@ -1938,24 +1971,24 @@ class TrainerConfig(simple_parsing.Serializable):
     is disabled.
     """
 
-    entropy_coef_lr: float = tunable(0.01, FloatDistribution(1e-5, 0.01, log=True))
+    entropy_coef_lr: float = tunable(1e-3, FloatDistribution(1e-5, 0.01, log=True))
     """How quickly to adapt the loss coefficient for the entropy regularizer.
 
     If set to 0, the entropy regularization coefficient will not be tuned
     during training.
     """
 
-    entropy_coef_min: float = tunable(-10, FloatDistribution(-100, 0))
+    entropy_coef_min: float = tunable(-100, FloatDistribution(-1000, 0))
     """Minimum value for the loss coefficient of the entropy regularizer.
 
     Negative values actively decrease the entropy.
     """
 
-    entropy_coef_max: float = tunable(10, FloatDistribution(0, 100))
+    entropy_coef_max: float = tunable(100, FloatDistribution(0, 1000))
     """Maximum value for the loss coefficient of the entropy regularizer.
     """
 
-    awr_temperature: float = tunable(1.0, FloatDistribution(1e-2, 1e3, log=True))
+    awr_temperature: float = tunable(0.01, FloatDistribution(1e-2, 1e3, log=True))
     """AWR temperature.
 
     Very low values result in a sparse loss that only attempts to repeat
@@ -1976,7 +2009,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Note that this is not used in the PPO loss.
     """
 
-    advantage_clip: float = tunable(8.0, FloatDistribution(0.1, 8.0))
+    advantage_clip: float = tunable(8.0, FloatDistribution(0.1, 12.0))
     """Max exponent value for advantages in AWR loss.
 
     Large values can lead to NaN errors.
@@ -1985,14 +2018,14 @@ class TrainerConfig(simple_parsing.Serializable):
     coefficients at low temperatures.
     """
 
-    grad_norm_max: float = tunable(10.0, FloatDistribution(1.0, 1e2, log=True))
+    grad_norm_max: float = tunable(5.0, FloatDistribution(1.0, 1e2, log=True))
     """Grad norm to clip the actor and value function parameters to in the main
     training loop.
 
     Small values will consistently lower the loss.
     """
 
-    recompute_train_inputs: bool = tunable(True, CategoricalDistribution([False, True]))
+    recompute_train_inputs: bool = tunable(False, CategoricalDistribution([False, True]))
     """Recompute advantages and VF targets every epoch inside a train_step().
 
     This causes full off-policy steps to be taken every train_step().

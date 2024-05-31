@@ -24,7 +24,7 @@ class GymConfig(TrainerConfig):
     max_episode_length: int = 200
     episodes_per_train_step: int = 30
     encoder_hidden_sizes: list[int] = tunable(
-        [64, 64],
+        [256, 128],
         IntListDistribution(
             [
                 16,
@@ -46,14 +46,15 @@ class GymConfig(TrainerConfig):
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
-    init_std: float = tunable(0.5, FloatDistribution(0.0, 2.0))
+    init_std: float = tunable(0.75,
+                              FloatDistribution(0.0, 2.0))
     """Only used for Box shaped action spaces."""
     min_std: float = tunable(1e-6, FloatDistribution(1e-6, 0.1, log=True))
     """Only used for Box shaped action spaces."""
 
     def __post_init__(self):
         super().__post_init__()
-        object.__setattr__(self, "max_buffer_episodes", self.episodes_per_train_step)
+        object.__setattr__(self, "replay_buffer_episodes", 2 * self.episodes_per_train_step)
         object.__setattr__(self, "expected_train_steps", self.n_train_steps)
 
 
