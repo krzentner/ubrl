@@ -624,7 +624,7 @@ class Trainer:
         if entropy_target is not None:
             entropy_loss = self.cfg.entropy_loss_coef * ((entropy - entropy_target) ** 2).sum()
         else:
-            entropy_target = float('nan')
+            entropy_target = entropy
             entropy_loss = torch.tensor(0.0)
 
         used_for_logging(approx_entropy)
@@ -1924,7 +1924,8 @@ class TrainerConfig(simple_parsing.Serializable):
     entropy_schedule_end_target: Optional[float] = None
     """Target entropy at end of schedule.
 
-    Overrides entropy_schedule_end_fraction."""
+    Overrides entropy_schedule_end_fraction.
+    """
 
     entropy_schedule_end_fraction: float = tunable(0.01, FloatDistribution(1e-6, 1.0, log=True))
     """Portion of "starting entropy" to attempt to maintain at end of

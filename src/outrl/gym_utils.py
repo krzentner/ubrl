@@ -89,7 +89,7 @@ class GymAgent(Agent):
 
     def construct_dist(
         self, params: dict[str, torch.Tensor]
-    ) -> torch.distributions.Distribution:
+    ) -> tuple[torch.distributions.Distribution, torch.Tensor]:
         """Construct a torch.distribution.Distribution from a dictionary of
         parameters returned by run_net() (or a concatenation thereof).
         """
@@ -123,9 +123,9 @@ class GymAgent(Agent):
                 .to(dtype=self.dtype)
                 .to(device=self.device)
             )
-        dist = self.construct_dist(params)
+        dist, mode = self.construct_dist(params)
         if best_action:
-            action = dist.mode
+            action = mode
         else:
             action = dist.sample()
         action_ll = dist.log_prob(action)
@@ -162,12 +162,12 @@ class GymAgent(Agent):
         state_encodings, params, infos = self.run_net(observations)
         del infos
 
-        batch_dist = self.construct_dist(params)
+        batch_dist, _ = self.construct_dist(params)
         state_encodings = unpack_tensors(state_encodings, pack_lens)
         packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
         unpacked_params = {k: unpack_tensors(v, pack_lens) for (k, v) in params.items()}
         dists = [
-            self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})
+            self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
             for i in range(len(episodes))
         ]
         action_lls = [
@@ -225,7 +225,7 @@ class GymBoxGaussianAgent(GymAgent):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
         state_encodings = self.shared_layers(obs)
         pi_x = self.pi_layers(state_encodings)
-        mean = self.action_mean(pi_x) + self.loc
+        mean = self.action_mean(pi_x)
         mean_adjusted = mean + self.loc
         std_pre_clamp = self.action_logstd(pi_x).exp()
         std = torch.clamp(std_pre_clamp, min=self.min_std)
@@ -241,12 +241,109 @@ class GymBoxGaussianAgent(GymAgent):
 
     def construct_dist(
         self, params: dict[str, torch.Tensor]
-    ) -> torch.distributions.Distribution:
+    ) -> tuple[torch.distributions.Distribution, torch.Tensor]:
         mean, std = params["mean"], params["std"]
         dist = torch.distributions.Normal(mean, std)
         if len(mean.shape) > 1:
             dist = torch.distributions.Independent(dist, 1)
-        return dist
+        return dist, dist.mode
+
+
+class GymBoxBetaAgent(GymAgent):
+    """GymAgent producing a continuous action distribution suitable for the
+    "Box" action space.
+
+    Despite this library's name, this class cannot be fully avoided.
+    """
+
+    def __init__(
+        self,
+        *,
+        obs_size: int,
+        action_size: int,
+        hidden_sizes: list[int],
+        pi_hidden_sizes: list[int],
+        init_std: float,
+        min_std: float,
+        loc: np.ndarray,
+        scale: np.ndarray,
+    ):
+        super().__init__(
+            obs_size=obs_size,
+            hidden_sizes=hidden_sizes,
+            pi_hidden_sizes=pi_hidden_sizes,
+        )
+
+        self.action_mean = nn.Linear(pi_hidden_sizes[-1], action_size)
+
+        self.action_logstd = nn.Linear(pi_hidden_sizes[-1], action_size)
+        nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std / 2).log().item())
+        nn.init.orthogonal_(
+            self.action_logstd.weight, gain=torch.tensor(init_std / 2).log().item()
+        )
+        nn.init.zeros_(self.action_logstd.weight)
+        nn.init.zeros_(self.action_mean.bias)
+        self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
+        self.min_std = min_std
+        self.loc = torch.from_numpy(loc)
+        self.scale = torch.from_numpy(scale)
+
+    def run_net(
+        self, obs: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        state_encodings = self.shared_layers(obs)
+        pi_x = self.pi_layers(state_encodings)
+
+        # Center the mean output in the beta distribution and
+        # clamp to 0.0 to 1.0 range
+        mean = torch.clamp(self.action_mean(pi_x) + 0.5,
+                           min=0.0, max=1.0)
+
+        std_pre_clamp = self.action_logstd(pi_x).exp()
+        std = torch.clamp(std_pre_clamp, min=self.min_std)
+        var = std ** 2
+
+        # Constraint of the beta distribution:
+        #  mean * (1 - mean) < var
+        # To ensure this constraint is fulfilled, compute an
+        # error:
+        error = torch.clamp(mean * (1 - mean) - var, min=0.0)
+        var_clipped = var - error
+
+        v = mean * (1 - mean) / var_clipped - 1
+        alpha = mean * v
+        beta = (1 - mean) * v
+
+        mean_adjusted = (mean - 0.5) + self.loc
+        std_adjusted = var_clipped.sqrt() * 2 * self.scale
+        params = dict(mean=mean_adjusted, std=std_adjusted,
+                      alpha=alpha, beta=beta)
+        return (
+            state_encodings,
+            params,
+            {
+                "action_stddev_unclamped": std_pre_clamp.mean(dim=-1),
+            },
+        )
+
+    def construct_dist(
+        self, params: dict[str, torch.Tensor]
+    ) -> tuple[torch.distributions.Distribution, torch.Tensor]:
+
+        alpha, beta = params["alpha"], params["beta"]
+        dist = torch.distributions.Beta(alpha, beta)
+        if len(alpha.shape) > 1:
+            dist = torch.distributions.Independent(dist, 1)
+        scale = 2 * self.scale
+        loc = scale * (self.loc - 0.5)
+        transform = AffineTransform(loc=loc,
+                                    scale=scale)
+        assert transform(torch.zeros_like(self.scale)) == -self.scale
+        assert transform(torch.ones_like(self.scale)) == self.scale
+        mode_untransformed = dist.mode
+        mode = (mode_untransformed + self.loc - 0.5) * 2 * self.scale
+        transformed_dist = TransformedDistribution(dist, [transform])
+        return transformed_dist, mode
 
 
 class GymBoxCategorialAgent(GymAgent):
@@ -277,7 +374,7 @@ class GymBoxCategorialAgent(GymAgent):
         pi_x = self.pi_layers(state_encodings)
         action_logits = self.action_logits(pi_x)
         params = dict(logits=action_logits)
-        dist = self.construct_dist(params)
+        dist, _ = self.construct_dist(params)
         infos = {
             f"action_{i}_prob": prob
             for (i, prob) in enumerate(dist.probs.transpose(0, 1))
@@ -287,8 +384,9 @@ class GymBoxCategorialAgent(GymAgent):
 
     def construct_dist(
         self, params: dict[str, torch.Tensor]
-    ) -> torch.distributions.Categorical:
-        return torch.distributions.Categorical(logits=params["logits"])
+    ) -> [torch.distributions.Categorical, torch.Tensor]:
+        dist = torch.distributions.Categorical(logits=params["logits"])
+        return dist, dist.mode
 
 
 def make_gym_agent(
@@ -327,7 +425,8 @@ def make_gym_agent(
         action_size = flatten_shape(env.action_space.shape)
         loc = (env.action_space.high + env.action_space.low) / 2
         scale = (env.action_space.high - env.action_space.low) / 2
-        return GymBoxGaussianAgent(
+        # return GymBoxGaussianAgent(
+        return GymBoxBetaAgent(
             obs_size=obs_size,
             action_size=action_size,
             hidden_sizes=hidden_sizes,
@@ -511,7 +610,7 @@ def collect(
                             action_dist_params[k] = torch.stack(
                                 [agent_i[key] for agent_i in agent_infos[i]]
                             )
-                    action_dists = agent.construct_dist(action_dist_params)
+                    action_dists, _ = agent.construct_dist(action_dist_params)
 
                     episodes.append(
                         process_episode(
@@ -563,10 +662,14 @@ def episode_stats(episodes: list[dict[str, Any]]) -> dict[str, float]:
     returns = [ep["rewards"].sum() for ep in episodes]
     terminations = [ep["terminated"] for ep in episodes]
     lengths = [len(ep["rewards"]) for ep in episodes]
+    sampled_action_mean = [ep["actions"].mean() for ep in episodes]
+    sampled_action_std = [ep["actions"].std() for ep in episodes]
     stats = {
         "episode_total_rewards": float(np.mean(returns)),
         "episode_termination_rate": float(np.mean(terminations)),
         "episode_length": float(np.mean(lengths)),
+        "sampled_action_mean": sampled_action_mean,
+        "sampled_action_std": sampled_action_std,
     }
     if "success" in episodes[0]["env_infos"]:
         stats["episode_success_rate"] = float(
