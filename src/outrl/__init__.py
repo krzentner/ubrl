@@ -181,7 +181,6 @@ _OPTIMIZER_FIELDS = [
     "vf_lr_scheduler",
     "agent_lr_scheduler",
     "kl_coef_opt",
-    "entropy_coef_opt",
 ]
 
 _SUBMODULE_FIELDS = [
@@ -192,7 +191,6 @@ _SUBMODULE_FIELDS = [
 
 _PARAM_FIELDS = [
     "kl_coef",
-    "entropy_coef",
 ]
 
 _IGNORED_FIELDS = ["_is_full_backward_hook"]
@@ -280,9 +278,6 @@ class Trainer:
         )
         """Dynamically adjusted parameter used for KL regularization."""
 
-        self.entropy_coef: nn.Parameter = nn.Parameter(torch.tensor(0.0))
-        """Dynamically adjusted parameter used for entropy enforcing."""
-
         self.starting_entropy: Optional[float] = None
         """Initial mean entropy of action distributions, measured immediately
         at the start of cfg.entropy_schedule_start_train_step."""
@@ -326,11 +321,10 @@ class Trainer:
         )
 
         self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
-        self.entropy_coef_opt = torch.optim.AdamW(
-            [self.entropy_coef], lr=self.cfg.entropy_coef_lr
-        )
 
         self.total_agent_grad_steps = 0
+        self.agent_grad_steps_at_start_of_train_step = 0
+        self.agent_grad_steps_last_train_step = 0
 
     def _primary_loss_function(
         self, batch: list[tuple[_EpisodeData, _PolicyTrainingInputs, "AgentOutput"]]
@@ -570,13 +564,21 @@ class Trainer:
         return kl_loss_scaled, infos
 
     def _entropy_target(self) -> Optional[float]:
+        agent_grad_steps_this_train_step = (
+            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
+        )
+        progress_at_train_step = min(
+            1,
+            agent_grad_steps_this_train_step / max(1, self.agent_grad_steps_last_train_step)
+        )
+
         if self.starting_entropy is not None:
             # 0 at cfg.entropy_schedule_start_train_step
             # 1 at (and after) cfg.expected_train_steps
             step_fraction = min(
                 1,
                 (
-                    (1 + self.train_steps_so_far)
+                    (progress_at_train_step + self.train_steps_so_far)
                     - self.cfg.entropy_schedule_start_train_step
                 )
                 / (
@@ -620,37 +622,9 @@ class Trainer:
         )
         entropy_target = self._entropy_target()
         if entropy_target is not None:
-            # Tune entropy_coef
-            entropy_coef_loss = self.entropy_coef * (
-                entropy_target - entropy.detach().mean()
-            )
-            self.entropy_coef_opt.zero_grad()
-            entropy_coef_loss.backward()
-            try:
-                clip_grad_norm_([self.entropy_coef],
-                                max_norm=self.cfg.grad_norm_max,
-                                error_if_nonfinite=True)
-                self.entropy_coef_opt.step()
-            except RuntimeError:
-                # Probably inf gradients, don't apply them
-                pass
-
-            if self.entropy_coef < self.cfg.entropy_coef_min:
-                with torch.no_grad():
-                    self.entropy_coef.copy_(self.cfg.entropy_coef_min)
-            if self.entropy_coef > self.cfg.entropy_coef_max:
-                with torch.no_grad():
-                    self.entropy_coef.copy_(self.cfg.entropy_coef_max)
-            # Unclear why entropy_coef became non-finite, so set back
-            # to zero
-            if not torch.isfinite(self.entropy_coef):
-                with torch.no_grad():
-                    self.entropy_coef.copy_(0.0)
-
-            entropy_coef = self.entropy_coef.detach()
-            norm_coef = entropy_coef / self.cfg.minibatch_target_timesteps
-            entropy_loss = (norm_coef * entropy).sum()
+            entropy_loss = self.cfg.entropy_loss_coef * ((entropy - entropy_target) ** 2).sum()
         else:
+            entropy_target = float('nan')
             entropy_loss = torch.tensor(0.0)
 
         used_for_logging(approx_entropy)
@@ -787,6 +761,7 @@ class Trainer:
         All options for tuning this method are present in the TrainerConfig
         passed on Trainer initialization.
         """
+        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
         if len(self._replay_buffer) > self.cfg.replay_buffer_episodes:
             self._replay_buffer = list(
                 self._replay_buffer[-self.cfg.replay_buffer_episodes :]
@@ -919,6 +894,9 @@ class Trainer:
         self.vf.train(mode=False)
         self.train_steps_so_far += 1
         self._maybe_record_starting_entropy()
+        self.agent_grad_steps_last_train_step = (
+            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step)
+        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
 
         if timed_out:
             _LOGGER.error("train_step() timed out")
@@ -1937,8 +1915,7 @@ class TrainerConfig(simple_parsing.Serializable):
     )
     """Whether to schedule an entropy loss.
 
-    With None, no entropy schedule will be applied, and entropy_coef_init will
-    be used throughout training.
+    With None, no entropy loss will be applied.
 
     With "linear", entropy will be scaled down from the initial entropy at
     start of training to a fraction of that `entropy_schedule_end_fraction`.
@@ -1949,7 +1926,7 @@ class TrainerConfig(simple_parsing.Serializable):
 
     Overrides entropy_schedule_end_fraction."""
 
-    entropy_schedule_end_fraction: float = tunable(0.5, FloatDistribution(1e-6, 1.0, log=True))
+    entropy_schedule_end_fraction: float = tunable(0.01, FloatDistribution(1e-6, 1.0, log=True))
     """Portion of "starting entropy" to attempt to maintain at end of
     training.
 
@@ -1962,30 +1939,12 @@ class TrainerConfig(simple_parsing.Serializable):
     The default value measures the entropy after one train step.
     """
 
-    entropy_coef_init: float = tunable(0.1, FloatDistribution(0, 1.0))
-    """Entropy regularizer coefficient.
+    entropy_loss_coef: float = tunable(0.01, FloatDistribution(0.0, 1.0))
+    """Entropy coefficient.
 
-    Will be adjusted by the entropy schedule if entropy_schedule is set.
-
-    If both entropy_coef_init and entropy_coef_lr are 0, entropy regularization
-    is disabled.
-    """
-
-    entropy_coef_lr: float = tunable(1e-3, FloatDistribution(1e-5, 0.01, log=True))
-    """How quickly to adapt the loss coefficient for the entropy regularizer.
-
-    If set to 0, the entropy regularization coefficient will not be tuned
-    during training.
-    """
-
-    entropy_coef_min: float = tunable(-100, FloatDistribution(-1000, 0))
-    """Minimum value for the loss coefficient of the entropy regularizer.
-
-    Negative values actively decrease the entropy.
-    """
-
-    entropy_coef_max: float = tunable(100, FloatDistribution(0, 1000))
-    """Maximum value for the loss coefficient of the entropy regularizer.
+    Coefficient to apply to entropy loss.
+    By default the entropy loss is a mean squared error relative to
+    the entropy schedule.
     """
 
     awr_temperature: float = tunable(0.01, FloatDistribution(1e-2, 1e3, log=True))
