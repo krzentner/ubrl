@@ -33,6 +33,24 @@ from outrl.torch_utils import (
 )
 
 
+class RobustTransformedDist(TransformedDistribution):
+
+    def log_prob(self, value: torch.Tensor):
+        # Sometimes, sampling from a transformed distribution
+        # produces a value that the transformed distribution
+        # claims has 0 probability of being sampled.
+
+        # This is usually due to sampling at the edge of the distribution, so compensate by slightly shrinking the input.
+
+        log_probs = super().log_prob(value)
+        if not torch.isfinite(log_probs).all():
+            value = value / (1 + 1e-6)
+        log_probs = super().log_prob(value)
+        assert torch.isfinite(log_probs).all()
+        return log_probs
+
+
+
 class GymAgent(Agent):
     """Agent intended to be used with the Gym API."""
 
@@ -165,6 +183,8 @@ class GymAgent(Agent):
         batch_dist, _ = self.construct_dist(params)
         state_encodings = unpack_tensors(state_encodings, pack_lens)
         packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
+        assert torch.isfinite(packed_action_ll).all()
+
         unpacked_params = {k: unpack_tensors(v, pack_lens) for (k, v) in params.items()}
         dists = [
             self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
@@ -193,8 +213,8 @@ class GymBoxGaussianAgent(GymAgent):
         *,
         obs_size: int,
         action_size: int,
-        hidden_sizes: list[int],
-        pi_hidden_sizes: list[int],
+        hidden_sizes: Sizes,
+        pi_hidden_sizes: Sizes,
         init_std: float,
         min_std: float,
         loc: np.ndarray,

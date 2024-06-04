@@ -1940,7 +1940,7 @@ class TrainerConfig(simple_parsing.Serializable):
     The default value measures the entropy after one train step.
     """
 
-    entropy_loss_coef: float = tunable(0.01, FloatDistribution(0.0, 1.0))
+    entropy_loss_coef: float = tunable(0.001, FloatDistribution(0.0, 1.0))
     """Entropy coefficient.
 
     Coefficient to apply to entropy loss.
@@ -2058,7 +2058,7 @@ def _discount_cumsum(x: torch.Tensor, discount: float):
     x = x.reshape(B, 1, L)
     # Add pad end of episodes to zero
     # Only need 2l - 1 timesteps to make index L valid
-    x_pad = torch.cat([x, torch.zeros_like(x[:, :, :-1])], axis=-1)
+    x_pad = torch.cat([x, torch.zeros_like(x[:, :, :-1])], dim=-1)
     returns = F.conv1d(x_pad, weights, stride=1)
     assert returns.shape == (B, 1, L)
     return returns.squeeze()
