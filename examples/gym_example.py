@@ -46,7 +46,7 @@ class GymConfig(TrainerConfig):
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
-    init_std: float = tunable(0.75,
+    init_std: float = tunable(0.5,
                               FloatDistribution(0.0, 2.0))
     """Only used for Box shaped action spaces."""
     min_std: float = tunable(1e-6, FloatDistribution(1e-6, 0.1, log=True))

@@ -667,6 +667,64 @@ def force_concat(elements: Sequence[torch.Tensor]) -> torch.Tensor:
         return torch.tensor(elements)
 
 
+def clamp_identity_grad(value: torch.Tensor,
+                        min: Optional[torch.Tensor | float] = None,
+                        max: Optional[torch.Tensor | float] = None):
+    """A clamp operation that has the same gradients as the
+    identity function (i.e. dy/dx = 1).
+
+    See also `soft_clamp`, which likely produces more useful
+    gradients at the cost of non-linear behavior.
+
+    """
+    if min is not None:
+        min_error = torch.clamp(min - value, min=0.0)
+        value = value + min_error
+    if max is not None:
+        max_error = torch.clamp(value - max, min=0.0)
+        value = value - max_error
+    return value
+
+
+def soft_clamp(value: torch.Tensor,
+               min: Optional[torch.Tensor | float] = None,
+               max: Optional[torch.Tensor | float] = None,
+               scale: Optional[torch.Tensor | float] = None) -> torch.Tensor:
+    """Implements smooth clamping using tanh."""
+    if min is None and max is None:
+        return value
+    elif min is not None and max is not None:
+        midpoint = (max + min) / 2
+        if scale is None:
+            scale = (max - min) / 2
+        x = (value - midpoint) / scale
+        y = (torch.tanh(x) * scale) + midpoint
+        assert (min <= y).all()
+        assert (y <= max).all()
+        return y
+    elif min is not None and max is None:
+        assert scale is not None
+        zero_point = min + scale
+        x = (value - zero_point) / scale
+        y = (torch.tanh(x) * scale) + zero_point
+        res = torch.where(value > zero_point,
+                          value,
+                          y)
+        assert (min <= res).all()
+        return res
+    else:
+        assert min is None and max is not None
+        assert scale is not None
+        zero_point = max - scale
+        x = (value - zero_point) / scale
+        y = (torch.tanh(x) * scale) + zero_point
+        res = torch.where(value < zero_point,
+                           value,
+                           y)
+        assert (res <= max).all()
+        return res
+
+
 class NOPLRScheduler(torch.optim.lr_scheduler.LRScheduler):
     """Learning rate scheduler that just uses a constant learning rate."""
 

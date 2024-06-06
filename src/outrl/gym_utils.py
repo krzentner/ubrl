@@ -30,17 +30,25 @@ from outrl.torch_utils import (
     pack_tensors,
     unpack_tensors,
     Sizes,
+    clamp_identity_grad,
+    soft_clamp,
 )
 
 
 class RobustTransformedDist(TransformedDistribution):
+    """A hack to avoid the situation where
+    dist.log_prob(dist.sample()) gives non-finite values.
+
+    """
 
     def log_prob(self, value: torch.Tensor):
         # Sometimes, sampling from a transformed distribution
         # produces a value that the transformed distribution
         # claims has 0 probability of being sampled.
 
-        # This is usually due to sampling at the edge of the distribution, so compensate by slightly shrinking the input.
+        # This is usually due to sampling at the edge of the
+        # distribution, so compensate by slightly shrinking the
+        # input.
 
         log_probs = super().log_prob(value)
         if not torch.isfinite(log_probs).all():
@@ -67,8 +75,7 @@ class GymAgent(Agent):
 
             obs_size (int): Flattened size of observations.
             hidden_sizes (Sizes): Sizes of latent representations for the shared layers.
-            pi_hidden_sizes (Sizes): Sizes of latent representations for the
-                policy specific layers.
+            pi_hidden_sizes (Sizes): Sizes of latent representations for the policy specific layers.
         """
         super().__init__(hidden_sizes[-1])
 
@@ -248,7 +255,7 @@ class GymBoxGaussianAgent(GymAgent):
         mean = self.action_mean(pi_x)
         mean_adjusted = mean + self.loc
         std_pre_clamp = self.action_logstd(pi_x).exp()
-        std = torch.clamp(std_pre_clamp, min=self.min_std)
+        std = clamp_identity_grad(std_pre_clamp, min=self.min_std)
         std_adjusted = std * self.scale
         params = dict(mean=mean_adjusted, std=std_adjusted)
         return (
@@ -281,8 +288,8 @@ class GymBoxBetaAgent(GymAgent):
         *,
         obs_size: int,
         action_size: int,
-        hidden_sizes: list[int],
-        pi_hidden_sizes: list[int],
+        hidden_sizes: Sizes,
+        pi_hidden_sizes: Sizes,
         init_std: float,
         min_std: float,
         loc: np.ndarray,
@@ -316,23 +323,27 @@ class GymBoxBetaAgent(GymAgent):
 
         # Center the mean output in the beta distribution and
         # clamp to 0.0 to 1.0 range
-        mean = torch.clamp(self.action_mean(pi_x) + 0.5,
-                           min=0.0, max=1.0)
+        mean = clamp_identity_grad(
+                self.action_mean(pi_x) + 0.5,
+                min=0.0, max=1.0)
 
-        std_pre_clamp = self.action_logstd(pi_x).exp()
-        std = torch.clamp(std_pre_clamp, min=self.min_std)
+        std = self.action_logstd(pi_x).exp()
         var = std ** 2
 
         # Constraint of the beta distribution:
-        #  mean * (1 - mean) < var
-        # To ensure this constraint is fulfilled, compute an
-        # error:
-        error = torch.clamp(mean * (1 - mean) - var, min=0.0)
-        var_clipped = var - error
+        #  mean * (1 - mean) > var
+        max_allowed_var = mean * (1 - mean)
+        var_clipped = soft_clamp(
+            var,
+            min=self.min_std ** 2,
+            max=max_allowed_var.detach())
 
         v = mean * (1 - mean) / var_clipped - 1
         alpha = mean * v
         beta = (1 - mean) * v
+
+        assert (0 <= alpha).all()
+        assert (0 <= beta).all()
 
         mean_adjusted = (mean - 0.5) + self.loc
         std_adjusted = var_clipped.sqrt() * 2 * self.scale
@@ -342,7 +353,7 @@ class GymBoxBetaAgent(GymAgent):
             state_encodings,
             params,
             {
-                "action_stddev_unclamped": std_pre_clamp.mean(dim=-1),
+                "action_stddev_unclamped": std.mean(dim=-1),
             },
         )
 
@@ -361,8 +372,12 @@ class GymBoxBetaAgent(GymAgent):
         assert transform(torch.zeros_like(self.scale)) == -self.scale
         assert transform(torch.ones_like(self.scale)) == self.scale
         mode_untransformed = dist.mode
+        mode_untransformed[~torch.isfinite(mode_untransformed)] = dist.mean[~torch.isfinite(mode_untransformed)]
+        assert torch.isfinite(mode_untransformed).all()
+
         mode = (mode_untransformed + self.loc - 0.5) * 2 * self.scale
-        transformed_dist = TransformedDistribution(dist, [transform])
+
+        transformed_dist = RobustTransformedDist(dist, [transform])
         return transformed_dist, mode
 
 
@@ -376,8 +391,8 @@ class GymBoxCategorialAgent(GymAgent):
         *,
         obs_size: int,
         action_size: int,
-        hidden_sizes: list[int],
-        pi_hidden_sizes: list[int],
+        hidden_sizes: Sizes,
+        pi_hidden_sizes: Sizes,
     ):
         super().__init__(
             obs_size=obs_size,
@@ -445,8 +460,7 @@ def make_gym_agent(
         action_size = flatten_shape(env.action_space.shape)
         loc = (env.action_space.high + env.action_space.low) / 2
         scale = (env.action_space.high - env.action_space.low) / 2
-        # return GymBoxGaussianAgent(
-        return GymBoxBetaAgent(
+        return GymBoxGaussianAgent(
             obs_size=obs_size,
             action_size=action_size,
             hidden_sizes=hidden_sizes,
