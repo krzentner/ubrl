@@ -94,8 +94,13 @@ class GymAgent(Agent):
             input_size=hidden_sizes[-1], hidden_sizes=pi_hidden_sizes, use_dropout=False
         )
 
-        self.dtype = torch.float32
-        self.device = "cpu"
+    @property
+    def _input_device(self):
+        return self.shared_layers[0].mean.device
+
+    @property
+    def _input_dtype(self):
+        return self.shared_layers[0].mean.dtype
 
     def run_net(
         self, obs: torch.Tensor
@@ -145,8 +150,7 @@ class GymAgent(Agent):
         with torch.no_grad():
             _, params, infos = self.run_net(
                 torch.from_numpy(observations)
-                .to(dtype=self.dtype)
-                .to(device=self.device)
+                .to(dtype=self._input_dtype, device=self._input_device)
             )
         dist, mode = self.construct_dist(params)
         if best_action:
@@ -160,7 +164,7 @@ class GymAgent(Agent):
                 "action_ll": action_ll,
             }
         )
-        return np.asarray(action), infos
+        return np.asarray(action.cpu()), infos
 
     def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[AgentOutput]:
         """Implements the OutRL forward pass API in terms of run_net().
@@ -174,7 +178,7 @@ class GymAgent(Agent):
             A list of AgentOutput objects.
         """
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
-        observations = observations.to(dtype=self.dtype).to(device=self.device)
+        observations = observations.to(dtype=self._input_dtype, device=self._input_device)
         # Add a trailing fake action so each observation has an action afterwards
         actions, action_pack_lens = pack_tensors(
             [
@@ -182,7 +186,7 @@ class GymAgent(Agent):
                 for ep in episodes
             ]
         )
-        actions = actions.to(dtype=self.dtype).to(device=self.device)
+        actions = actions.to(dtype=self._input_dtype, device=self._input_device)
         assert action_pack_lens == pack_lens
         state_encodings, params, infos = self.run_net(observations)
         del infos
@@ -696,8 +700,8 @@ def episode_stats(episodes: list[dict[str, Any]]) -> dict[str, float]:
     returns = [ep["rewards"].sum() for ep in episodes]
     terminations = [ep["terminated"] for ep in episodes]
     lengths = [len(ep["rewards"]) for ep in episodes]
-    sampled_action_mean = [ep["actions"].mean() for ep in episodes]
-    sampled_action_std = [ep["actions"].std() for ep in episodes]
+    sampled_action_mean = [ep["actions"].float().mean() for ep in episodes]
+    sampled_action_std = [ep["actions"].float().std() for ep in episodes]
     stats = {
         "episode_total_rewards": float(np.mean(returns)),
         "episode_termination_rate": float(np.mean(terminations)),

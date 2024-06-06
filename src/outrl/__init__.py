@@ -230,7 +230,7 @@ class Trainer:
         (except via load_state_dict()).
         """
 
-        self.agent: "Agent" = agent
+        self.agent: "Agent" = agent.to(device=self.cfg.device)
         """The agent being optimized. Provides action (log-likelihoods) and
         state encodings."""
 
@@ -241,7 +241,7 @@ class Trainer:
             hidden_sizes=self.cfg.vf_hidden_sizes,
             output_size=0,
             use_dropout=True,
-        )
+        ).to(device=self.cfg.device)
         """The value function. Feed-forward networks that predicts future
         rewards from state_encodings."""
 
@@ -249,7 +249,7 @@ class Trainer:
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer: RunningMeanVar = RunningMeanVar(use_mean=False)
+        self.reward_normalizer: RunningMeanVar = RunningMeanVar(use_mean=False).to(self.cfg.device)
         """Normalized used to make rewards have unit variance if
         cfg.normalize_rewards is True."""
 
@@ -274,7 +274,7 @@ class Trainer:
         """Number of (completed) train_step() calls at last periodic checkpoint."""
 
         self.kl_coef: nn.Parameter = nn.Parameter(
-            torch.tensor(float(self.cfg.kl_coef_init))
+            torch.tensor(float(self.cfg.kl_coef_init), device=self.cfg.device)
         )
         """Dynamically adjusted parameter used for KL regularization."""
 
@@ -926,7 +926,7 @@ class Trainer:
         )
         assert not state_enc_packed.requires_grad
 
-        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer]).to(device=self.cfg.device)
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
@@ -962,6 +962,7 @@ class Trainer:
                         if self._replay_buffer[i].terminated:
                             vf_x[i, episode_length] = 0.0
                             terminated[i] = True
+                    terminated = terminated.to(device=self.cfg.device)
 
                     with torch.no_grad():
                         _, vf_targets = _v_trace_estimation(
@@ -1095,10 +1096,10 @@ class Trainer:
 
         action_lls_now = pad_tensors(
             [agent_out.action_lls for agent_out in agent_outputs]
-        )
+        ).to(device=self.cfg.device)
         original_action_lls = pad_tensors(
             [data.original_action_lls for data in self._replay_buffer]
-        )
+        ).to(device=self.cfg.device)
         terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
 
         vf_returns = pad_packed(vf_returns_packed, obs_lens)
@@ -1111,8 +1112,9 @@ class Trainer:
             if self._replay_buffer[i].terminated:
                 vf_returns[i, episode_length] = 0.0
                 terminated[i] = True
+        terminated = terminated.to(device=self.cfg.device)
 
-        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer])
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer]).to(device=self.cfg.device)
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
@@ -1131,7 +1133,7 @@ class Trainer:
             action_lls=action_lls_now,
             original_action_lls=original_action_lls,
             terminated=terminated,
-            episode_lengths=torch.tensor(episode_lengths),
+            episode_lengths=torch.tensor(episode_lengths, device=self.cfg.device),
         )
 
         adv_packed = pack_padded(padded_advantages, episode_lengths)
@@ -2029,6 +2031,9 @@ class TrainerConfig(simple_parsing.Serializable):
     Many errors at once usually indicate that training cannot continue, so the
     error should be re-raised to avoid wasting time.
     """
+
+    device: str = 'cpu'
+    """PyTorch device to use for optimization."""
 
     def __post_init__(self):
         """Fill in values with non-constant defaults. Called after construction."""
