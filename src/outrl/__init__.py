@@ -622,7 +622,7 @@ class Trainer:
         )
         entropy_target = self._entropy_target()
         if entropy_target is not None:
-            entropy_loss = self.cfg.entropy_loss_coef * ((entropy - entropy_target) ** 2).sum()
+            entropy_loss = self.cfg.entropy_loss_coef * ((entropy - entropy_target).sum() ** 2)
         else:
             entropy_target = entropy
             entropy_loss = torch.tensor(0.0)
