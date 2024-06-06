@@ -1,0 +1,12 @@
+env_name: Pendulum-v1
+n_train_steps: 20
+vf_lr_schedule: cosine
+agent_lr_schedule: cosine
+entropy_schedule: cosine
+entropy_schedule_end_fraction: 0.5
+train_step_timeout_seconds: 30
+minibatch_target_timesteps: 1024
+tb_log_level: TRACE
+ppo_loss_coef: 0.0
+awr_loss_coef: 1.0
+checkpoint_interval: 100
