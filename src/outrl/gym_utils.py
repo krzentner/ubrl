@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.distributions import TransformedDistribution, AffineTransform
 from tqdm import tqdm
 
-from outrl import Agent, AgentOutput
+from outrl import Agent, AgentInput, AgentOutput
 from outrl.torch_utils import (
     force_concat,
     make_mlp,
@@ -166,7 +166,7 @@ class GymAgent(Agent):
         )
         return np.asarray(action.cpu()), infos
 
-    def forward(self, episodes: list[dict[str, torch.Tensor]]) -> list[AgentOutput]:
+    def forward(self, inputs: AgentInput) -> AgentOutput:
         """Implements the OutRL forward pass API in terms of run_net().
 
         Args:
@@ -177,6 +177,7 @@ class GymAgent(Agent):
 
             A list of AgentOutput objects.
         """
+        episodes = inputs.episodes
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
         observations = observations.to(dtype=self._input_dtype, device=self._input_device)
         # Add a trailing fake action so each observation has an action afterwards
@@ -192,24 +193,17 @@ class GymAgent(Agent):
         del infos
 
         batch_dist, _ = self.construct_dist(params)
-        state_encodings = unpack_tensors(state_encodings, pack_lens)
-        packed_action_ll = batch_dist.log_prob(actions).squeeze(-1)
-        assert torch.isfinite(packed_action_ll).all()
+        action_lls = batch_dist.log_prob(actions).squeeze(-1)
+        assert torch.isfinite(action_lls).all()
 
         unpacked_params = {k: unpack_tensors(v, pack_lens) for (k, v) in params.items()}
         dists = [
             self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
             for i in range(len(episodes))
         ]
-        action_lls = [
-            act_lls[:-1] for act_lls in unpack_tensors(packed_action_ll, pack_lens)
-        ]
-        return [
-            AgentOutput(
-                state_encodings=state_enc, action_lls=act_lls, action_dists=dist
-            )
-            for (state_enc, act_lls, dist) in zip(state_encodings, action_lls, dists)
-        ]
+        return AgentOutput(
+            state_encodings=state_encodings, action_lls=action_lls, action_dists=dists
+        )
 
 
 class GymBoxGaussianAgent(GymAgent):

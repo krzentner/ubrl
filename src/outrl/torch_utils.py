@@ -60,7 +60,7 @@ class CustomTorchDist:
 ActionDist = Union[
     torch.distributions.Distribution,
     CustomTorchDist,
-    Union[list[torch.distributions.Distribution], list[CustomTorchDist]],
+    list["ActionDist"],
 ]
 
 
@@ -367,6 +367,50 @@ class RunningMeanVar(nn.Module):
         dst[f"{prefix}.var"] = self.var.mean().item()
         dst[f"{prefix}.mean"] = self.mean.mean().item()
         dst[f"{prefix}.count"] = self.count
+
+
+def pack_dataclass(data: list[T]) -> tuple[T, list[int]]:
+    """Pack a list of dataclasses containing tensors into a single instance of
+    that dataclass.
+    All fields must be torch.Tensors of the same length.
+    """
+    lengths = None
+    field_values = {}
+    for field in dataclasses.fields(data[0]):
+        prefix = f"{prefix}.{field}"
+        packed_field, new_lengths = pack_tensors(
+            [getattr(d, field.name) for d in data]
+        )
+        if lengths is None:
+            lengths = new_lengths
+        assert new_lengths == lengths
+        field_values[field.name] = packed_field
+    assert lengths is not None
+    return dataclasses.replace(data[0], **field_values), lengths
+
+
+def unpack_dataclass(data: T, lengths: list[int]) -> list[T]:
+    """Pack a list of dataclasses containing tensors into a single instance of
+    that dataclass.
+    All fields must be torch.Tensors of the same length.
+    """
+    fields_unpacked = {
+        field.name: unpack_tensors(getattr(data, field.name), lengths)
+        for field in dataclasses.fields(data)
+    }
+    results = [dataclasses.replace(data, **{
+        k: v[i] for (k, v) in fields_unpacked.items()
+        }) for i in range(len(lengths))]
+    return results
+
+
+def truncate_packed(tensor: torch.Tensor, new_lengths: list[int], to_cut: int) -> torch.Tensor:
+    """Truncate a packed tensor by a fixed number of elements along the first dimension."""
+    assert tensor.shape[0] == sum(new_lengths) + to_cut * len(new_lengths)
+    unpacked = unpack_tensors(tensor, [length + to_cut for length in new_lengths])
+    repacked = pack_tensors([t[:-to_cut] for t in unpacked])[0]
+    assert repacked.shape[0] == sum(new_lengths)
+    return repacked
 
 
 def pack_recursive(
@@ -762,3 +806,27 @@ def used_for_logging(*args):
     "inform" the linter.
     """
     del args
+
+
+def discount_cumsum(x: torch.Tensor, discount: float) -> torch.Tensor:
+    """Discounted cumulative sum."""
+    B, L = x.shape
+    discount_x = discount * torch.ones_like(x[0])
+    discount_x[0] = 1.0
+    # Compute discount weights.
+    weights = torch.cumprod(discount_x, dim=0)
+    # Add channel in dimensions and channel out dimensions
+    weights = weights.reshape(1, 1, L)
+    x = x.reshape(B, 1, L)
+    # Add pad end of episodes to zero
+    # Only need 2l - 1 timesteps to make index L valid
+    x_pad = torch.cat([x, torch.zeros_like(x[:, :, :-1])], dim=-1)
+    returns = F.conv1d(x_pad, weights, stride=1)
+    assert returns.shape == (B, 1, L)
+    return returns.squeeze()
+
+def concat_lists(lists: list[list[T]]) -> list[T]:
+    new_list = []
+    for l in lists:
+        new_list.extend(l)
+    return new_list
