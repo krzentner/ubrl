@@ -32,6 +32,7 @@ from outrl.torch_utils import (
     Sizes,
     clamp_identity_grad,
     soft_clamp,
+    truncate_packed,
 )
 
 
@@ -201,8 +202,10 @@ class GymAgent(Agent):
             self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
             for i in range(len(episodes))
         ]
+        action_lls_valid = truncate_packed(action_lls,
+                                           [pack_len - 1 for pack_len in action_pack_lens], 1)
         return AgentOutput(
-            state_encodings=state_encodings, action_lls=action_lls, action_dists=dists
+            state_encodings=state_encodings, action_lls=action_lls_valid, action_dists=dists
         )
 
 
