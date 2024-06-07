@@ -378,9 +378,7 @@ def pack_dataclass(data: list[T]) -> tuple[T, list[int]]:
     field_values = {}
     for field in dataclasses.fields(data[0]):
         prefix = f"{prefix}.{field}"
-        packed_field, new_lengths = pack_tensors(
-            [getattr(d, field.name) for d in data]
-        )
+        packed_field, new_lengths = pack_tensors([getattr(d, field.name) for d in data])
         if lengths is None:
             lengths = new_lengths
         assert new_lengths == lengths
@@ -398,13 +396,16 @@ def unpack_dataclass(data: T, lengths: list[int]) -> list[T]:
         field.name: unpack_tensors(getattr(data, field.name), lengths)
         for field in dataclasses.fields(data)
     }
-    results = [dataclasses.replace(data, **{
-        k: v[i] for (k, v) in fields_unpacked.items()
-        }) for i in range(len(lengths))]
+    results = [
+        dataclasses.replace(data, **{k: v[i] for (k, v) in fields_unpacked.items()})
+        for i in range(len(lengths))
+    ]
     return results
 
 
-def truncate_packed(tensor: torch.Tensor, new_lengths: list[int], to_cut: int) -> torch.Tensor:
+def truncate_packed(
+    tensor: torch.Tensor, new_lengths: list[int], to_cut: int
+) -> torch.Tensor:
     """Truncate a packed tensor by a fixed number of elements along the first dimension."""
     assert tensor.shape[0] == sum(new_lengths) + to_cut * len(new_lengths)
     unpacked = unpack_tensors(tensor, [length + to_cut for length in new_lengths])
@@ -618,8 +619,7 @@ def split_shuffled_indices(
     return indices[:split_i], indices[split_i:]
 
 
-def softmax_clip(x: torch.Tensor,
-                 max_exp: torch.Tensor) -> torch.Tensor:
+def softmax_clip(x: torch.Tensor, max_exp: torch.Tensor) -> torch.Tensor:
     """Compute softmax of input, clipping exponential values to a
     maximal value.
     """
@@ -711,9 +711,11 @@ def force_concat(elements: Sequence[torch.Tensor]) -> torch.Tensor:
         return torch.tensor(elements)
 
 
-def clamp_identity_grad(value: torch.Tensor,
-                        min: Optional[torch.Tensor | float] = None,
-                        max: Optional[torch.Tensor | float] = None):
+def clamp_identity_grad(
+    value: torch.Tensor,
+    min: Optional[torch.Tensor | float] = None,
+    max: Optional[torch.Tensor | float] = None,
+):
     """A clamp operation that has the same gradients as the
     identity function (i.e. dy/dx = 1).
 
@@ -730,10 +732,12 @@ def clamp_identity_grad(value: torch.Tensor,
     return value
 
 
-def soft_clamp(value: torch.Tensor,
-               min: Optional[torch.Tensor | float] = None,
-               max: Optional[torch.Tensor | float] = None,
-               scale: Optional[torch.Tensor | float] = None) -> torch.Tensor:
+def soft_clamp(
+    value: torch.Tensor,
+    min: Optional[torch.Tensor | float] = None,
+    max: Optional[torch.Tensor | float] = None,
+    scale: Optional[torch.Tensor | float] = None,
+) -> torch.Tensor:
     """Implements smooth clamping using tanh."""
     if min is None and max is None:
         return value
@@ -751,9 +755,7 @@ def soft_clamp(value: torch.Tensor,
         zero_point = min + scale
         x = (value - zero_point) / scale
         y = (torch.tanh(x) * scale) + zero_point
-        res = torch.where(value > zero_point,
-                          value,
-                          y)
+        res = torch.where(value > zero_point, value, y)
         assert (min <= res).all()
         return res
     else:
@@ -762,9 +764,7 @@ def soft_clamp(value: torch.Tensor,
         zero_point = max - scale
         x = (value - zero_point) / scale
         y = (torch.tanh(x) * scale) + zero_point
-        res = torch.where(value < zero_point,
-                           value,
-                           y)
+        res = torch.where(value < zero_point, value, y)
         assert (res <= max).all()
         return res
 
@@ -824,6 +824,7 @@ def discount_cumsum(x: torch.Tensor, discount: float) -> torch.Tensor:
     returns = F.conv1d(x_pad, weights, stride=1)
     assert returns.shape == (B, 1, L)
     return returns.squeeze()
+
 
 def concat_lists(lists: list[list[T]]) -> list[T]:
     new_list = []

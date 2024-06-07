@@ -2,19 +2,18 @@ import torch
 from torch.nn.functional import soft_margin_loss
 from outrl.torch_utils import clamp_identity_grad, soft_clamp
 
+
 def test_clamp_identity_grad():
     a = torch.tensor([-2, -1, 0, 1, 2])
     a_clamp = clamp_identity_grad(a, min=1.0)
-    assert torch.allclose(a_clamp,
-                          torch.tensor([1, 1, 1, 1, 2]).float())
+    assert torch.allclose(a_clamp, torch.tensor([1, 1, 1, 1, 2]).float())
 
     a_clamp = clamp_identity_grad(a, max=1.0)
-    assert torch.allclose(a_clamp,
-                          torch.tensor([-2, -1, 0, 1, 1]).float())
+    assert torch.allclose(a_clamp, torch.tensor([-2, -1, 0, 1, 1]).float())
 
     a_clamp = clamp_identity_grad(a, min=0.0, max=1.0)
-    assert torch.allclose(a_clamp,
-                          torch.tensor([0, 0, 0, 1, 1]).float()    )
+    assert torch.allclose(a_clamp, torch.tensor([0, 0, 0, 1, 1]).float())
+
 
 def test_soft_clamp():
     a = torch.tensor([-2, -1, 0, 1, 2])

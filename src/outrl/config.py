@@ -174,9 +174,7 @@ def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str
     if cfg.parquet_logging:
         from noko.arrow_output import ArrowOutputEngine
 
-        noko.add_output(
-            ArrowOutputEngine(runs_dir=cfg.runs_dir, run_name=cfg.run_name)
-        )
+        noko.add_output(ArrowOutputEngine(runs_dir=cfg.runs_dir, run_name=cfg.run_name))
 
     return cfg
 
@@ -288,9 +286,7 @@ def cmd_tune(
     save_yaml(overrides, os.path.join(run_dir, "overrides.yaml"))
 
     # Setup basic noko logging
-    noko.init_extra(
-        runs_dir=runs_dir, run_name=run_name, stderr_log_level=noko.INFO
-    )
+    noko.init_extra(runs_dir=runs_dir, run_name=run_name, stderr_log_level=noko.INFO)
     from noko.pprint_output import PPrintOutputEngine
 
     noko.add_output(PPrintOutputEngine("stdout"))

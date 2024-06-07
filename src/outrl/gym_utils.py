@@ -13,6 +13,7 @@ inheriting from the classes defined here.
 .. include:: ../../examples/gym_example.py
 ```
 """
+
 from typing import Optional, Any
 
 import numpy as np
@@ -57,7 +58,6 @@ class RobustTransformedDist(TransformedDistribution):
         log_probs = super().log_prob(value)
         assert torch.isfinite(log_probs).all()
         return log_probs
-
 
 
 class GymAgent(Agent):
@@ -150,8 +150,9 @@ class GymAgent(Agent):
         assert len(observations.shape) == 2
         with torch.no_grad():
             _, params, infos = self.run_net(
-                torch.from_numpy(observations)
-                .to(dtype=self._input_dtype, device=self._input_device)
+                torch.from_numpy(observations).to(
+                    dtype=self._input_dtype, device=self._input_device
+                )
             )
         dist, mode = self.construct_dist(params)
         if best_action:
@@ -180,7 +181,9 @@ class GymAgent(Agent):
         """
         episodes = inputs.episodes
         observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
-        observations = observations.to(dtype=self._input_dtype, device=self._input_device)
+        observations = observations.to(
+            dtype=self._input_dtype, device=self._input_device
+        )
         # Add a trailing fake action so each observation has an action afterwards
         actions, action_pack_lens = pack_tensors(
             [
@@ -202,10 +205,13 @@ class GymAgent(Agent):
             self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
             for i in range(len(episodes))
         ]
-        action_lls_valid = truncate_packed(action_lls,
-                                           [pack_len - 1 for pack_len in action_pack_lens], 1)
+        action_lls_valid = truncate_packed(
+            action_lls, [pack_len - 1 for pack_len in action_pack_lens], 1
+        )
         return AgentOutput(
-            state_encodings=state_encodings, action_lls=action_lls_valid, action_dists=dists
+            state_encodings=state_encodings,
+            action_lls=action_lls_valid,
+            action_dists=dists,
         )
 
 
@@ -305,7 +311,9 @@ class GymBoxBetaAgent(GymAgent):
         self.action_mean = nn.Linear(pi_hidden_sizes[-1], action_size)
 
         self.action_logstd = nn.Linear(pi_hidden_sizes[-1], action_size)
-        nn.init.constant_(self.action_logstd.bias, torch.tensor(init_std / 2).log().item())
+        nn.init.constant_(
+            self.action_logstd.bias, torch.tensor(init_std / 2).log().item()
+        )
         nn.init.orthogonal_(
             self.action_logstd.weight, gain=torch.tensor(init_std / 2).log().item()
         )
@@ -324,20 +332,15 @@ class GymBoxBetaAgent(GymAgent):
 
         # Center the mean output in the beta distribution and
         # clamp to 0.0 to 1.0 range
-        mean = clamp_identity_grad(
-                self.action_mean(pi_x) + 0.5,
-                min=0.0, max=1.0)
+        mean = clamp_identity_grad(self.action_mean(pi_x) + 0.5, min=0.0, max=1.0)
 
         std = self.action_logstd(pi_x).exp()
-        var = std ** 2
+        var = std**2
 
         # Constraint of the beta distribution:
         #  mean * (1 - mean) > var
         max_allowed_var = mean * (1 - mean)
-        var_clipped = soft_clamp(
-            var,
-            min=self.min_std ** 2,
-            max=max_allowed_var.detach())
+        var_clipped = soft_clamp(var, min=self.min_std**2, max=max_allowed_var.detach())
 
         v = mean * (1 - mean) / var_clipped - 1
         alpha = mean * v
@@ -348,8 +351,7 @@ class GymBoxBetaAgent(GymAgent):
 
         mean_adjusted = (mean - 0.5) + self.loc
         std_adjusted = var_clipped.sqrt() * 2 * self.scale
-        params = dict(mean=mean_adjusted, std=std_adjusted,
-                      alpha=alpha, beta=beta)
+        params = dict(mean=mean_adjusted, std=std_adjusted, alpha=alpha, beta=beta)
         return (
             state_encodings,
             params,
@@ -368,12 +370,13 @@ class GymBoxBetaAgent(GymAgent):
             dist = torch.distributions.Independent(dist, 1)
         scale = 2 * self.scale
         loc = scale * (self.loc - 0.5)
-        transform = AffineTransform(loc=loc,
-                                    scale=scale)
+        transform = AffineTransform(loc=loc, scale=scale)
         assert transform(torch.zeros_like(self.scale)) == -self.scale
         assert transform(torch.ones_like(self.scale)) == self.scale
         mode_untransformed = dist.mode
-        mode_untransformed[~torch.isfinite(mode_untransformed)] = dist.mean[~torch.isfinite(mode_untransformed)]
+        mode_untransformed[~torch.isfinite(mode_untransformed)] = dist.mean[
+            ~torch.isfinite(mode_untransformed)
+        ]
         assert torch.isfinite(mode_untransformed).all()
 
         mode = (mode_untransformed + self.loc - 0.5) * 2 * self.scale

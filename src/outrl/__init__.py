@@ -70,6 +70,7 @@ T = TypeVar("T")
 
 EpisodeID = int
 
+
 @dataclass(eq=False)
 class _EpisodeData:
     """Wrapper around an episode that maintains metadata and caches computed values."""
@@ -211,7 +212,8 @@ class LossInput:
                 new_fields[field.name] = concat_lists(field_vals)
             else:
                 new_fields[field.name] = torch.cat(
-                    [getattr(li, field.name) for li in loss_inputs])
+                    [getattr(li, field.name) for li in loss_inputs]
+                )
         return cls(**new_fields)
 
 
@@ -283,12 +285,14 @@ class Trainer:
 
         self._state_encoding_size = self.agent.state_encoding_size
 
-        self.vf: nn.Module = self._prepare(make_mlp(
-            input_size=self._state_encoding_size,
-            hidden_sizes=self.cfg.vf_hidden_sizes,
-            output_size=0,
-            use_dropout=True,
-        ))
+        self.vf: nn.Module = self._prepare(
+            make_mlp(
+                input_size=self._state_encoding_size,
+                hidden_sizes=self.cfg.vf_hidden_sizes,
+                output_size=0,
+                use_dropout=True,
+            )
+        )
         """The value function. Feed-forward networks that predicts future
         rewards from state_encodings."""
 
@@ -296,7 +300,9 @@ class Trainer:
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer: RunningMeanVar = RunningMeanVar(use_mean=False).to(self.device)
+        self.reward_normalizer: RunningMeanVar = RunningMeanVar(use_mean=False).to(
+            self.device
+        )
         """Normalized used to make rewards have unit variance if
         cfg.normalize_rewards is True."""
 
@@ -445,7 +451,8 @@ class Trainer:
         self, loss_input: LossInput, agent_output: "AgentOutput"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         state_enc_packed = truncate_packed(
-            agent_output.state_encodings, loss_input.episode_lengths, 1)
+            agent_output.state_encodings, loss_input.episode_lengths, 1
+        )
         critic_out = self.vf(state_enc_packed)
         vf_loss = F.mse_loss(critic_out, loss_input.vf_targets)
 
@@ -497,9 +504,9 @@ class Trainer:
         self.kl_coef_opt.zero_grad()
         kl_coef_loss.backward()
         try:
-            clip_grad_norm_([self.kl_coef],
-                            max_norm=self.cfg.grad_norm_max,
-                            error_if_nonfinite=True)
+            clip_grad_norm_(
+                [self.kl_coef], max_norm=self.cfg.grad_norm_max, error_if_nonfinite=True
+            )
             self.kl_coef_opt.step()
         except RuntimeError:
             # Probably inf gradients, don't apply them
@@ -532,7 +539,8 @@ class Trainer:
         )
         progress_at_train_step = min(
             1,
-            agent_grad_steps_this_train_step / max(1, self.agent_grad_steps_last_train_step)
+            agent_grad_steps_this_train_step
+            / max(1, self.agent_grad_steps_last_train_step),
         )
 
         if self.starting_entropy is not None:
@@ -587,7 +595,9 @@ class Trainer:
         )
         entropy_target = self._entropy_target()
         if entropy_target is not None:
-            entropy_loss = self.cfg.entropy_loss_coef * ((entropy - entropy_target).sum() ** 2)
+            entropy_loss = self.cfg.entropy_loss_coef * (
+                (entropy - entropy_target).sum() ** 2
+            )
         else:
             entropy_target = entropy.mean()
             entropy_loss = torch.tensor(0.0)
@@ -605,9 +615,7 @@ class Trainer:
         epochs: int = 1,
         shuffle: bool = False,
         need_full: bool = True,
-    ) -> Generator[
-        tuple[int, int, list[_EpisodeData], "AgentOutput"], None, None
-    ]:
+    ) -> Generator[tuple[int, int, list[_EpisodeData], "AgentOutput"], None, None]:
         """Runs the agent forward pass on minibatches drawn from the replay buffer.
 
         Minibatches are a list of tuples of _EpisodeData from the input, data T
@@ -677,9 +685,10 @@ class Trainer:
 
                     try:
                         agent_output = _call_agent_forward(
-                            self.agent, [data.episode for data in batch],
+                            self.agent,
+                            [data.episode for data in batch],
                             need_full=need_full,
-                            expected_lengths=[data.n_timesteps for data in batch]
+                            expected_lengths=[data.n_timesteps for data in batch],
                         )
                         yield (
                             epoch,
@@ -734,7 +743,11 @@ class Trainer:
         ):
             # Allow extra time for first train_step
             if self.train_steps_so_far == 0:
-                deadline = start_time + self.cfg.first_train_step_timeout_coef * self.cfg.train_step_timeout_seconds
+                deadline = (
+                    start_time
+                    + self.cfg.first_train_step_timeout_coef
+                    * self.cfg.train_step_timeout_seconds
+                )
             else:
                 deadline = start_time + self.cfg.train_step_timeout_seconds
         else:
@@ -754,12 +767,15 @@ class Trainer:
 
         pre_train_epochs = self.cfg.vf_pre_training_epochs
         if self.train_steps_so_far == 0:
-            pre_train_epochs = max(self.cfg.vf_warmup_training_epochs,
-                                   pre_train_epochs)
+            pre_train_epochs = max(self.cfg.vf_warmup_training_epochs, pre_train_epochs)
 
         with torch.no_grad():
-            for _, _, episode_data, agent_output in self._agent_minibatches(desc="Caching latents", need_full=True):
-                for episode_id, state_encodings, action_lls in _split_agent_output(episode_data, agent_output):
+            for _, _, episode_data, agent_output in self._agent_minibatches(
+                desc="Caching latents", need_full=True
+            ):
+                for episode_id, state_encodings, action_lls in _split_agent_output(
+                    episode_data, agent_output
+                ):
                     state_encoding_cache[episode_id] = state_encodings.detach()
                     action_lls_cache[episode_id] = action_lls.detach()
 
@@ -791,17 +807,21 @@ class Trainer:
                 timed_out = True
                 break
             if agent_output.full_valid():
-                for episode_id, state_encodings, action_lls in _split_agent_output(episode_data, agent_output):
+                for episode_id, state_encodings, action_lls in _split_agent_output(
+                    episode_data, agent_output
+                ):
                     state_encoding_cache[episode_id] = state_encodings.detach()
                     action_lls_cache[episode_id] = action_lls.detach()
-            loss_input = LossInput.pack([loss_inputs[ep_data.episode_id]
-                                         for ep_data in episode_data])
+            loss_input = LossInput.pack(
+                [loss_inputs[ep_data.episode_id] for ep_data in episode_data]
+            )
             loss, loss_infos = self._primary_loss_function(loss_input, agent_output)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
             loss.backward()
             self.total_agent_grad_steps += 1
-            if (self.cfg.log_grad_step_period > 0
+            if (
+                self.cfg.log_grad_step_period > 0
                 and batch_i % self.cfg.log_grad_step_period == 0
             ):
                 noko.log_row(
@@ -843,12 +863,18 @@ class Trainer:
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
         if self.cfg.vf_post_training_epochs > 0 and not timed_out:
-            missing_episodes = [episode_data for episode_data in self._replay_buffer
-                                if episode_data.episode_id not in state_encoding_cache]
+            missing_episodes = [
+                episode_data
+                for episode_data in self._replay_buffer
+                if episode_data.episode_id not in state_encoding_cache
+            ]
             with torch.no_grad():
-                for _, _, episode_data, agent_output in self._agent_minibatches(episodes=missing_episodes,
-                                                                                desc="Caching latents", need_full=True):
-                    for episode_id, state_encodings, action_lls in _split_agent_output(episode_data, agent_output):
+                for _, _, episode_data, agent_output in self._agent_minibatches(
+                    episodes=missing_episodes, desc="Caching latents", need_full=True
+                ):
+                    for episode_id, state_encodings, action_lls in _split_agent_output(
+                        episode_data, agent_output
+                    ):
                         state_encoding_cache[episode_id] = state_encodings.detach()
                         action_lls_cache[episode_id] = action_lls.detach()
             timed_out = self._train_vf(
@@ -867,7 +893,8 @@ class Trainer:
         self.train_steps_so_far += 1
         self._maybe_record_starting_entropy()
         self.agent_grad_steps_last_train_step = (
-            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step)
+            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
+        )
         self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
 
         if timed_out:
@@ -902,12 +929,13 @@ class Trainer:
         assert not state_enc_packed.requires_grad
         assert not action_lls_now.requires_grad
 
-        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer]).to(device=self.device)
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer]).to(
+            device=self.device
+        )
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
             rewards_normed = padded_rewards
-
 
         original_action_lls = pad_tensors(
             [data.original_action_lls for data in self._replay_buffer]
@@ -984,9 +1012,10 @@ class Trainer:
             [data.rewards for data in self._replay_buffer]
         )
         ep_lengths = [len(data.rewards) for data in self._replay_buffer]
-        discounted_returns = pack_padded(discount_cumsum(full_episode_rewards,
-                                                          discount=1 - self.cfg.discount_inv),
-                                         ep_lengths)
+        discounted_returns = pack_padded(
+            discount_cumsum(full_episode_rewards, discount=1 - self.cfg.discount_inv),
+            ep_lengths,
+        )
         dataset_stats = {
             "episode_total_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
             "vf_explained_variance": explained_variance(
@@ -1010,8 +1039,11 @@ class Trainer:
             step=self.total_env_steps,
         )
 
-    def _prepare_loss_inputs(self, state_encodings: dict[EpisodeID, torch.Tensor],
-                             action_lls: dict[EpisodeID, torch.Tensor]) -> dict[EpisodeID, LossInput]:
+    def _prepare_loss_inputs(
+        self,
+        state_encodings: dict[EpisodeID, torch.Tensor],
+        action_lls: dict[EpisodeID, torch.Tensor],
+    ) -> dict[EpisodeID, LossInput]:
         """Compute training inputs from the replay buffer and value function.
 
         Mostly this consists of the advantages and value function
@@ -1058,8 +1090,9 @@ class Trainer:
                 terminated[i] = True
         terminated = terminated.to(device=self.device)
 
-        padded_rewards = pad_tensors(
-            [data.rewards for data in self._replay_buffer]).to(device=self.device)
+        padded_rewards = pad_tensors([data.rewards for data in self._replay_buffer]).to(
+            device=self.device
+        )
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
@@ -1093,8 +1126,7 @@ class Trainer:
         if self.cfg.awr_temperature < 1000:
             heated_adv = adv_packed / self.cfg.awr_temperature
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-            softmax_adv = softmax_clip(heated_adv,
-                                       max_exp_adv)
+            softmax_adv = softmax_clip(heated_adv, max_exp_adv)
             awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
             normed_exp_adv = softmax_adv * len(softmax_adv)
             assert 0.9 <= normed_exp_adv.mean() <= 1.1
@@ -1217,9 +1249,7 @@ class Trainer:
         """
         assert "primary" not in stats
         stats["primary"] = stats[primary]
-        noko.log_row(
-            "eval_stats", stats, step=self.total_env_steps, level=noko.RESULTS
-        )
+        noko.log_row("eval_stats", stats, step=self.total_env_steps, level=noko.RESULTS)
         self.primary_performance = stats[primary]
         self.last_eval_stats = stats
         hparams = self.cfg.to_dict()
@@ -1426,9 +1456,9 @@ class Trainer:
             self.starting_entropy is None
             and self.train_steps_so_far >= self.cfg.entropy_schedule_start_train_step
         ):
-            original_action_lls = torch.cat([
-                ep_data.original_action_lls for ep_data in self._replay_buffer
-            ])
+            original_action_lls = torch.cat(
+                [ep_data.original_action_lls for ep_data in self._replay_buffer]
+            )
             original_dists = [
                 ep_data.original_action_dists for ep_data in self._replay_buffer
             ]
@@ -1531,8 +1561,9 @@ class AgentOutput:
         # checked here.
         assert len(self.state_encodings.shape) == 2
         assert len(self.action_lls.shape) == 1
-        assert self.state_encodings.shape[0] != self.action_lls.shape[0], \
-            "There should be one more state_encoding per episode than action_ll. "
+        assert (
+            self.state_encodings.shape[0] != self.action_lls.shape[0]
+        ), "There should be one more state_encoding per episode than action_ll. "
         if self.valid_mask is not None:
             assert len(self.valid_mask.shape) == 1
             assert self.valid_mask.shape == self.state_encodings.shape
@@ -1544,7 +1575,9 @@ class AgentOutput:
         return self.valid_mask is None or self.valid_mask.all()
 
 
-def _split_agent_output(episode_data: list[_EpisodeData], agent_output: AgentOutput) ->list[tuple[EpisodeID, torch.Tensor, torch.Tensor]]:
+def _split_agent_output(
+    episode_data: list[_EpisodeData], agent_output: AgentOutput
+) -> list[tuple[EpisodeID, torch.Tensor, torch.Tensor]]:
     action_lens = [ep_data.n_timesteps for ep_data in episode_data]
     obs_lens = [ep_data.n_timesteps + 1 for ep_data in episode_data]
     state_encodings = unpack_tensors(agent_output.state_encodings, obs_lens)
@@ -1577,8 +1610,9 @@ class AgentInput:
     """
 
 
-def _call_agent_forward(agent: Agent, episodes: list[Any], need_full: bool,
-                        expected_lengths: list[int]) -> AgentOutput:
+def _call_agent_forward(
+    agent: Agent, episodes: list[Any], need_full: bool, expected_lengths: list[int]
+) -> AgentOutput:
     """Calls the outrl_forward method if available, otherwise calls the normal
     forward method via __call__.
 
@@ -1589,7 +1623,9 @@ def _call_agent_forward(agent: Agent, episodes: list[Any], need_full: bool,
         output = agent.outrl_forward(agent_input)
     else:
         output = agent(agent_input)
-    assert output.state_encodings.shape[0] == sum(expected_lengths) + len(expected_lengths)
+    assert output.state_encodings.shape[0] == sum(expected_lengths) + len(
+        expected_lengths
+    )
     assert output.action_lls.shape[0] == sum(expected_lengths)
     return output
 
@@ -1757,7 +1793,6 @@ class TrainerConfig(simple_parsing.Serializable):
     Because OutRL uses an AWR-style loss, training the VF before
     the policy is expected.
     """
-
 
     vf_pre_training_epochs: int = tunable(3, IntDistribution(0, 20))
     """Number of epochs of value function training to run from frozen state
@@ -1945,7 +1980,9 @@ class TrainerConfig(simple_parsing.Serializable):
     Overrides entropy_schedule_end_fraction.
     """
 
-    entropy_schedule_end_fraction: float = tunable(0.01, FloatDistribution(1e-6, 1.0, log=True))
+    entropy_schedule_end_fraction: float = tunable(
+        0.01, FloatDistribution(1e-6, 1.0, log=True)
+    )
     """Portion of "starting entropy" to attempt to maintain at end of
     training.
 
@@ -2051,7 +2088,7 @@ class TrainerConfig(simple_parsing.Serializable):
     error should be re-raised to avoid wasting time.
     """
 
-    device: str = 'cpu'
+    device: str = "cpu"
     """PyTorch device to use for optimization."""
 
     def __post_init__(self):
