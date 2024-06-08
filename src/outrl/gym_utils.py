@@ -251,8 +251,8 @@ class GymBoxGaussianAgent(GymAgent):
         nn.init.zeros_(self.action_mean.bias)
         self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
         self.min_std = min_std
-        self.loc = torch.from_numpy(loc)
-        self.scale = torch.from_numpy(scale)
+        self.register_buffer("loc", torch.from_numpy(loc))
+        self.register_buffer("scale", torch.from_numpy(scale))
 
     def run_net(
         self, obs: torch.Tensor
@@ -321,8 +321,8 @@ class GymBoxBetaAgent(GymAgent):
         nn.init.zeros_(self.action_mean.bias)
         self.action_mean.weight.data.copy_(0.01 * self.action_mean.weight.data)
         self.min_std = min_std
-        self.loc = torch.from_numpy(loc)
-        self.scale = torch.from_numpy(scale)
+        self.register_buffer("loc", torch.from_numpy(loc))
+        self.register_buffer("scale", torch.from_numpy(scale))
 
     def run_net(
         self, obs: torch.Tensor

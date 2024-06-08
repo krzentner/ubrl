@@ -339,6 +339,10 @@ class Trainer:
         self._next_episode_id: EpisodeID = 0
         self._dtype = torch.float32
 
+        self.total_agent_grad_steps = 0
+        self.agent_grad_steps_at_start_of_train_step = 0
+        self.agent_grad_steps_last_train_step = 0
+
         # This method is also called after loading the state dict to re-attach
         # parameters
         self._setup_optimizers()
@@ -380,10 +384,6 @@ class Trainer:
         )
 
         self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
-
-        self.total_agent_grad_steps = 0
-        self.agent_grad_steps_at_start_of_train_step = 0
-        self.agent_grad_steps_last_train_step = 0
 
     def _primary_loss_function(
         self, loss_input: LossInput, agent_output: "AgentOutput"
@@ -534,6 +534,9 @@ class Trainer:
         return kl_loss_scaled, infos
 
     def _entropy_target(self) -> Optional[float]:
+        if self.starting_entropy is None:
+            return None
+
         agent_grad_steps_this_train_step = (
             self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
         )
@@ -543,48 +546,48 @@ class Trainer:
             / max(1, self.agent_grad_steps_last_train_step),
         )
 
-        if self.starting_entropy is not None:
-            # 0 at cfg.entropy_schedule_start_train_step
-            # 1 at (and after) cfg.expected_train_steps
-            step_fraction = min(
-                1,
-                (
-                    (progress_at_train_step + self.train_steps_so_far)
-                    - self.cfg.entropy_schedule_start_train_step
-                )
-                / (
-                    self.cfg.expected_train_steps
-                    - self.cfg.entropy_schedule_start_train_step
-                ),
+        # 0 at cfg.entropy_schedule_start_train_step
+        # 1 at (and after) cfg.expected_train_steps
+        step_fraction = min(
+            1,
+            (
+                (progress_at_train_step + self.train_steps_so_far)
+                - self.cfg.entropy_schedule_start_train_step
             )
-            assert step_fraction >= 0
-            assert step_fraction <= 1
-            if self.cfg.entropy_schedule_end_target is not None:
-                final_entropy = self.cfg.entropy_schedule_end_target
-            else:
-                if self.starting_entropy < 0:
-                    final_entropy = (
-                        self.starting_entropy / self.cfg.entropy_schedule_end_fraction
-                    )
-                else:
-                    final_entropy = (
-                        self.cfg.entropy_schedule_end_fraction * self.starting_entropy
-                    )
-            if self.cfg.entropy_schedule == "linear":
-                mix = step_fraction
-            elif self.cfg.entropy_schedule == "cosine":
-                # Cosine curve from 1 to 0
-                mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
-            else:
-                raise NotImplementedError(
-                    f"Unknown entropy schedule {self.cfg.entropy_schedule}"
-                )
-            assert mix >= 0
-            assert mix <= 1
-            target = (1 - mix) * self.starting_entropy + mix * final_entropy
-            return target
+            / (
+                self.cfg.expected_train_steps
+                - self.cfg.entropy_schedule_start_train_step
+            ),
+        )
+        assert step_fraction >= 0
+        assert step_fraction <= 1
+        if self.cfg.entropy_schedule_end_target is not None:
+            final_entropy = self.cfg.entropy_schedule_end_target
+        elif self.starting_entropy < 0:
+            # We must be in an (at least partly) continuous action space.
+            # Decrease the entropy by -log(fraction) instead.
+            final_entropy = self.starting_entropy + math.log(
+                self.cfg.entropy_schedule_end_fraction
+            )
         else:
-            return None
+            final_entropy = (
+                self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            )
+
+        if self.cfg.entropy_schedule == "linear":
+            mix = step_fraction
+        elif self.cfg.entropy_schedule == "cosine":
+            # Cosine curve from 1 to 0
+            mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
+        else:
+            raise NotImplementedError(
+                f"Unknown entropy schedule {self.cfg.entropy_schedule}"
+            )
+
+        assert mix >= 0
+        assert mix <= 1
+        target = (1 - mix) * self.starting_entropy + mix * final_entropy
+        return target
 
     def _entropy_loss(
         self, loss_input: LossInput, agent_output: "AgentOutput"
@@ -606,116 +609,6 @@ class Trainer:
         infos = locals()
         del infos["self"]
         return entropy_loss, infos
-
-    def _agent_minibatches(
-        self,
-        episodes: Optional[list[_EpisodeData]] = None,
-        minibatch_target_timesteps: Optional[int] = None,
-        desc: Optional[str] = None,
-        epochs: int = 1,
-        shuffle: bool = False,
-        need_full: bool = True,
-    ) -> Generator[tuple[int, int, list[_EpisodeData], "AgentOutput"], None, None]:
-        """Runs the agent forward pass on minibatches drawn from the replay buffer.
-
-        Minibatches are a list of tuples of _EpisodeData from the input, data T
-        from the extra_data (None if not provided), and AgentOutput from the
-        agent forward pass.
-
-        This method handles sizing of minibatches to avoid OOM, shuffling of
-        episodes, rendering the progress bar, and running for multiple epochs.
-        Basically, this method plays a similar role to "Trainer" classes in
-        supervised learning libraries.
-
-        Yields: list[tuple[_EpisodeData, T, ForwardResult]]
-        """
-        if episodes is None:
-            episodes = self._replay_buffer
-
-        if shuffle:
-            shuffled_indices = torch.randperm(len(episodes))
-            episodes = [episodes[i] for i in shuffled_indices]
-
-        minibatch_hard_cap = 2**64
-        if self.cfg.max_timesteps_per_forward is not None:
-            minibatch_hard_cap = self.cfg.max_timesteps_per_forward
-
-        minibatch_soft_cap = minibatch_hard_cap
-        if minibatch_target_timesteps is not None:
-            minibatch_soft_cap = min(minibatch_target_timesteps, minibatch_hard_cap)
-
-        with tqdm(
-            total=epochs * sum([ep.n_timesteps for ep in episodes]), desc=desc
-        ) as pbar:
-            for epoch in range(epochs):
-                next_ep_index = 0
-                minibatch_number = 0
-                while next_ep_index < len(episodes):
-                    start_batch_ep_index = next_ep_index
-                    batch = []
-                    n_batch_steps = 0
-                    # Accumulate episodes into batch until we run out of space
-                    while next_ep_index < len(episodes) and (
-                        n_batch_steps + episodes[next_ep_index].n_timesteps
-                        <= minibatch_hard_cap
-                    ):
-                        batch.append(episodes[next_ep_index])
-                        n_batch_steps += episodes[next_ep_index].n_timesteps
-                        next_ep_index += 1
-                        if n_batch_steps >= minibatch_soft_cap:
-                            break
-
-                    if len(batch) == 0:
-                        # We can't fit even a single forward pass in memory!
-                        # Crash in this case (maybe the user can decrease the episode
-                        # length, decrease the model size, enable gradient
-                        # checkpointing / implement BPT, or buy a bigger GPU).
-                        ep_steps = episodes[next_ep_index].n_timesteps
-                        max_steps = self.cfg.max_timesteps_per_forward
-                        raise RuntimeError(
-                            dedent(
-                                f"""\
-                            Cannot run .forward() on episode of length:
-                            {ep_steps} > {max_steps} = cfg.max_timesteps_per_forward
-                            Increase cfg.max_timesteps_per_forward, decrease model size,
-                            or find another way of increasing available memory.
-                            """
-                            )
-                        )
-
-                    try:
-                        agent_output = _call_agent_forward(
-                            self.agent,
-                            [data.episode for data in batch],
-                            need_full=need_full,
-                            expected_lengths=[data.n_timesteps for data in batch],
-                        )
-                        yield (
-                            epoch,
-                            minibatch_number,
-                            batch,
-                            agent_output,
-                        )
-                        minibatch_number += 1
-                        pbar.update(sum([data.n_timesteps for data in batch]))
-                    except RuntimeError as ex:
-                        if "Cannot allocate memory" not in str(ex):
-                            raise ex
-                        # Decrease to just one below the current size, which will
-                        # prevent the last episode from being in the batch.
-                        # This avoids dropping the max_timesteps_per_forward too low
-                        # from one unusually large trailing episode.
-                        # Note that this may still decrease by a large number of steps
-                        # (or set max_timesteps_per_forward when it was previously
-                        # None).
-                        self.cfg.max_timesteps_per_forward = n_batch_steps - 1
-                        minibatch_hard_cap = self.cfg.max_timesteps_per_forward
-                        warnings.warn(
-                            f"Decreasing cfg.max_timesteps_per_forward to "
-                            f"{self.cfg.max_timesteps_per_forward}",
-                        )
-                        # Retry the batch
-                        next_ep_index = start_batch_ep_index
 
     def train_step(self):
         """Runs one "policy step" of training.
@@ -758,60 +651,43 @@ class Trainer:
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
-        # Cached policy outputs for VF training.
-        # This avoids performing a full pass on the agent network when tuning
-        # the VF outside of the primary loss.
-        # The VF loss still tunes the full network in the primary loss.
-        state_encoding_cache = {}
-        action_lls_cache = {}
+        agent_w = _AgentWrapper(self.agent, self.cfg)
 
         pre_train_epochs = self.cfg.vf_pre_training_epochs
         if self.train_steps_so_far == 0:
             pre_train_epochs = max(self.cfg.vf_warmup_training_epochs, pre_train_epochs)
 
-        with torch.no_grad():
-            for _, _, episode_data, agent_output in self._agent_minibatches(
-                desc="Caching latents", need_full=True
-            ):
-                for episode_id, state_encodings, action_lls in _split_agent_output(
-                    episode_data, agent_output
-                ):
-                    state_encoding_cache[episode_id] = state_encodings.detach()
-                    action_lls_cache[episode_id] = action_lls.detach()
-
         # Pre-train VF (usually only used for off-policy algorithms)
         if pre_train_epochs > 0:
+            agent_w.fill_caches(self._replay_buffer)
             timed_out = self._train_vf(
-                state_encoding_cache,
-                action_lls_cache,
+                agent_w.state_encodings_cache,
+                agent_w.action_lls_cache,
                 pre_train_epochs,
                 desc="Pre Training VF",
                 deadline=deadline,
             )
 
-        loss_inputs = self._prepare_loss_inputs(state_encoding_cache, action_lls_cache)
+        loss_inputs = self._prepare_loss_inputs(
+            agent_w.state_encodings_cache, agent_w.action_lls_cache
+        )
         self._log_dataset(loss_inputs)
-
-        state_encoding_cache = {}
-        action_lls_cache = {}
+        agent_w.clear_caches()
 
         # Run primary training loop.
-        for _, batch_i, episode_data, agent_output in self._agent_minibatches(
-            desc="Training Agent",
-            epochs=self.cfg.policy_epochs_per_train_step,
-            shuffle=True,
-            minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
-            need_full=False,
+        for batch_i, (episode_data, agent_output) in enumerate(
+            agent_w.run_minibatches(
+                self._replay_buffer,
+                desc="Training Agent",
+                epochs=self.cfg.policy_epochs_per_train_step,
+                shuffle=True,
+                minibatch_target_timesteps=self.cfg.minibatch_target_timesteps,
+                need_full=False,
+            )
         ):
             if time.monotonic() > deadline:
                 timed_out = True
                 break
-            if agent_output.full_valid():
-                for episode_id, state_encodings, action_lls in _split_agent_output(
-                    episode_data, agent_output
-                ):
-                    state_encoding_cache[episode_id] = state_encodings.detach()
-                    action_lls_cache[episode_id] = action_lls.detach()
             loss_input = LossInput.pack(
                 [loss_inputs[ep_data.episode_id] for ep_data in episode_data]
             )
@@ -855,7 +731,9 @@ class Trainer:
                 if errors > self.cfg.max_permitted_errors_per_train_step:
                     raise ex
             if self.cfg.recompute_loss_inputs:
-                loss_inputs = self._preprocess()
+                loss_inputs = self._prepare_loss_inputs(
+                    agent_w.state_encodings_cache, agent_w.action_lls_cache
+                )
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
@@ -863,23 +741,10 @@ class Trainer:
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
         if self.cfg.vf_post_training_epochs > 0 and not timed_out:
-            missing_episodes = [
-                episode_data
-                for episode_data in self._replay_buffer
-                if episode_data.episode_id not in state_encoding_cache
-            ]
-            with torch.no_grad():
-                for _, _, episode_data, agent_output in self._agent_minibatches(
-                    episodes=missing_episodes, desc="Caching latents", need_full=True
-                ):
-                    for episode_id, state_encodings, action_lls in _split_agent_output(
-                        episode_data, agent_output
-                    ):
-                        state_encoding_cache[episode_id] = state_encodings.detach()
-                        action_lls_cache[episode_id] = action_lls.detach()
+            agent_w.fill_caches(self._replay_buffer)
             timed_out = self._train_vf(
-                state_encoding_cache,
-                action_lls_cache,
+                agent_w.state_encodings_cache,
+                agent_w.action_lls_cache,
                 self.cfg.vf_post_training_epochs,
                 desc="Post Training VF",
                 deadline=deadline,
@@ -907,7 +772,7 @@ class Trainer:
         training_epochs: int,
         desc: str,
         deadline: float,
-    ):
+    ) -> bool:
         """Train just the VF using cached agent outputs.
 
         state_encodings and action_lls are indexed by the `episode_id`
@@ -919,6 +784,8 @@ class Trainer:
         Because this training is only tuning the memoryless VF tail, it uses
         smaller minibatches of shuffled timesteps from across multiple
         episodes.
+
+        Returns True iff the deadline is reached.
         """
         state_enc_packed, obs_lens = pack_tensors(
             [state_encodings[ep_data.episode_id] for ep_data in self._replay_buffer]
@@ -1010,7 +877,7 @@ class Trainer:
         loss_input = LossInput.pack(list(loss_inputs.values()))
         full_episode_rewards = pad_tensors(
             [data.rewards for data in self._replay_buffer]
-        )
+        ).to(device=self.device)
         ep_lengths = [len(data.rewards) for data in self._replay_buffer]
         discounted_returns = pack_padded(
             discount_cumsum(full_episode_rewards, discount=1 - self.cfg.discount_inv),
@@ -1035,7 +902,7 @@ class Trainer:
         noko.log_row(
             "dataset_stats",
             dataset_stats,
-            level=noko.RESULTS,
+            level=noko.INFO,
             step=self.total_env_steps,
         )
 
@@ -1610,24 +1477,161 @@ class AgentInput:
     """
 
 
-def _call_agent_forward(
-    agent: Agent, episodes: list[Any], need_full: bool, expected_lengths: list[int]
-) -> AgentOutput:
-    """Calls the outrl_forward method if available, otherwise calls the normal
-    forward method via __call__.
+class _AgentWrapper:
+    """Performs checking of the Agent API and caches outputs."""
 
-    Does some basic checking of the shapes of the AgentOutput.
-    """
-    agent_input = AgentInput(episodes=episodes, need_full=need_full)
-    if hasattr(agent, "outrl_forward"):
-        output = agent.outrl_forward(agent_input)
-    else:
-        output = agent(agent_input)
-    assert output.state_encodings.shape[0] == sum(expected_lengths) + len(
-        expected_lengths
-    )
-    assert output.action_lls.shape[0] == sum(expected_lengths)
-    return output
+    def __init__(self, agent: Agent, cfg: "TrainerConfig"):
+        self.agent: Agent = agent
+        self.cfg = cfg
+        self.state_encodings_cache: dict[EpisodeID, torch.Tensor] = {}
+        self.action_lls_cache: dict[EpisodeID, torch.Tensor] = {}
+
+    def clear_caches(self):
+        self.state_encodings_cache = {}
+        self.action_lls_cache = {}
+
+    def fill_caches(self, episode_data: list[_EpisodeData]):
+        missing_episodes = [
+            ep_data
+            for ep_data in episode_data
+            if ep_data.episode_id not in self.state_encodings_cache
+        ]
+        with torch.no_grad():
+            for _ in self.run_minibatches(
+                missing_episodes, desc="Caching state encodings", need_full=True
+            ):
+                # Force evaluation of all minibatches
+                pass
+
+    def agent_forward(
+        self, episode_data: list[_EpisodeData], need_full: bool
+    ) -> AgentOutput:
+        """Wrapper around the Agent forward() method.
+
+        Handles delegating to outrl_forward() if necessary, checking that
+        need_full is respected, and caching.
+        """
+        episodes = [ep_data.episode for ep_data in episode_data]
+        expected_lengths = [ep_data.n_timesteps for ep_data in episode_data]
+        agent_input = AgentInput(episodes=episodes, need_full=need_full)
+        if hasattr(self.agent, "outrl_forward"):
+            agent_output = self.agent.outrl_forward(agent_input)
+        else:
+            agent_output = self.agent(agent_input)
+        assert agent_output.state_encodings.shape[0] == sum(expected_lengths) + len(
+            expected_lengths
+        )
+        assert agent_output.action_lls.shape[0] == sum(expected_lengths)
+        if agent_output.full_valid():
+            for episode_id, state_encodings, action_lls in _split_agent_output(
+                episode_data, agent_output
+            ):
+                self.state_encodings_cache[episode_id] = state_encodings.detach()
+                self.action_lls_cache[episode_id] = action_lls.detach()
+        else:
+            total_valid = agent_output.valid_mask.sum().item()
+            total_timesteps = sum(expected_lengths)
+            if need_full:
+                raise ValueError(
+                    f"Requested fully valid output but Agent only provided valid output for {total_valid}/{total_timesteps}"
+                )
+        return agent_output
+
+    def run_minibatches(
+        self,
+        episodes: list[_EpisodeData],
+        minibatch_target_timesteps: Optional[int] = None,
+        desc: Optional[str] = None,
+        epochs: int = 1,
+        shuffle: bool = False,
+        need_full: bool = True,
+    ) -> Generator[tuple[list[_EpisodeData], "AgentOutput"], None, None]:
+        """Runs the agent forward pass on minibatches drawn from the replay buffer.
+
+        Minibatches are a tuple of epoch number, minibatch number, _EpisodeData and an AgentOutput.
+
+        This method handles sizing of minibatches to avoid OOM, shuffling of
+        episodes, rendering the progress bar, and running for multiple epochs.
+        Basically, this method plays a similar role to "Trainer" classes in
+        supervised learning libraries.
+        """
+        minibatch_hard_cap = 2**64
+        if self.cfg.max_timesteps_per_forward is not None:
+            minibatch_hard_cap = self.cfg.max_timesteps_per_forward
+
+        minibatch_soft_cap = minibatch_hard_cap
+        if minibatch_target_timesteps is not None:
+            minibatch_soft_cap = min(minibatch_target_timesteps, minibatch_hard_cap)
+
+        with tqdm(
+            total=epochs * sum([ep.n_timesteps for ep in episodes]),
+            desc=desc,
+            disable=(desc is None),
+        ) as pbar:
+            for _ in range(epochs):
+                if shuffle:
+                    shuffled_indices = torch.randperm(len(episodes))
+                    episodes = [episodes[i] for i in shuffled_indices]
+                next_ep_index = 0
+                # While we have episodes left
+                while next_ep_index < len(episodes):
+                    start_batch_ep_index = next_ep_index
+                    batch = []
+                    n_batch_steps = 0
+                    # Accumulate episodes into batch until we run out of space
+                    while next_ep_index < len(episodes) and (
+                        n_batch_steps + episodes[next_ep_index].n_timesteps
+                        <= minibatch_hard_cap
+                    ):
+                        batch.append(episodes[next_ep_index])
+                        n_batch_steps += episodes[next_ep_index].n_timesteps
+                        next_ep_index += 1
+                        if n_batch_steps >= minibatch_soft_cap:
+                            break
+
+                    if len(batch) == 0:
+                        # We can't fit even a single forward pass in memory!
+                        # Crash in this case (maybe the user can decrease the episode
+                        # length, decrease the model size, enable gradient
+                        # checkpointing / implement BPT, or buy a bigger GPU).
+                        ep_steps = episodes[next_ep_index].n_timesteps
+                        max_steps = self.cfg.max_timesteps_per_forward
+                        raise RuntimeError(
+                            dedent(
+                                f"""\
+                            Cannot run .forward() on episode of length:
+                            {ep_steps} > {max_steps} = cfg.max_timesteps_per_forward
+                            Increase cfg.max_timesteps_per_forward, decrease model size,
+                            or find another way of increasing available memory.
+                            """
+                            )
+                        )
+
+                    try:
+                        agent_output = self.agent_forward(batch, need_full=need_full)
+                        yield (
+                            batch,
+                            agent_output,
+                        )
+                        pbar.update(sum([data.n_timesteps for data in batch]))
+                    except RuntimeError as ex:
+                        if "Cannot allocate memory" not in str(ex):
+                            raise ex
+                        # Decrease to just one below the current size, which will
+                        # prevent the last episode from being in the batch.
+                        # This avoids dropping the max_timesteps_per_forward too low
+                        # from one unusually large trailing episode.
+                        # Note that this may still decrease by a large number of steps
+                        # (or set max_timesteps_per_forward when it was previously
+                        # None).
+                        self.cfg.max_timesteps_per_forward = n_batch_steps - 1
+                        minibatch_hard_cap = self.cfg.max_timesteps_per_forward
+                        warnings.warn(
+                            f"Decreasing cfg.max_timesteps_per_forward to "
+                            f"{self.cfg.max_timesteps_per_forward}",
+                        )
+                        # Retry the batch
+                        next_ep_index = start_batch_ep_index
 
 
 _GENERATED_FROM_TIME = "GENERATED_FROM_TIME"
