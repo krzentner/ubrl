@@ -369,40 +369,6 @@ class RunningMeanVar(nn.Module):
         dst[f"{prefix}.count"] = self.count
 
 
-def pack_dataclass(data: list[T]) -> tuple[T, list[int]]:
-    """Pack a list of dataclasses containing tensors into a single instance of
-    that dataclass.
-    All fields must be torch.Tensors of the same length.
-    """
-    lengths = None
-    field_values = {}
-    for field in dataclasses.fields(data[0]):
-        prefix = f"{prefix}.{field}"
-        packed_field, new_lengths = pack_tensors([getattr(d, field.name) for d in data])
-        if lengths is None:
-            lengths = new_lengths
-        assert new_lengths == lengths
-        field_values[field.name] = packed_field
-    assert lengths is not None
-    return dataclasses.replace(data[0], **field_values), lengths
-
-
-def unpack_dataclass(data: T, lengths: list[int]) -> list[T]:
-    """Pack a list of dataclasses containing tensors into a single instance of
-    that dataclass.
-    All fields must be torch.Tensors of the same length.
-    """
-    fields_unpacked = {
-        field.name: unpack_tensors(getattr(data, field.name), lengths)
-        for field in dataclasses.fields(data)
-    }
-    results = [
-        dataclasses.replace(data, **{k: v[i] for (k, v) in fields_unpacked.items()})
-        for i in range(len(lengths))
-    ]
-    return results
-
-
 def truncate_packed(
     tensor: torch.Tensor, new_lengths: list[int], to_cut: int
 ) -> torch.Tensor:
@@ -412,53 +378,6 @@ def truncate_packed(
     repacked = pack_tensors([t[:-to_cut] for t in unpacked])[0]
     assert repacked.shape[0] == sum(new_lengths)
     return repacked
-
-
-def pack_recursive(
-    data: Union[list[T], T], prefix: str = ""
-) -> tuple[T, Optional[list[int]]]:
-    """Recursively pack tensors contained in dataclasses, dictionaries, and lists.
-
-    No-op for non-sequence inputs.
-
-    Raises:
-
-        ValueError: On inconsistent lengths in (sub)fields.
-
-    """
-    lengths = None
-
-    def update_lengths(new_lens: list[int], prefix: str):
-        nonlocal lengths
-        if lengths is None:
-            lengths = new_lens
-        elif lengths != new_lens:
-            raise ValueError("Inconsistent lengths in field {prefix}")
-
-    if isinstance(data, (list, tuple)):
-        if dataclasses.is_dataclass(data[0]):
-            field_values = {}
-            for field in dataclasses.fields(data[0]):
-                prefix = f"{prefix}.{field}"
-                packed_field, new_lengths = pack_recursive(
-                    [getattr(d, field.name) for d in data], prefix
-                )
-                update_lengths(new_lengths, prefix)
-                field_values[field.name] = packed_field
-            return dataclasses.replace(data[0], **field_values), lengths
-        elif isinstance(data[0], dict):
-            out_dict = {}
-            for k in data[0].keys():
-                prefix = f"{prefix}[{k!r}]"
-                packed_value, new_lengths = pack_recursive(d[k] for d in data)
-                update_lengths(new_lengths, prefix)
-                out_dict[k] = packed_value
-            return out_dict, lengths
-        elif isinstance(data[0], torch.Tensor):
-            packed_list, new_lengths = pack_tensors(data)
-            update_lengths(new_lengths, prefix)
-            return packed_list, lengths
-    return data, lengths
 
 
 def pack_tensors(tensor_list: list[torch.Tensor]) -> tuple[torch.Tensor, list[int]]:

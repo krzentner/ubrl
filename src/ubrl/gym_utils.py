@@ -340,7 +340,9 @@ class GymBoxBetaAgent(GymAgent):
         # Constraint of the beta distribution:
         #  mean * (1 - mean) > var
         max_allowed_var = mean * (1 - mean)
-        var_clipped = soft_clamp(var, min=self.min_std**2, max=max_allowed_var.detach())
+        var_clipped = soft_clamp(
+            var, min=self.min_std**2, max=max_allowed_var.detach()
+        )
 
         v = mean * (1 - mean) / var_clipped - 1
         alpha = mean * v
@@ -363,7 +365,6 @@ class GymBoxBetaAgent(GymAgent):
     def construct_dist(
         self, params: dict[str, torch.Tensor]
     ) -> tuple[torch.distributions.Distribution, torch.Tensor]:
-
         alpha, beta = params["alpha"], params["beta"]
         dist = torch.distributions.Beta(alpha, beta)
         if len(alpha.shape) > 1:
@@ -700,8 +701,9 @@ def episode_stats(episodes: list[dict[str, Any]]) -> dict[str, float]:
     returns = [ep["rewards"].sum() for ep in episodes]
     terminations = [ep["terminated"] for ep in episodes]
     lengths = [len(ep["rewards"]) for ep in episodes]
-    sampled_action_mean = [ep["actions"].float().mean() for ep in episodes]
-    sampled_action_std = [ep["actions"].float().std() for ep in episodes]
+    sampled_actions = torch.cat([ep["actions"] for ep in episodes])
+    sampled_action_mean = sampled_actions.float().mean()
+    sampled_action_std = sampled_actions.float().std()
     stats = {
         "episode_total_rewards": float(np.mean(returns)),
         "episode_termination_rate": float(np.mean(terminations)),

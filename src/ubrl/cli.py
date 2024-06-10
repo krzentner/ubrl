@@ -23,6 +23,7 @@ from torch import Value
 import yaml
 from simple_parsing.helpers.serialization import save_yaml
 from simple_parsing.helpers.serialization import load as load_yaml
+
 try:
     import optuna
 except ImportError:
@@ -238,6 +239,7 @@ def cmd_sample_config(
 
     Creates a trial config file at a given path using hparam optimization."""
     import optuna
+
     if override_config is not None:
         with open(override_config, "r") as f:
             # Load "raw" values. suggest_config will call .from_dict to
@@ -261,6 +263,7 @@ def cmd_report_trial(config_file: str, run_dirs: list[str]):
 
     Reports performance of a config file using multiple runs."""
     import optuna
+
     with open(config_file, "r") as f:
         config_data = yaml.safe_load(f)
     trial_number = config_data["optuna_trial_number"]
@@ -307,6 +310,7 @@ def cmd_tune(
     """Runs hyper parameter tuning, assuming the current script uses the
     standard ExperimentInvocation()."""
     import optuna
+
     run_dir = os.path.abspath(os.path.join(runs_dir, run_name))
     os.makedirs(run_dir, exist_ok=True)
 
@@ -468,6 +472,7 @@ def run(
 
     def _create_study():
         import optuna
+
         study_storage = _storage_filename_to_storage(args.study_storage)
         optuna.create_study(storage=study_storage, study_name=args.study_name)
 

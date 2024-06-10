@@ -28,9 +28,7 @@ from ubrl.torch_utils import (
     entropy_of,
     force_concat,
     make_mlp,
-    pack_recursive,
     pack_tensors,
-    pack_tensors_check,
     pad_packed,
     pad_tensors,
     softmax_clip,
@@ -46,12 +44,11 @@ from ubrl.torch_utils import (
     approx_kl_div_of,
     used_for_logging,
     discount_cumsum,
-    pack_dataclass,
     truncate_packed,
     concat_lists,
 )
 from ubrl.cli import tunable, IntListDistribution, default_run_name
-import ubrl.accel
+import ubrl.engine
 
 _LOGGER = logging.getLogger("ubrl")
 
@@ -224,7 +221,7 @@ _PARAM_FIELDS = [
     "kl_coef",
 ]
 
-_IGNORED_FIELDS = ["_is_full_backward_hook"]
+_IGNORED_FIELDS = ["_is_full_backward_hook", "engine"]
 
 
 class Trainer:
@@ -264,21 +261,21 @@ class Trainer:
         Trainer's behavior, but is not guaranteed to and should be avoided
         (except via load_state_dict()).
         """
-        self.accel = ubrl.accel.DefaultAccel(self.cfg)
+        self.engine = ubrl.engine.DefaultEngine(self.cfg)
 
-        self.agent: "Agent" = self.accel.prepare_module(agent)
+        # Will be passed through accelerator in _setup_optimizers
+        self.agent: "Agent" = agent
         """The agent being optimized. Provides action (log-likelihoods) and
         state encodings."""
 
         self._state_encoding_size = self.agent.state_encoding_size
 
-        self.vf: nn.Module = self.accel.prepare_module(
-            make_mlp(
-                input_size=self._state_encoding_size,
-                hidden_sizes=self.cfg.vf_hidden_sizes,
-                output_size=0,
-                use_dropout=True,
-            )
+        # Will be passed through accelerator in _setup_optimizers
+        self.vf: nn.Module = make_mlp(
+            input_size=self._state_encoding_size,
+            hidden_sizes=self.cfg.vf_hidden_sizes,
+            output_size=0,
+            use_dropout=True,
         )
         """The value function. Feed-forward networks that predicts future
         rewards from state_encodings."""
@@ -287,7 +284,7 @@ class Trainer:
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer: RunningMeanVar = self.accel.prepare_module(
+        self.reward_normalizer: RunningMeanVar = self.engine.prepare_module(
             RunningMeanVar(use_mean=False)
         )
         """Normalized used to make rewards have unit variance if
@@ -313,8 +310,10 @@ class Trainer:
         self.train_steps_so_far_at_last_checkpoint: int = 0
         """Number of (completed) train_step() calls at last periodic checkpoint."""
 
+        # TODO(krzentner): Figure out if kl_coef should be on cpu or used through engine
+        # Maybe it would be simpler to just make kl_coef a nn.Linear(1, 1, bias=False)
         self.kl_coef: nn.Parameter = nn.Parameter(
-            self.accel.prepare_tensor(torch.tensor(float(self.cfg.kl_coef_init)))
+            torch.tensor(float(self.cfg.kl_coef_init))
         )
         """Dynamically adjusted parameter used for KL regularization."""
 
@@ -324,7 +323,7 @@ class Trainer:
 
         self._replay_buffer: list[_EpisodeData] = []
         self._next_episode_id: EpisodeID = 0
-        self._dtype = torch.float32
+        self._loss_dtype = torch.float32
 
         self.total_agent_grad_steps = 0
         self.agent_grad_steps_at_start_of_train_step = 0
@@ -339,10 +338,13 @@ class Trainer:
 
         This method is called in __init__ and also in load_state_dict().
         """
-        self.agent_optimizer = torch.optim.AdamW(
-            self.agent.parameters(),
-            lr=self.cfg.agent_lr_start,
-            weight_decay=self.cfg.agent_weight_decay,
+        self.agent, self.agent_optimizer = self.engine.prepare_module_opt(
+            self.agent,
+            torch.optim.AdamW(
+                self.agent.parameters(),
+                lr=self.cfg.agent_lr_start,
+                weight_decay=self.cfg.agent_weight_decay,
+            ),
         )
         self.agent_lr_scheduler = make_scheduler(
             self.agent_optimizer,
@@ -351,10 +353,13 @@ class Trainer:
             self.cfg.agent_lr_end,
             self.cfg.expected_train_steps,
         )
-        self.vf_optimizer = torch.optim.AdamW(
-            self.vf.parameters(),
-            lr=self.cfg.vf_lr_start,
-            weight_decay=self.cfg.vf_weight_decay,
+        self.vf, self.vf_optimizer = self.engine.prepare_module_opt(
+            self.vf,
+            torch.optim.AdamW(
+                self.vf.parameters(),
+                lr=self.cfg.vf_lr_start,
+                weight_decay=self.cfg.vf_weight_decay,
+            ),
         )
         self.vf_lr_scheduler = make_scheduler(
             self.vf_optimizer,
@@ -632,7 +637,7 @@ class Trainer:
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
-        agent_w = _AgentWrapper(self.agent, self.cfg, self.accel)
+        agent_w = _AgentWrapper(self.agent, self.cfg, self.engine)
 
         pre_train_epochs = self.cfg.vf_pre_training_epochs
         if self.train_steps_so_far == 0:
@@ -658,7 +663,7 @@ class Trainer:
         # Run primary training loop.
         for batch_i, minibatch in enumerate(
             _minibatch_episodes(
-                self.accel,
+                self.engine,
                 self._replay_buffer,
                 desc="Training Agent",
                 epochs=self.cfg.policy_epochs_per_train_step,
@@ -677,7 +682,7 @@ class Trainer:
             loss, loss_infos = self._primary_loss_function(agent_output, loss_input)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
-            loss.backward()
+            self.engine.backward(loss)
             self.total_agent_grad_steps += 1
             if (
                 self.cfg.log_grad_step_period > 0
@@ -690,12 +695,12 @@ class Trainer:
                     step=self.total_agent_grad_steps,
                 )
             try:
-                clip_grad_norm_(
+                self.engine.clip_grad_norm_(
                     self.agent.parameters(),
                     max_norm=self.cfg.grad_norm_max,
                     error_if_nonfinite=True,
                 )
-                clip_grad_norm_(
+                self.engine.clip_grad_norm_(
                     self.vf.parameters(),
                     max_norm=self.cfg.grad_norm_max,
                     error_if_nonfinite=True,
@@ -779,7 +784,7 @@ class Trainer:
         assert not state_enc_packed.requires_grad
         assert not action_lls_now.requires_grad
 
-        padded_rewards = self.accel.prepare_tensor(
+        padded_rewards = self.engine.prepare_tensor(
             pad_tensors([data.rewards for data in self._replay_buffer])
         )
         if self.cfg.normalize_rewards:
@@ -813,7 +818,7 @@ class Trainer:
                         if self._replay_buffer[i].terminated:
                             vf_x[i, episode_length] = 0.0
                             terminated[i] = True
-                    terminated = self.accel.prepare_tensor(terminated)
+                    terminated = self.engine.prepare_tensor(terminated)
 
                     with torch.no_grad():
                         _, vf_targets = _v_trace_estimation(
@@ -845,7 +850,7 @@ class Trainer:
                     # If we have a NaN in this update, it's probably best to
                     # just crash, since something is very wrong with the
                     # training run.
-                    clip_grad_norm_(
+                    self.engine.clip_grad_norm_(
                         self.vf.parameters(),
                         max_norm=self.cfg.grad_norm_max,
                         error_if_nonfinite=True,
@@ -859,7 +864,7 @@ class Trainer:
 
     def _log_dataset(self, loss_inputs: dict[EpisodeID, LossInput]):
         loss_input = LossInput.pack(list(loss_inputs.values()))
-        full_episode_rewards = self.accel.prepare_tensor(
+        full_episode_rewards = self.engine.prepare_tensor(
             pad_tensors([data.rewards for data in self._replay_buffer])
         )
         ep_lengths = [len(data.rewards) for data in self._replay_buffer]
@@ -924,7 +929,7 @@ class Trainer:
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
-        original_action_lls = self.accel.prepare_tensor(
+        original_action_lls = self.engine.prepare_tensor(
             pad_tensors([data.original_action_lls for data in self._replay_buffer])
         )
         terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
@@ -941,9 +946,9 @@ class Trainer:
             if self._replay_buffer[i].terminated:
                 vf_returns[i, episode_length] = 0.0
                 terminated[i] = True
-        terminated = self.accel.prepare_tensor(terminated)
+        terminated = self.engine.prepare_tensor(terminated)
 
-        padded_rewards = self.accel.prepare_tensor(
+        padded_rewards = self.engine.prepare_tensor(
             pad_tensors([data.rewards for data in self._replay_buffer])
         )
         if self.cfg.normalize_rewards:
@@ -964,7 +969,7 @@ class Trainer:
             action_lls=action_lls_now,
             original_action_lls=original_action_lls,
             terminated=terminated,
-            episode_lengths=self.accel.prepare_tensor(torch.tensor(episode_lengths)),
+            episode_lengths=self.engine.prepare_tensor(torch.tensor(episode_lengths)),
         )
 
         adv_packed = pack_padded(padded_advantages, episode_lengths)
@@ -1070,7 +1075,7 @@ class Trainer:
         else:
             assert isinstance(any_actions_possible, torch.Tensor)
 
-        rewards = rewards.to(dtype=self._dtype)
+        rewards = rewards.to(dtype=self._loss_dtype)
         self.reward_normalizer.update(rewards)
         if infos is None:
             infos = {}
@@ -1081,7 +1086,7 @@ class Trainer:
                 episode_id=self._next_episode_id,
                 n_timesteps=n_timesteps,
                 terminated=terminated,
-                original_action_lls=action_lls.to(dtype=self._dtype),
+                original_action_lls=action_lls.to(dtype=self._loss_dtype),
                 original_action_dists=action_dists,
                 rewards=rewards,
                 any_actions_possible=any_actions_possible,
@@ -1128,13 +1133,12 @@ class Trainer:
         best_ckpt = os.path.join(checkpoint_dir, "best.pkl")
         if prefer_best and os.path.exists(best_ckpt):
             try:
-                with open(best_ckpt, "rb") as f:
-                    state = pickle.load(f)
-                    self.load_state_dict(state)
-                    _LOGGER.critical(
-                        f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
-                    )
-                    return True
+                state = self.engine.load(best_ckpt)
+                self.load_state_dict(state)
+                _LOGGER.critical(
+                    f"Resuming from checkpoint {best_ckpt} which had {self.train_steps_so_far} train_steps"
+                )
+                return True
             except (pickle.UnpicklingError, ValueError) as ex:
                 _LOGGER.error(f"Could not load {best_ckpt}: {ex}")
         checkpoints = glob(f"{checkpoint_dir}/train_step_*.pkl")
@@ -1144,13 +1148,12 @@ class Trainer:
         ]
         for _, f_name in sorted(with_idx, reverse=True):
             try:
-                with open(f_name, "rb") as f:
-                    state = pickle.load(f)
-                    self.load_state_dict(state)
-                    _LOGGER.critical(
-                        f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
-                    )
-                    return True
+                state = self.engine.load(best_ckpt)
+                self.load_state_dict(state)
+                _LOGGER.critical(
+                    f"Resuming from checkpoint {f_name} which had {self.train_steps_so_far} train_steps"
+                )
+                return True
             except (pickle.UnpicklingError, ValueError) as ex:
                 _LOGGER.error(f"Could not load {f_name}: {ex}")
         return False
@@ -1183,19 +1186,14 @@ class Trainer:
                 )
                 if not os.path.exists(f_name):
                     _LOGGER.info(f"Checkpointing to {f_name!r}")
-                    with open(
-                        f_name,
-                        "wb",
-                    ) as f:
-                        pickle.dump(state_dict, f)
+                    self.engine.save(state_dict, f_name)
                     self.train_steps_so_far_at_last_checkpoint = self.train_steps_so_far
                 else:
                     _LOGGER.info(f"Checkpoint {f_name!r} already exists")
             if checkpoint_best:
                 f_name = os.path.join(self.cfg.runs_dir, self.cfg.run_name, f"best.pkl")
                 _LOGGER.info(f"Checkpointing to {f_name!r}")
-                with open(f_name, "wb") as f:
-                    pickle.dump(state_dict, f)
+                self.engine.save(state_dict, f_name)
                 self.best_checkpoint_primary_performance = self.primary_performance
             return True
         else:
@@ -1232,6 +1230,9 @@ class Trainer:
                 if self.cfg.checkpoint_replay_buffer:
                     state[k] = v
             else:
+                _LOGGER.debug(
+                    f"Adding {k!r}: {v!r} to ubrl.Trainer.state_dict() verbatim"
+                )
                 if hasattr(v, "state_dict"):
                     _LOGGER.error(
                         f"Field {k} was not expected to have a state_dict method"
@@ -1471,10 +1472,10 @@ class AgentInput:
 class _AgentWrapper:
     """Performs checking of the Agent API and caches outputs."""
 
-    def __init__(self, agent: Agent, cfg: "TrainerConfig", accel: ubrl.accel.Accel):
+    def __init__(self, agent: Agent, cfg: "TrainerConfig", engine: ubrl.engine.Engine):
         self.agent: Agent = agent
         self.cfg = cfg
-        self.accel = accel
+        self.engine = engine
         self.state_encodings_cache: dict[EpisodeID, torch.Tensor] = {}
         self.action_lls_cache: dict[EpisodeID, torch.Tensor] = {}
 
@@ -1490,7 +1491,7 @@ class _AgentWrapper:
         ]
         with torch.no_grad():
             for minibatch in _minibatch_episodes(
-                self.accel,
+                self.engine,
                 missing_episodes,
                 desc="Caching state encodings",
                 minibatch_max_timesteps=self.cfg.minibatch_max_timesteps,
@@ -1690,7 +1691,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """
 
     vf_warmup_training_epochs: int = tunable(30, low=0, high=1000)
-    high="""Number of epochs of value function training to run fro
+    high = """Number of epochs of value function training to run fro
     frozen state encodings on the very first train_step() before
     training the agent.
 
@@ -1829,9 +1830,7 @@ class TrainerConfig(simple_parsing.Serializable):
     decrease this value.
     """
 
-    kl_target_stat: Literal["mean", "max"] = tunable(
-        "mean", choices=["mean", "max"]
-    )
+    kl_target_stat: Literal["mean", "max"] = tunable("mean", choices=["mean", "max"])
     """What statistic of the KL divergence to constrain.
 
     Constraining the mean KL divergence is typical, but constraining the max KL
@@ -1884,9 +1883,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Overrides entropy_schedule_end_fraction.
     """
 
-    entropy_schedule_end_fraction: float = tunable(
-        0.01, low=1e-6, high=1.0, log=True
-    )
+    entropy_schedule_end_fraction: float = tunable(0.01, low=1e-6, high=1.0, log=True)
     """Portion of "starting entropy" to attempt to maintain at end of
     training.
 
@@ -1924,9 +1921,7 @@ class TrainerConfig(simple_parsing.Serializable):
     If set to >=1000, will literally just perform behavioral cloning.
     """
 
-    normalize_awr_advantages: bool = tunable(
-        True, choices=[False, True]
-    )
+    normalize_awr_advantages: bool = tunable(True, choices=[False, True])
     """Whether to normalize the advantages across the batch before computing
     the AWR coefficients.
 
@@ -2169,7 +2164,7 @@ def _group_episodes_to_minibatches(
 
 
 def _minibatch_episodes(
-    accel: ubrl.accel.Accel,
+    engine: ubrl.engine.Engine,
     episodes: list[_EpisodeData],
     minibatch_target_timesteps: Optional[int] = None,
     minibatch_max_timesteps: Optional[int] = None,
@@ -2190,7 +2185,7 @@ def _minibatch_episodes(
         disable=(desc is None),
     ) as pbar:
         for _ in range(epochs):
-            episodes = accel.shard_episodes(episodes, shuffle=shuffle)
+            episodes = engine.shard_episodes(episodes, shuffle=shuffle)
 
             minibatches = _group_episodes_to_minibatches(
                 episodes=episodes,
