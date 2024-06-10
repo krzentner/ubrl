@@ -9,7 +9,6 @@ try:
     import gymnasium as gym
 except ImportError:
     import gym
-from optuna.distributions import FloatDistribution
 
 import noko
 from ubrl import Trainer, TrainerConfig
@@ -46,9 +45,9 @@ class GymConfig(TrainerConfig):
     train_steps_per_eval: int = 1
     eval_episodes: int = 20
 
-    init_std: float = tunable(0.5, FloatDistribution(0.0, 2.0))
+    init_std: float = tunable(0.5, low=0.0, high=2.0)
     """Only used for Box shaped action spaces."""
-    min_std: float = tunable(1e-6, FloatDistribution(1e-6, 0.1, log=True))
+    min_std: float = tunable(1e-6, low=1e-6, high=0.1, log=True)
     """Only used for Box shaped action spaces."""
 
     def __post_init__(self):

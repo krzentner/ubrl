@@ -17,12 +17,16 @@ import logging
 from pprint import pprint
 
 import noko
-import optuna
 import argparse
 import simple_parsing
+from torch import Value
 import yaml
 from simple_parsing.helpers.serialization import save_yaml
 from simple_parsing.helpers.serialization import load as load_yaml
+try:
+    import optuna
+except ImportError:
+    optuna = None
 
 import ubrl
 
@@ -34,7 +38,7 @@ _LOGGER = logging.getLogger("ubrl")
 class CustomOptunaDistribution:
     """A custom distribution for a tunable hyper paraemter."""
 
-    def sample(self, name: str, trial: optuna.Trial) -> Any:
+    def sample(self, name: str, trial: "optuna.Trial") -> Any:
         del name, trial
         raise NotImplementedError()
 
@@ -69,9 +73,14 @@ _OPTUNA_DISTRIBUTION = "OPTUNA_DISTRIBUTION"
 
 def tunable(
     default_val: T,
-    distribution: Union[
-        optuna.distributions.BaseDistribution, CustomOptunaDistribution
-    ],
+    distribution: Optional[
+        Union["optuna.distributions.BaseDistribution", CustomOptunaDistribution]
+    ] = None,
+    *,
+    low: Optional[float | int] = None,
+    high: Optional[float | int] = None,
+    log: bool = False,
+    choices: Optional[list[T]] = None,
     metadata=None,
     **kwargs,
 ) -> T:
@@ -86,6 +95,30 @@ def tunable(
     """
     if metadata is None:
         metadata = {}
+    if distribution is None and optuna is not None:
+        if low is not None or high is not None:
+            if choices is not None:
+                raise ValueError("Must not provide both choices and high or low")
+            if low is None:
+                raise ValueError("Must provide low if high is provided")
+            if high is None:
+                raise ValueError("Must provide high if low is provided")
+            if isinstance(low, int) and isinstance(high, int):
+                assert isinstance(default_val, int)
+                distribution = optuna.distributions.IntDistribution(
+                    low=low, high=high, log=log
+                )
+            else:
+                assert isinstance(default_val, float)
+                distribution = optuna.distributions.FloatDistribution(
+                    low=low, high=high, log=log
+                )
+        elif choices is not None:
+            distribution = optuna.distributions.CategoricalDistribution(choices=choices)
+        else:
+            raise ValueError(
+                "Must provide either distribution, choices, or (high and low) to tunable"
+            )
     metadata[_OPTUNA_DISTRIBUTION] = distribution
     if isinstance(default_val, list):
         return dataclasses.field(
@@ -97,7 +130,7 @@ def tunable(
         return dataclasses.field(default=default_val, **kwargs, metadata=metadata)
 
 
-def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any]):
+def suggest_config(trial: "optuna.Trial", config: Type, overrides: dict[str, Any]):
     """Samples a Config from an optuna Trial.
 
     config should be a dataclass, with tunable
@@ -204,6 +237,7 @@ def cmd_sample_config(
     """Low-level command for manually distributing hyper-parameter optimization.
 
     Creates a trial config file at a given path using hparam optimization."""
+    import optuna
     if override_config is not None:
         with open(override_config, "r") as f:
             # Load "raw" values. suggest_config will call .from_dict to
@@ -226,6 +260,7 @@ def cmd_report_trial(config_file: str, run_dirs: list[str]):
     """Low-level command for manually distributing hyper-parameter optimization.
 
     Reports performance of a config file using multiple runs."""
+    import optuna
     with open(config_file, "r") as f:
         config_data = yaml.safe_load(f)
     trial_number = config_data["optuna_trial_number"]
@@ -271,6 +306,7 @@ def cmd_tune(
 ):
     """Runs hyper parameter tuning, assuming the current script uses the
     standard ExperimentInvocation()."""
+    import optuna
     run_dir = os.path.abspath(os.path.join(runs_dir, run_name))
     os.makedirs(run_dir, exist_ok=True)
 
@@ -370,9 +406,9 @@ def cmd_tune(
 
 
 def run(
-        train_fn: "Callable[[config_type], None]",
-        config_type: "type[ubrl.TrainerConfig]",
-    ):
+    train_fn: "Callable[[config_type], None]",
+    config_type: "type[ubrl.TrainerConfig]",
+):
     """Provides a standard command line interface to ubrl launcher scripts.
 
     Commands:
@@ -431,6 +467,7 @@ def run(
         train_fn(cfg)
 
     def _create_study():
+        import optuna
         study_storage = _storage_filename_to_storage(args.study_storage)
         optuna.create_study(storage=study_storage, study_name=args.study_name)
 
@@ -468,9 +505,7 @@ def run(
     train_parser.add_argument("--log-dir", default=None, type=str)
 
     # "High-level" hyper parameter tuning command
-    tune_parser = subp.add_parser(
-        "tune", help="Automatically tune hyper parameters"
-    )
+    tune_parser = subp.add_parser("tune", help="Automatically tune hyper parameters")
     tune_parser.set_defaults(func=_tune)
     tune_parser.add_argument(
         "--runs_dir", type=str, default="runs", help="Directory to keep runs in."
