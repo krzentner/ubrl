@@ -16,15 +16,15 @@ class Accel:
         raise NotImplementedError()
 
     def shard_episodes(
-        self, episodes: list["outrl._EpisodeData"], shuffle: bool
-    ) -> list["outrl._EpisodeData"]:
+        self, episodes: list["ubrl._EpisodeData"], shuffle: bool
+    ) -> list["ubrl._EpisodeData"]:
         raise NotImplementedError()
 
 
 class LocalAccel(Accel):
     """Accel that just uses torch directly. Supports local cpu and gpu training."""
 
-    def __init__(self, cfg: "outrl.TrainerConfig"):
+    def __init__(self, cfg: "ubrl.TrainerConfig"):
         self.device = cfg.device
 
     def prepare_module(self, module: torch.nn.Module) -> torch.nn.Module:
@@ -34,8 +34,8 @@ class LocalAccel(Accel):
         return tensor.to(device=self.device)
 
     def shard_episodes(
-        self, episodes: list["outrl._EpisodeData"], shuffle: bool
-    ) -> list["outrl._EpisodeData"]:
+        self, episodes: list["ubrl._EpisodeData"], shuffle: bool
+    ) -> list["ubrl._EpisodeData"]:
         """This function determines how the episodes from the replay buffer (or
         some portion of the replay buffer) should be distributed between
         machines, handling shuffling as appropriate.

@@ -24,11 +24,11 @@ import yaml
 from simple_parsing.helpers.serialization import save_yaml
 from simple_parsing.helpers.serialization import load as load_yaml
 
-import outrl
+import ubrl
 
 T = TypeVar("T")
 
-_LOGGER = logging.getLogger("outrl")
+_LOGGER = logging.getLogger("ubrl")
 
 
 class CustomOptunaDistribution:
@@ -101,7 +101,7 @@ def suggest_config(trial: optuna.Trial, config: Type, overrides: dict[str, Any])
     """Samples a Config from an optuna Trial.
 
     config should be a dataclass, with tunable
-    fields declared using outrl.config.tunable().
+    fields declared using ubrl.config.tunable().
 
     overrides is a dictionary containing "raw" (in the simple_parsing sense)
     values that should not be tuned.
@@ -142,7 +142,7 @@ def default_run_name() -> str:
     return run_name
 
 
-def prepare_training_directory(cfg: "outrl.TrainerConfig", log_dir: Optional[str]):
+def prepare_training_directory(cfg: "ubrl.TrainerConfig", log_dir: Optional[str]):
     """Creates a directory for logging and sets up logging."""
     if log_dir is not None:
         while log_dir.endswith("/"):
@@ -198,7 +198,7 @@ def cmd_sample_config(
     override_config: Optional[str],
     study_storage: str,
     study_name: str,
-    config_type: "type[outrl.TrainerConfig]",
+    config_type: "type[ubrl.TrainerConfig]",
     out_path: str,
 ):
     """Low-level command for manually distributing hyper-parameter optimization.
@@ -370,7 +370,7 @@ def cmd_tune(
 
 
 class ExperimentInvocation:
-    """Provides a standard command line interface to outrl launcher scripts.
+    """Provides a standard command line interface to ubrl launcher scripts.
 
     After construction, additional arguments can be added to the parser.
 
@@ -388,7 +388,7 @@ class ExperimentInvocation:
 
         tune: Runs hparam tuning using optuna using the provided train
             function to maximize the primary_performance stat passed to
-            outrl.Trainer.add_eval_stats().
+            ubrl.Trainer.add_eval_stats().
             --runs_dir Directory to keep runs in. (default: runs)
             --run_name
             --n_trials
@@ -424,7 +424,7 @@ class ExperimentInvocation:
     def __init__(
         self,
         train_fn: "Callable[[config_type], None]",
-        config_type: "type[outrl.TrainerConfig]",
+        config_type: "type[ubrl.TrainerConfig]",
     ):
         self.parser = simple_parsing.ArgumentParser(
             nested_mode=simple_parsing.NestedMode.WITHOUT_ROOT,

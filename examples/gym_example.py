@@ -12,9 +12,9 @@ except ImportError:
 from optuna.distributions import FloatDistribution
 
 import noko
-from outrl import Trainer, TrainerConfig
-from outrl.gym_utils import make_gym_agent, collect, episode_stats
-from outrl.config import ExperimentInvocation, tunable, IntListDistribution
+from ubrl import Trainer, TrainerConfig
+from ubrl.gym_utils import make_gym_agent, collect, episode_stats
+from ubrl.config import ExperimentInvocation, tunable, IntListDistribution
 
 
 @dataclass

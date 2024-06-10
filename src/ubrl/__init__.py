@@ -35,7 +35,7 @@ from optuna.distributions import (
 
 import noko
 
-from outrl.torch_utils import (
+from ubrl.torch_utils import (
     approx_entropy_of,
     entropy_of,
     force_concat,
@@ -62,10 +62,10 @@ from outrl.torch_utils import (
     truncate_packed,
     concat_lists,
 )
-from outrl.config import tunable, IntListDistribution, default_run_name
-import outrl.accel
+from ubrl.config import tunable, IntListDistribution, default_run_name
+import ubrl.accel
 
-_LOGGER = logging.getLogger("outrl")
+_LOGGER = logging.getLogger("ubrl")
 
 T = TypeVar("T")
 
@@ -276,7 +276,7 @@ class Trainer:
         Trainer's behavior, but is not guaranteed to and should be avoided
         (except via load_state_dict()).
         """
-        self.accel = outrl.accel.DefaultAccel(self.cfg)
+        self.accel = ubrl.accel.DefaultAccel(self.cfg)
 
         self.agent: "Agent" = self.accel.prepare_module(agent)
         """The agent being optimized. Provides action (log-likelihoods) and
@@ -1345,7 +1345,7 @@ def summarize_trainer(trainer, key, dst):
 
 
 class Agent(nn.Module):
-    """Agent API optimized by OutRL.
+    """Agent API optimized by ubrl.
 
     You do not need to actually inherit from this class, it exists for
     documentation purposes.
@@ -1360,10 +1360,10 @@ class Agent(nn.Module):
 
     def forward(self, inputs: "AgentInput") -> "AgentOutput":
         """Run the agent's forward pass. This is the main API entry point
-        between your agent and OutRL's trainer.
+        between your agent and ubrl's trainer.
 
         If you already need to use the forward pass for another purpose, you
-        can define outrl_forward() instead, but note that this will not invoke
+        can define ubrl_forward() instead, but note that this will not invoke
         torch forward hooks.
 
         Episodes can be any value passed to Trainer.add_episode().
@@ -1483,7 +1483,7 @@ class AgentInput:
 class _AgentWrapper:
     """Performs checking of the Agent API and caches outputs."""
 
-    def __init__(self, agent: Agent, cfg: "TrainerConfig", accel: outrl.accel.Accel):
+    def __init__(self, agent: Agent, cfg: "TrainerConfig", accel: ubrl.accel.Accel):
         self.agent: Agent = agent
         self.cfg = cfg
         self.accel = accel
@@ -1514,14 +1514,14 @@ class _AgentWrapper:
     ) -> AgentOutput:
         """Wrapper around the Agent forward() method.
 
-        Handles delegating to outrl_forward() if necessary, checking that
+        Handles delegating to ubrl_forward() if necessary, checking that
         need_full is respected, and caching.
         """
         episodes = [ep_data.episode for ep_data in episode_data]
         expected_lengths = [ep_data.n_timesteps for ep_data in episode_data]
         agent_input = AgentInput(episodes=episodes, need_full=need_full)
-        if hasattr(self.agent, "outrl_forward"):
-            agent_output = self.agent.outrl_forward(agent_input)
+        if hasattr(self.agent, "ubrl_forward"):
+            agent_output = self.agent.ubrl_forward(agent_input)
         else:
             agent_output = self.agent(agent_input)
         assert agent_output.state_encodings.shape[0] == sum(expected_lengths) + len(
@@ -1671,7 +1671,7 @@ class TrainerConfig(simple_parsing.Serializable):
     is between 1 / (1 + ppo_clip_epsilon) and 1 + ppo_clip_epsilon.
 
     Because the ppo_loss is disabled by default, this field also has no effect by default.
-    Because OutRL uses regularized VF training, VF clipping is not used.
+    Because ubrl uses regularized VF training, VF clipping is not used.
     """
 
     vf_lr_schedule: Literal[None, "linear", "cosine"] = tunable(
@@ -1706,7 +1706,7 @@ class TrainerConfig(simple_parsing.Serializable):
     frozen state encodings on the very first train_step() before
     training the agent.
 
-    Because OutRL uses an AWR-style loss, training the VF before
+    Because ubrl uses an AWR-style loss, training the VF before
     the policy is expected.
     """
 
@@ -1714,7 +1714,7 @@ class TrainerConfig(simple_parsing.Serializable):
     """Number of epochs of value function training to run from frozen state
     encodings each train_step() before training the agent.
 
-    Because OutRL uses an AWR-style loss, training the VF before the policy is
+    Because ubrl uses an AWR-style loss, training the VF before the policy is
     expected.
     """
 
@@ -2134,11 +2134,11 @@ def _v_trace_estimation(
 
 
 def _group_episodes_to_minibatches(
-    episodes: list["outrl._EpisodeData"],
+    episodes: list["ubrl._EpisodeData"],
     *,
     minibatch_target_timesteps: Optional[int] = None,
     minibatch_max_timesteps: Optional[int] = None,
-) -> list[list["outrl._EpisodeData"]]:
+) -> list[list["ubrl._EpisodeData"]]:
     """Group a list of episodes into a list of list of episodes.
     Each minibatch (list of episodes) will have at least
     minibatch_target_timesteps timesteps unless adding the next episode would
@@ -2176,7 +2176,7 @@ def _group_episodes_to_minibatches(
 
 
 def _minibatch_episodes(
-    accel: outrl.accel.Accel,
+    accel: ubrl.accel.Accel,
     episodes: list[_EpisodeData],
     minibatch_target_timesteps: Optional[int] = None,
     minibatch_max_timesteps: Optional[int] = None,

@@ -1,6 +1,6 @@
 import torch
 from torch.nn.functional import soft_margin_loss
-from outrl.torch_utils import clamp_identity_grad, soft_clamp
+from ubrl.torch_utils import clamp_identity_grad, soft_clamp
 
 
 def test_clamp_identity_grad():

@@ -22,8 +22,8 @@ import torch.nn as nn
 from torch.distributions import TransformedDistribution, AffineTransform
 from tqdm import tqdm
 
-from outrl import Agent, AgentInput, AgentOutput
-from outrl.torch_utils import (
+from ubrl import Agent, AgentInput, AgentOutput
+from ubrl.torch_utils import (
     force_concat,
     make_mlp,
     flatten_shape,

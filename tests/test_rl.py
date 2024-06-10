@@ -1,5 +1,5 @@
 import torch
-from outrl import _discount_cumsum, _v_trace_estimation
+from ubrl import _discount_cumsum, _v_trace_estimation
 
 
 def test_discount_cumsum():
