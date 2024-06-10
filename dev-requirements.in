@@ -8,3 +8,4 @@ gymnasium
 optuna-dashboard
 tensorboardX
 pip-tools
+noko[recommended]

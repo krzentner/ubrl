@@ -30,7 +30,12 @@ dependencies = [
   "optuna>=3.5.0",
   "simple-parsing>=0.1.5",
   "torch>=2.0",
-  "noko[recommended]>=0.3.1",
+  "noko>=0.3.1",
+]
+
+[project.optional-dependencies]
+recommended = [
+  "noko[recommended]",
 ]
 
 [project.urls]
