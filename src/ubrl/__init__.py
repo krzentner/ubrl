@@ -62,7 +62,7 @@ from ubrl.torch_utils import (
     truncate_packed,
     concat_lists,
 )
-from ubrl.config import tunable, IntListDistribution, default_run_name
+from ubrl.cli import tunable, IntListDistribution, default_run_name
 import ubrl.accel
 
 _LOGGER = logging.getLogger("ubrl")
@@ -2028,11 +2028,11 @@ class TrainerConfig(simple_parsing.Serializable):
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
 
     def choose_device(self, n_params: int) -> "TrainerConfig":
-        if self.cfg == _CUDA_ON_OVER_ONE_MILLION_PARAMS:
+        if self.device == _CUDA_ON_OVER_ONE_MILLION_PARAMS:
             if n_params >= 1e6:
-                return replace(self, device="cuda")
+                return dataclasses.replace(self, device="cuda")
             else:
-                return replace(self, device="cpu")
+                return dataclasses.replace(self, device="cpu")
         else:
             return self
 

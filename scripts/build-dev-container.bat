@@ -1,1 +1,1 @@
-docker build -f scripts/dev.containerfile -t outrl .
+docker build -f scripts/dev.containerfile -t ubrl-dev .

@@ -14,7 +14,7 @@ from optuna.distributions import FloatDistribution
 import noko
 from ubrl import Trainer, TrainerConfig
 from ubrl.gym_utils import make_gym_agent, collect, episode_stats
-from ubrl.config import ExperimentInvocation, tunable, IntListDistribution
+from ubrl.cli import run, tunable, IntListDistribution
 
 
 @dataclass
@@ -124,4 +124,4 @@ def train(cfg: GymConfig):
 
 
 if __name__ == "__main__":
-    ExperimentInvocation(train, GymConfig).run()
+    run(train, GymConfig)

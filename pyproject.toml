@@ -1,7 +1,7 @@
 [project]
-name = "outrl"
+name = "ubrl"
 version = "0.1.0"
-description = "An outside the box framework for training agents"
+description = "Unbound Reinforcement Learning of Multimodal Agents"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {file = "LICENSE"}
@@ -30,13 +30,13 @@ dependencies = [
   "optuna>=3.5.0",
   "simple-parsing>=0.1.5",
   "torch>=2.0",
-  "noko[recommended]>=0.2.0",
+  "noko[recommended]>=0.3.1",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/krzentner/outrl"
-"Bug Reports" = "https://github.com/krzentner/outrl/issues"
-"Source" = "https://github.com/krzentner/outrl"
+"Homepage" = "https://github.com/krzentner/ubrl"
+"Bug Reports" = "https://github.com/krzentner/ubrl/issues"
+"Source" = "https://github.com/krzentner/ubrl"
 
 
 # Below is poetry setup for developing this package
@@ -79,7 +79,7 @@ include = ["src"]
 venv = ".venv"
 
 [tool.poetry]
-name = "outrl"
+name = "ubrl"
 version = "0.1.0"
 description = ""
 authors = ["K.R. Zentner <krzentner@gmail.com>"]
