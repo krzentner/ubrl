@@ -11,7 +11,7 @@ except ImportError:
     import gym
 
 import noko
-from ubrl import Trainer, TrainerConfig
+from ubrl import TrainerConfig, TorchTrainer
 from ubrl.gym_utils import make_gym_agent, collect, episode_stats
 from ubrl.cli import run, tunable, IntListDistribution
 
@@ -70,7 +70,7 @@ def train(cfg: GymConfig):
     )
     print("agent:", agent)
 
-    trainer = Trainer(cfg, agent)
+    trainer = TorchTrainer(cfg, agent)
 
     trainer.attempt_resume(prefer_best=False)
 

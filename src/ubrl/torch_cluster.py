@@ -17,7 +17,7 @@ except ImportError:
     Accelerator = None
 
 
-class Engine:
+class Cluster:
     def __init__(self, cfg: "ubrl.TrainerConfig"):
         pass
 
@@ -37,6 +37,9 @@ class Engine:
         Locally, this just means shuffling episodes when requested.
         The agent forward() method is responsible for actually collating and
         placing episode contents as appropriate.
+
+        In a distributed context, this _may_ involve distributing the
+        _EpisodeData across machines.
         """
         raise NotImplementedError()
 
@@ -50,11 +53,11 @@ class Engine:
         raise NotImplementedError()
 
 
-class LocalEngine(Engine):
-    """Engine that just uses torch directly. Supports local cpu and gpu training."""
+class LocalCluster(Cluster):
+    """Cluster that just uses torch directly. Supports local cpu and gpu training."""
 
     def __init__(self, cfg: "ubrl.TrainerConfig"):
-        _LOGGER.info(f"Using LocalEngine(device={cfg.device!r})")
+        _LOGGER.info(f"Using LocalCluster(device={cfg.device!r})")
         self.device = cfg.device
 
     def prepare_module(self, module: torch.nn.Module) -> torch.nn.Module:
@@ -98,9 +101,9 @@ class LocalEngine(Engine):
         return torch.load(path, map_location=self.device)
 
 
-class AcceleratorEngine(Engine):
+class AcceleratorCluster(Cluster):
     def __init__(self, cfg: "ubrl.TrainerConfig"):
-        print("Using AcceleratorEngine")
+        print("Using AcceleratorCluster")
         from accelerate import Accelerator
 
         self.accelerator = Accelerator()
@@ -141,6 +144,6 @@ class AcceleratorEngine(Engine):
 
 
 if Accelerator is None:
-    DefaultEngine = LocalEngine
+    DefaultCluster = LocalCluster
 else:
-    DefaultEngine = AcceleratorEngine
+    DefaultCluster = AcceleratorCluster

@@ -1,6 +1,7 @@
-# `ubrl`
+# `ubrl`: "Unbound Reinforcement Learning"
 
-"Unbound Reinforcement Learning"
+A reinforcement learning library for fine-tuning multimodal foundation
+models by K.R. Zentner.
 
 `ubrl` is a flexible-but-minimal reinforcement learning library. Unlike most RL
 libraries, `ubrl` is not focused on existing benchmarks, but on providing
@@ -10,7 +11,7 @@ It provides a single learning algorithm optimized for reliability and
 performance when training large models.
 
 `ubrl` avoids defining any environment API at all, and only defines a minimal
-`Trainer` and `Agent` API. This avoids the use of any "Space" types, such as
+`TorchTrainer` and `Agent` API. This avoids the use of any "Space" types, such as
 the "gym.spaces.Box" that pervades other RL libraries. For working with the
 popular gym(nasium) API, a small [optional library](src/ubrl/gym_utils.py) and
 [example](examples/gym_example.py) is available.
@@ -38,15 +39,15 @@ propagate rewards back through time.
 
 ## API Overview
 
-`ubrl` does not require you to use any particular command line user interface, you can use whatever control flow you'd like to create and invoke a `ubrl.Trainer` on your agent.
+`ubrl` does not require you to use any particular command line user interface, you can use whatever control flow you'd like to create and invoke a `ubrl.TorchTrainer` on your agent.
 
 However, there are some utilities for writing short "launch scripts" with a consistent command line interface.
 
-### `Trainer` API
+### `TorchTrainer` API
 
-The `Trainer` is the class that provides most of `ubrl`'s functionality.
+The `TorchTrainer` is the class that provides most of `ubrl`'s functionality.
 
-A Trainer is constructed from a `TrainerConfig` (referred to as `cfg` elsewhere) and an `Agent`.
+A `TorchTrainer` is constructed from a `TrainerConfig` (referred to as `cfg` elsewhere) and an `Agent`.
 
 The agent should be a `torch.nn.Module` with a forward method that takes in a list of "episodes" and returns a list of `AgentOutput` (one per episode).
 The agent should also have an integer field `state_encoding_size` that is the
@@ -54,24 +55,24 @@ dimensionality of the state encodings returned by the agent.
 
 The episode can be any value you would like, as long as your agent can produce differentiable state encodings and action log-likelihoods for every time-step in the episode.
 
-Besides training, the `Trainer` also implements checkpoint / resume.
+Besides training, the `TorchTrainer` also implements checkpoint / resume.
 
 Methods:
-- `Trainer.add_episode`: Add an episode to the replay buffer. Must be called
+- `TorchTrainer.add_episode`: Add an episode to the replay buffer. Must be called
   before `train_step`.
-- `Trainer.train_step`: Run a training step on the agent.
-- `Trainer.add_eval_stats`: Add a dictionary of training statistics. Used for
+- `TorchTrainer.train_step`: Run a training step on the agent.
+- `TorchTrainer.add_eval_stats`: Add a dictionary of training statistics. Used for
   checkpointing the "best" agent. Also used in hyper-parameter tuning.
 
-- `Trainer.attempt_resume`: Attempts to resume from the run directory
+- `TorchTrainer.attempt_resume`: Attempts to resume from the run directory
   (`cfg.log_dir`/`cfg.run_name`).
-- `Trainer.maybe_checkpoint`: Checkpoint the `state_dict` to the run directory
+- `TorchTrainer.maybe_checkpoint`: Checkpoint the `state_dict` to the run directory
   depending on `cfg.checkpoint_best` and the checkpoint interval specified in
   `cfg.checkpoint_interval`.
 
-- `Trainer.state_dict`: Compute a state dictionary for the Trainer (as in
+- `TorchTrainer.state_dict`: Compute a state dictionary for the `TorchTrainer` (as in
   `torch.nn.Module`).
-- `Trainer.load_state_dict`: Load a state dictionary for the Trainer (as in
+- `TorchTrainer.load_state_dict`: Load a state dictionary for the `TorchTrainer` (as in
   `torch.nn.Module`).
 
 ### `ExperimentInvocation` API
@@ -87,23 +88,24 @@ Example:
 ```python3
 # my_launcher.py
 
+import ubrl
+import ubrl.cli
+import ubrl.gym_utils
+
 class MyConfig(ubrl.TrainerConfig):
   env_name: str
 
 def train(cfg: MyConfig):
   env = gym.make(cfg.env_name)
   agent = ubrl.gym_utils.make_gym_agent(env, ...)
-  trainer = ubrl.Trainer(MyConfig, agent)
+  trainer = ubrl.TorchTrainer(MyConfig, agent)
   ...
 
 if __name__ == '__main__':
-  ubrl.config.ExperimentInvocation(train, MyConfig).run()
+  ubrl.cli.run(train, MyConfig)
 ```
 
 Then, you can call e.g. `python my_launcher.py train --env_name=CartPole-v1`.
-
-If you'd like to add additional options to the command line parser (outside of
-the config), you can do so before calling `run()`.
 
 You can tune hyper parameters using the `tune` command:
 `python my_launcher.py tune`.
