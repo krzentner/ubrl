@@ -116,3 +116,13 @@ Because the OpenAI Gym / Farama Gymnasium API is used by so many environments,
 some optional tools for working with it are available in `ubrl.gym_utils`.
 
 Most of the API is used in [`gym_example.py`](examples/gym_example.py).
+
+
+## File Layout
+
+ - `src/ubrl/torch_trainer.py`: Reinforcement Learning algorithm implementation.
+ - `src/ubrl/config.py`: Declaration of the configuration format for `TorchTrainer`.
+ - `src/ubrl/gym_utils.py`: (Minimal) utilities for working with gym environments.
+ - `src/ubrl/cli.py`: Command line interface for running training and hyper-parameter optimization.
+ - `src/ubrl/torch_utils.py`: Generic pytorch utilities.
+ - `src/ubrl/torch_cluster.py`: Optional around HuggingFace Accelerator for distributed training.

@@ -390,7 +390,9 @@ class TorchTrainer:
         vf_loss, vf_infos = self._vf_loss(agent_output, loss_input)
 
         if agent_output.inherent_loss is not None:
-            inherent_loss = self.cfg.inherent_loss_coef * agent_output.inherent_loss.mean()
+            inherent_loss = (
+                self.cfg.inherent_loss_coef * agent_output.inherent_loss.mean()
+            )
         else:
             inherent_loss = 0.0
 
@@ -1482,7 +1484,9 @@ class AgentInput:
 class _AgentWrapper:
     """Performs checking of the Agent API and caches outputs."""
 
-    def __init__(self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"):
+    def __init__(
+        self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"
+    ):
         self.agent: Agent = agent
         self.cfg = cfg
         self.cluster = cluster
@@ -1713,6 +1717,7 @@ def _minibatch_episodes(
             for minibatch in minibatches:
                 yield minibatch
                 pbar.update(sum(ep_data.n_timesteps for ep_data in minibatch))
+
 
 __all__ = [
     "TorchTrainer",

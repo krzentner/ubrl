@@ -340,9 +340,7 @@ class GymBoxBetaAgent(GymAgent):
         # Constraint of the beta distribution:
         #  mean * (1 - mean) > var
         max_allowed_var = mean * (1 - mean)
-        var_clipped = soft_clamp(
-            var, min=self.min_std**2, max=max_allowed_var.detach()
-        )
+        var_clipped = soft_clamp(var, min=self.min_std**2, max=max_allowed_var.detach())
 
         v = mean * (1 - mean) / var_clipped - 1
         alpha = mean * v

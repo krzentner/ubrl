@@ -12,6 +12,7 @@ from ubrl.cli import tunable, IntListDistribution, default_run_name
 _GENERATED_FROM_TIME = "GENERATED_FROM_TIME"
 _CUDA_ON_OVER_ONE_MILLION_PARAMS = "CUDA_ON_OVER_ONE_MILLION_PARAMS"
 
+
 @dataclasses.dataclass
 class TrainerConfig(simple_parsing.Serializable):
     """Config structure for the Trainer.
