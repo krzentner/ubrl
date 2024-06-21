@@ -1,4 +1,4 @@
-# `ubrl`: "Unbound Reinforcement Learning"
+# `ubrl`: Unbound Reinforcement Learning
 
 A reinforcement learning library for fine-tuning multimodal foundation
 models by K.R. Zentner.
@@ -70,10 +70,8 @@ Methods:
   depending on `cfg.checkpoint_best` and the checkpoint interval specified in
   `cfg.checkpoint_interval`.
 
-- `TorchTrainer.state_dict`: Compute a state dictionary for the `TorchTrainer` (as in
-  `torch.nn.Module`).
-- `TorchTrainer.load_state_dict`: Load a state dictionary for the `TorchTrainer` (as in
-  `torch.nn.Module`).
+- `TorchTrainer.state_dict`: Compute a state dictionary for the `TorchTrainer`.
+- `TorchTrainer.load_state_dict`: Load a state dictionary to the `TorchTrainer`.
 
 ### `ExperimentInvocation` API
 

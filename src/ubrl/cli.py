@@ -410,6 +410,7 @@ def cmd_tune(
 
 
 def run(
+    *,
     train_fn: "Callable[[config_type], None]",
     config_type: "type[ubrl.TrainerConfig]",
 ):
