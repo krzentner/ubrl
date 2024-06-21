@@ -123,4 +123,4 @@ def train(cfg: GymConfig):
 
 
 if __name__ == "__main__":
-    run(train, GymConfig)
+    run(train_fn=train, config_type=GymConfig)
