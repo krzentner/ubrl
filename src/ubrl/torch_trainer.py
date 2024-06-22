@@ -1422,6 +1422,10 @@ class AgentOutput:
     Typically should be near unit scale when used.
     """
 
+    infos: Optional[dict[str, Any]] = None
+    """Not used by ubrl, but can be used if agent.forward() needs to return
+    additional values for other use cases."""
+
     def __post_init__(self):
         # The number of state_encoding dimensions is not constant and cannot be
         # checked here.
