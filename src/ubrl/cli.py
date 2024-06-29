@@ -413,8 +413,18 @@ def run(
     *,
     train_fn: "Callable[[config_type], None]",
     config_type: "type[ubrl.TrainerConfig]",
-):
+    run_command: bool = True
+) -> Any | argparse.ArgumentParser:
     """Provides a standard command line interface to ubrl launcher scripts.
+
+    Args:
+        train_fn: A function to call to train the agent. The "main function" of
+            most launcher programs. If run_command is True, return value will
+            be returned from this function.
+        config_type: The configuration type to use for command line arguments
+            to "train" / to load from file if --config is passed.
+        run_command: Whether to run the command. If False, the ArgumentParser
+            will be returned instead of calling parser.parse().func().
 
     Commands:
 
@@ -467,15 +477,23 @@ def run(
     subp = parser.add_subparsers(title="command", dest="command")
     subp.required = True
 
+    def _after_func():
+        if args.done_token:
+            with open(args.done_token, "w") as f:
+                f.write("done\n")
+
     def _train():
         cfg = prepare_training_directory(args.cfg, args.log_dir)
-        train_fn(cfg)
+        result = train_fn(cfg)
+        _after_func()
+        return result
 
     def _create_study():
         import optuna
 
         study_storage = _storage_filename_to_storage(args.study_storage)
         optuna.create_study(storage=study_storage, study_name=args.study_name)
+        _after_func()
 
     def _sample_config():
         cmd_sample_config(
@@ -485,9 +503,11 @@ def run(
             config_type=config_type,
             out_path=args.config_path,
         )
+        _after_func()
 
     def _report_trial():
         cmd_report_trial(args.config_file, args.run_dirs)
+        _after_func()
 
     def _tune():
         cmd_tune(
@@ -500,6 +520,7 @@ def run(
             n_seeds_per_trial=args.n_seeds_per_trial,
             config_type=config_type,
         )
+        _after_func()
 
     train_parser = subp.add_parser(
         "train",
@@ -618,8 +639,8 @@ def run(
         help="show this help message and exit",
     )
 
-    args, _ = parser.parse_known_args()
-    args.func()
-    if args.done_token:
-        with open(args.done_token, "w") as f:
-            f.write("done\n")
+    if run_command:
+        args = parser.parse_args()
+        return args.func()
+    else:
+        return parser

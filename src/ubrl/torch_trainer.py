@@ -468,11 +468,12 @@ class TorchTrainer:
         approx_kl = total_timesteps * approx_kl_div_of(old_log_probs, log_probs)
         total_approx_kl = approx_kl.sum()
         used_for_logging(total_approx_kl)
+        new_dists = agent_output.action_dists
+        old_dists = loss_input.original_action_dists
+        assert (new_dists is None) == (old_dists is None), "dists do not consistently exist"
 
         # Compute KL Divergence
-        if self.cfg.use_approx_kl is False:
-            new_dists = agent_output.action_dists
-            old_dists = loss_input.original_action_dists
+        if self.cfg.use_approx_kl is False and new_dists is not None and old_dists is not None:
             # TODO: Add options for other KL directions
             try:
                 kl = kl_div_of(old_dists, new_dists)
@@ -481,8 +482,8 @@ class TorchTrainer:
         else:
             kl = approx_kl
 
-        assert kl.shape == (total_timesteps,)
-        assert approx_kl.shape == (total_timesteps,)
+        assert kl.shape == (total_timesteps,), "KL shape does not match total timesteps"
+        assert approx_kl.shape == (total_timesteps,), "KL approx shape does not match total timesteps"
         kl = kl[torch.isfinite(kl)]
 
         # Update KL loss coefficient
@@ -550,8 +551,8 @@ class TorchTrainer:
                 - self.cfg.entropy_schedule_start_train_step
             ),
         )
-        assert step_fraction >= 0
-        assert step_fraction <= 1
+        assert step_fraction >= 0, "step_fraction < 0"
+        assert step_fraction <= 1, "step_fraction > 1"
         if self.cfg.entropy_schedule_end_target is not None:
             final_entropy = self.cfg.entropy_schedule_end_target
         elif self.starting_entropy < 0:
@@ -575,8 +576,8 @@ class TorchTrainer:
                 f"Unknown entropy schedule {self.cfg.entropy_schedule}"
             )
 
-        assert mix >= 0
-        assert mix <= 1
+        assert mix >= 0, "entropy mix < 0"
+        assert mix <= 1, "entropy mix > 1"
         target = (1 - mix) * self.starting_entropy + mix * final_entropy
         return target
 
@@ -616,7 +617,7 @@ class TorchTrainer:
             self._replay_buffer = list(
                 self._replay_buffer[-self.cfg.replay_buffer_episodes :]
             )
-            assert len(self._replay_buffer) == self.cfg.replay_buffer_episodes
+            assert len(self._replay_buffer) == self.cfg.replay_buffer_episodes, "replay buffer length shorter than expected"
         self._maybe_record_starting_entropy()
 
         errors = 0
@@ -786,8 +787,8 @@ class TorchTrainer:
         action_lls_now = pad_tensors(
             [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
         )
-        assert not state_enc_packed.requires_grad
-        assert not action_lls_now.requires_grad
+        assert not state_enc_packed.requires_grad, "state_enc unexpectedly required grad"
+        assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         padded_rewards = self.cluster.prepare_tensor(
             pad_tensors([data.rewards for data in self._replay_buffer])
@@ -917,12 +918,12 @@ class TorchTrainer:
         action_lls_now = pad_tensors(
             [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
         )
-        assert not state_enc_packed.requires_grad
-        assert not action_lls_now.requires_grad
+        assert not state_enc_packed.requires_grad, "state_enc unexpectedly required grad"
+        assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
-        obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
-        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens
+        # obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
+        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens, "rewards length do not match state_encodings length"
 
         # Compute vf_returns
         self.agent.train(mode=False)
@@ -945,7 +946,7 @@ class TorchTrainer:
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
             # Everything after last valid observation should have been padded to zero
-            assert (vf_returns[i, episode_length + 1 :] == 0.0).all()
+            assert (vf_returns[i, episode_length + 1 :] == 0.0).all(), "VF returns non-zero after last observation"
 
             # zero vf_{t+1} in terminated episodes
             if self._replay_buffer[i].terminated:
@@ -978,7 +979,7 @@ class TorchTrainer:
         )
 
         adv_packed = pack_padded(padded_advantages, episode_lengths)
-        assert not adv_packed.requires_grad
+        assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
 
         if self.cfg.normalize_awr_advantages:
             adv_packed = adv_packed - adv_packed.mean()
@@ -992,7 +993,7 @@ class TorchTrainer:
             softmax_adv = softmax_clip(heated_adv, max_exp_adv)
             awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
             normed_exp_adv = softmax_adv * len(softmax_adv)
-            assert 0.9 <= normed_exp_adv.mean() <= 1.1
+            assert 0.9 <= normed_exp_adv.mean() <= 1.1, "normed_exp_adv outside expected range"
         else:
             awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
@@ -1005,7 +1006,7 @@ class TorchTrainer:
                 exp_advantages=exp_adv,
                 original_action_lls=episode_data.original_action_lls,
                 episode_lengths=[episode_data.n_timesteps],
-                original_action_dists=[episode_data.original_action_dists],
+                original_action_dists=[episode_data.original_action_dists] if episode_data.original_action_dists else None,
             )
             for (episode_data, adv, vf_ret, vf_target, exp_adv) in zip(
                 self._replay_buffer,
@@ -1015,9 +1016,9 @@ class TorchTrainer:
                 unpack_tensors(normed_exp_adv, episode_lengths),
             )
         }
-        assert len(loss_inputs) == len(self._replay_buffer)
+        assert len(loss_inputs) == len(self._replay_buffer), "number of loss inputs do not match size of replay buffer"
         for data in self._replay_buffer:
-            assert len(loss_inputs[data.episode_id].advantages) == len(data.rewards)
+            assert len(loss_inputs[data.episode_id].advantages) == len(data.rewards), "number of advantages do not match number of rewards"
 
         used_for_logging(awr_clip_ratio)
         infos = locals()
@@ -1070,15 +1071,15 @@ class TorchTrainer:
                 the episode. Will be summarized and logged every training step.
 
         """
-        assert isinstance(rewards, torch.Tensor)
-        assert isinstance(action_lls, torch.Tensor)
-        assert not action_lls.requires_grad
+        assert isinstance(rewards, torch.Tensor), "rewards are not a torch.Tensor"
+        assert isinstance(action_lls, torch.Tensor), "action_lls are not a torch.Tensor"
+        assert not action_lls.requires_grad, "action_lls unexpectedly require grad"
         n_timesteps = len(rewards)
         self.total_env_steps += n_timesteps
         if any_actions_possible is None:
             any_actions_possible = torch.ones(n_timesteps, dtype=torch.bool)
         else:
-            assert isinstance(any_actions_possible, torch.Tensor)
+            assert isinstance(any_actions_possible, torch.Tensor), "any_actions_possible is not a torch.Tensor"
 
         rewards = rewards.to(dtype=self._loss_dtype)
         self.reward_normalizer.update(rewards)
@@ -1110,7 +1111,7 @@ class TorchTrainer:
         the "best" agent for purposes of checkpointing and hyper-parameter
         tuning.
         """
-        assert "primary" not in stats
+        assert "primary" not in stats, "'primary' stat already present in stats"
         stats["primary"] = stats[primary]
         noko.log_row("eval_stats", stats, step=self.total_env_steps, level=noko.RESULTS)
         self.primary_performance = stats[primary]
@@ -1284,13 +1285,13 @@ class TorchTrainer:
             getattr(self, k).load_state_dict(state[k])
 
         # Make sure optimizers are attached to parameters
-        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
+        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef, "kl_coef_opt not optimizing kl_coef"
         assert self.vf_optimizer.param_groups[0]["params"][0] is next(
             self.vf.parameters()
-        )
+        ), "vf_optimizer not optimizing vf"
         assert self.agent_optimizer.param_groups[0]["params"][0] is next(
             self.agent.parameters()
-        )
+        ), "agent optimizer not optimizing ageint"
 
     def _entropy_of(
         self, action_lls: torch.Tensor, action_dists: Optional[ActionDist]
@@ -1321,6 +1322,9 @@ class TorchTrainer:
             original_dists = [
                 ep_data.original_action_dists for ep_data in self._replay_buffer
             ]
+            if None in original_dists:
+                assert all([dist is None for dist in original_dists])
+                original_dists = None
             approx_entropy, entropy = self._entropy_of(
                 original_action_lls, original_dists
             )
@@ -1429,15 +1433,15 @@ class AgentOutput:
     def __post_init__(self):
         # The number of state_encoding dimensions is not constant and cannot be
         # checked here.
-        assert len(self.state_encodings.shape) == 2
-        assert len(self.action_lls.shape) == 1
+        assert len(self.state_encodings.shape) == 2, "state_encodings should have exactly two dimensions"
+        assert len(self.action_lls.shape) == 1, "action_lls should have exactly one dimension"
         assert (
             self.state_encodings.shape[0] != self.action_lls.shape[0]
         ), "There should be one more state_encoding per episode than action_ll. "
         if self.valid_mask is not None:
-            assert len(self.valid_mask.shape) == 1
-            assert self.valid_mask.shape == self.state_encodings.shape
-            assert self.valid_mask.dtype == torch.bool
+            assert len(self.valid_mask.shape) == 1, "valid_mask should have exactly one dimension"
+            assert self.valid_mask.shape == self.state_encodings.shape, "valid_mask shape does not match state_encodings shape"
+            assert self.valid_mask.dtype == torch.bool, "valid_mask does not use torch.bool dtype"
 
     def full_valid(self):
         """If the AgentOutput has contains all timesteps for the requested
@@ -1730,3 +1734,4 @@ __all__ = [
     "AgentOutput",
     "LossInput",
 ]
+import hot_restart; hot_restart.wrap_module()

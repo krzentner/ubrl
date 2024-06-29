@@ -580,11 +580,11 @@ def kl_div_of(
     """
 
     if isinstance(p_dist, list):
-        assert isinstance(q_dist, list)
-        assert len(p_dist) == len(q_dist)
+        assert isinstance(q_dist, list), "unsupported distribution type"
+        assert len(p_dist) == len(q_dist), "distribution sizes do not match from same episode"
         return torch.cat([kl_div_of(p, q) for (p, q) in zip(p_dist, q_dist)])
     elif isinstance(p_dist, torch.distributions.Distribution):
-        assert isinstance(q_dist, torch.distributions.Distribution)
+        assert isinstance(q_dist, torch.distributions.Distribution), "distribution types do not match from same episode"
         return torch.distributions.kl.kl_divergence(p_dist, q_dist)
     else:
         # Presumably implements the CustomTorchDist API

@@ -171,3 +171,4 @@ cython_debug/
 /python*.svg
 /runs*
 /plots*
+/.idea

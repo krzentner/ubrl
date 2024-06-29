@@ -103,7 +103,7 @@ class LocalCluster(Cluster):
 
 class AcceleratorCluster(Cluster):
     def __init__(self, cfg: "ubrl.TrainerConfig"):
-        print("Using AcceleratorCluster")
+        _LOGGER.info(f"Using AcceleratorCluster(device={cfg.device!r})")
         from accelerate import Accelerator
 
         self.accelerator = Accelerator()
