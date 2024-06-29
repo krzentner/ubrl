@@ -28,7 +28,8 @@ class LLMAgentConfig(ubrl.TrainerConfig):
     train_steps_per_checkpoint: int = 100
 
     n_prompts: int = 10
-    episode_length: int = 16
+    max_generation_len: int = 44
+    max_prompt_len: int = 20
 
 
 class CausalLMAgent(ubrl.Agent):
@@ -46,7 +47,9 @@ class CausalLMAgent(ubrl.Agent):
                 cfg.pretrained_name, trust_remote_code=cfg.trust_remote_code
             )
         self.cfg = cfg
-        self.encoder_task_description = "Please answer the following question by reasoning step-by-step."
+        self.encoder_task_description = (
+            "Please answer the following question by reasoning step-by-step."
+        )
 
     def llm_inputs(self, decoder_inputs_unpadded: list[torch.Tensor]):
         pass
@@ -65,13 +68,11 @@ class CausalLMAgent(ubrl.Agent):
         #     'decoder_input_ids': padded_dec_input,
         # }
 
-
     def forward(self, inputs: ubrl.AgentInput) -> ubrl.AgentOutput:
         # This method could also be called ubrl_forward
 
         # This method needs to match how _collect_episodes runs the agent.
         # In this example, that is checked in agent.check_padding.
-
 
         n_episodes = len(inputs.episodes)
 
@@ -87,17 +88,28 @@ class CausalLMAgent(ubrl.Agent):
             torch.cat([prompt_ids[i], gen_ids[i]])
             for i in range(n_episodes)
         ]
-        print('prompt_tokens\n',
-              [self.tokenizer.convert_ids_to_tokens(prompt_enc)
-               for prompt_enc in prompt_ids][0])
-        print('gen_tokens\n',
-              [self.tokenizer.convert_ids_to_tokens(gen_enc)
-               for gen_enc in gen_ids][0])
-        print('episodes_encoded\n',
-              [self.tokenizer.decode(ep_enc) for ep_enc in episodes_encoded][0])
-        print('episodes_tokens\n',
-              [self.tokenizer.convert_ids_to_tokens(ep_enc)
-               for ep_enc in episodes_encoded][0])
+        print(
+            "prompt_tokens\n",
+            [
+                self.tokenizer.convert_ids_to_tokens(prompt_enc)
+                for prompt_enc in prompt_ids
+            ][0],
+        )
+        print(
+            "gen_tokens\n",
+            [self.tokenizer.convert_ids_to_tokens(gen_enc) for gen_enc in gen_ids][0],
+        )
+        print(
+            "episodes_encoded\n",
+            [self.tokenizer.decode(ep_enc) for ep_enc in episodes_encoded][0],
+        )
+        print(
+            "episodes_tokens\n",
+            [
+                self.tokenizer.convert_ids_to_tokens(ep_enc)
+                for ep_enc in episodes_encoded
+            ][0],
+        )
 
         max_len = max([len(ids) for ids in episodes_encoded])
         ep_len = max(16, max_len)
@@ -129,28 +141,32 @@ class CausalLMAgent(ubrl.Agent):
             if self.tokenizer.padding_side == "left":
                 padded_episodes[i, attn_pad_size:] = encoded
                 state_encodings_mask[i, attn_pad_size:] = True
-                action_lls_mask[i, attn_pad_size:ep_len - 1] = True
-                real_logits_mask[i, attn_pad_size + prompt_size:ep_len - 1] = True
+                action_lls_mask[i, attn_pad_size : ep_len - 1] = True
+                real_logits_mask[i, attn_pad_size + prompt_size : ep_len - 1] = True
             else:
-                padded_episodes[i, :ep_len - attn_pad_size] = encoded
-                state_encodings_mask[i, :ep_len - attn_pad_size] = True
-                action_lls_mask[i, :ep_len - attn_pad_size - 1] = True
-                real_logits_mask[i, prompt_size:ep_len - attn_pad_size - 1] = True
+                padded_episodes[i, : ep_len - attn_pad_size] = encoded
+                state_encodings_mask[i, : ep_len - attn_pad_size] = True
+                action_lls_mask[i, : ep_len - attn_pad_size - 1] = True
+                real_logits_mask[i, prompt_size : ep_len - attn_pad_size - 1] = True
 
         # Sometimes there may be pad tokens embedded in the sequence. Count them.
         original_pad_count = sum(
             (encoded == self.tokenizer.pad_token_id).sum()
-                   for encoded in episodes_encoded)
-        masked_pad_count = (padded_episodes[state_encodings_mask] == self.tokenizer.pad_token_id).sum()
+            for encoded in episodes_encoded
+        )
+        masked_pad_count = (
+            padded_episodes[state_encodings_mask] == self.tokenizer.pad_token_id
+        ).sum()
         # Those same pad tokens (and only those) should be visible "through" the mask
         assert original_pad_count == masked_pad_count
         reward_count = sum([len(ep["rewards"]) for ep in inputs.episodes])
 
         assert action_lls_mask.sum() == reward_count
-        assert (state_encodings_mask.sum() == n_episodes + reward_count)
+        assert state_encodings_mask.sum() == n_episodes + reward_count
 
-        task_desc_enc = self.tokenizer(self.encoder_task_description,
-                                    return_tensors="pt").input_ids.repeat(n_episodes, 1)
+        task_desc_enc = self.tokenizer(
+            self.encoder_task_description, return_tensors="pt"
+        ).input_ids.repeat(n_episodes, 1)
 
         # print('padded_episodes\n',
         #       [self.tokenizer.decode(pad_ep) for pad_ep in padded_episodes][0])
@@ -243,37 +259,46 @@ def generate_prompt(agent: CausalLMAgent) -> str:
 
 
 def _collect_episodes(
-    agent: CausalLMAgent, n_prompts: int, episode_length: int
+    agent: CausalLMAgent, n_prompts: int, max_prompt_len: int, max_generation_len: int
 ) -> list[dict[str, str | torch.Tensor]]:
+    torch.manual_seed(99)
     prompts = [generate_prompt(agent) for _ in range(n_prompts)]
-    encoded_prompts_unpadded = [agent.tokenizer(prompt, return_tensors="pt").input_ids[0]
-                                for prompt in prompts]
+    encoded_prompts_unpadded = [
+        agent.tokenizer(prompt, return_tensors="pt").input_ids[0] for prompt in prompts
+    ]
     # Remove end-of-sequence token
-    decoder_inputs_unpadded = [enc_prompt[:-1] for enc_prompt in encoded_prompts_unpadded]
+    # decoder_inputs_unpadded = [enc_prompt[:-1] for enc_prompt in encoded_prompts_unpadded]
+    decoder_inputs_unpadded = [
+        enc_prompt[max(0, len(enc_prompt) - max_prompt_len - 1):-1]
+        for enc_prompt in encoded_prompts_unpadded
+    ]
     # decoder_inputs_unpadded = encoded_prompts_unpadded
 
     # TODO: Refactor into method
     n_episodes = len(decoder_inputs_unpadded)
-    prompt_padded_len = max(len(dec_in) for dec_in in decoder_inputs_unpadded)
-    task_desc_enc = agent.tokenizer(agent.encoder_task_description,
-                                return_tensors="pt").input_ids.repeat(n_episodes, 1)
-    padded_dec_input = torch.full((n_episodes, prompt_padded_len),
-                                    agent.tokenizer.pad_token_id,
-                                    dtype=torch.long)
+    # prompt_padded_len = 1 + max(len(dec_in) for dec_in in decoder_inputs_unpadded)
+    prompt_padded_len = max_prompt_len
+    task_desc_enc = agent.tokenizer(
+        agent.encoder_task_description, return_tensors="pt"
+    ).input_ids.repeat(n_episodes, 1)
+    padded_dec_input = torch.full(
+        (n_episodes, prompt_padded_len), agent.tokenizer.pad_token_id, dtype=torch.long
+    )
     dec_attn_mask = torch.zeros((n_episodes, prompt_padded_len), dtype=torch.bool)
     for i, dec_in in enumerate(decoder_inputs_unpadded):
-        padded_dec_input[i, prompt_padded_len - len(dec_in):] = dec_in
-        dec_attn_mask[i, prompt_padded_len - len(dec_in):] = True
+        padded_dec_input[i, prompt_padded_len - len(dec_in) :] = dec_in
+        # Need to attend to the last pad token, since it serves as the
+        # beginning of sequence token.
+        dec_attn_mask[i, prompt_padded_len - len(dec_in) - 1 :] = True
     llm_inputs = {
-        'input_ids': task_desc_enc,
-        'decoder_input_ids': padded_dec_input,
-        'decoder_attention_mask': dec_attn_mask,
+        "input_ids": task_desc_enc,
+        "decoder_input_ids": padded_dec_input,
+        "decoder_attention_mask": dec_attn_mask,
     }
 
     # decoded_prompts = [agent.tokenizer.convert_ids_to_tokens(enc_prompt)
     #                    for enc_prompt in llm_inputs['decoder_input_ids']]
     # print('decoded_prompts', decoded_prompts[0])
-
 
     # prompt_padded_len = max([len(enc_prompt)
     #                for enc_prompt in encoded_prompts_unpadded])
@@ -291,7 +316,6 @@ def _collect_episodes(
     #                    for enc_prompt in encoded_prompts]
     # print('decoded_prompts', decoded_prompts)
 
-
     # encoded_prompts = agent.tokenizer(
     #     prompts, padding="longest", return_tensors="pt")
     # prompt_padded_len = encoded_prompts.input_ids.shape[1]
@@ -307,7 +331,6 @@ def _collect_episodes(
             # input_ids=encoded_prompts.input_ids,
             # decoder_input_ids=encoded_prompts.input_ids,
             # decoder_attention_mask=encoded_prompts.attention_mask,
-
             # input_ids=torch.full((n_prompts, 1),
             #                      agent.tokenizer.pad_token_id, dtype=torch.long),
             # decoder_input_ids=encoded_prompts,
@@ -316,18 +339,28 @@ def _collect_episodes(
             return_dict_in_generate=True,
             output_logits=True,
             do_sample=True,
-            max_new_tokens=episode_length,
+            max_new_tokens=max_generation_len,
         )
 
     # We need to account for the <bos> start token fed into the decoder
-    gen_seqs = generated_output.sequences[:, prompt_padded_len + 1:]
-    print('generated_sequences\n',
-          [agent.tokenizer.convert_ids_to_tokens(gen_seq)
-           for gen_seq in generated_output.sequences][0])
-    print('gen_seqs\n',
-          [agent.tokenizer.convert_ids_to_tokens(gen_seq)
-           for gen_seq in gen_seqs][0])
+    gen_seqs = generated_output.sequences[:, prompt_padded_len:]
+    print(
+        "generated_sequences\n",
+        [
+            agent.tokenizer.convert_ids_to_tokens(gen_seq)
+            for gen_seq in generated_output.sequences
+        ][0],
+    )
+    print(
+        "gen_seqs\n",
+        [agent.tokenizer.convert_ids_to_tokens(gen_seq) for gen_seq in gen_seqs][0],
+    )
     # assert False
+
+    # generated_sequences
+    #  ['<pad>', '▁Here', "'", 's', '▁', 'a', '▁poem', '▁about', '▁sisters', ':', '▁', "'", 'R', 'o', 'at', 'less', '▁and', '▁mean', ';', '▁how', '▁it', '▁feels', '▁', '-', '▁and', '▁you', '▁are']
+    # gen_seqs
+    #  ["'", 'R', 'o', 'at', 'less', '▁and', '▁mean', ';', '▁how', '▁it', '▁feels', '▁', '-', '▁and', '▁you', '▁are']
 
     # vocab_size = generated_output.logits[0].shape[1]
 
@@ -345,9 +378,7 @@ def _collect_episodes(
 
     # logits are (B, T, X) here, where X is the token dim
     token_lls = torch.log_softmax(logits, dim=2)
-    action_lls = torch.gather(
-        token_lls, 2, gen_seqs[:, :, None]
-    ).squeeze(-1)
+    action_lls = torch.gather(token_lls, 2, gen_seqs[:, :, None]).squeeze(-1)
 
     valid_tokens_mask = gen_seqs != agent.tokenizer.pad_token_id
     # Note that we still include eos_token_id, since that's an "action" the LLM
@@ -364,9 +395,13 @@ def _collect_episodes(
         # encoded_prompt = encoded_prompts.input_ids[i][
         #     encoded_prompts.attention_mask[i].bool()
         # ]
-        encoded_prompt = torch.cat([
-            torch.full((1,), agent.tokenizer.pad_token_id, dtype=torch.long),
-            decoder_inputs_unpadded[i]], dim=0)
+        encoded_prompt = torch.cat(
+            [
+                torch.full((1,), agent.tokenizer.pad_token_id, dtype=torch.long),
+                decoder_inputs_unpadded[i],
+            ],
+            dim=0,
+        )
         # encoded_prompt = decoder_inputs_unpadded[i]
         # decoded_prompt = agent.tokenizer.decode(encoded_prompt)
 
@@ -412,7 +447,8 @@ def _collect_episodes(
                 "rewards": torch.tensor(rewards),
             }
         )
-    # agent.check_padding(episodes)
+    agent.check_padding(episodes)
+    # assert False, "no go"
     return episodes
 
 
@@ -430,7 +466,9 @@ def train_llm_agent(cfg: LLMAgentConfig):
     trainer.attempt_resume(prefer_best=False)
 
     llm_agent.eval()
-    start_episodes = _collect_episodes(llm_agent, cfg.n_prompts, cfg.episode_length)
+    start_episodes = _collect_episodes(
+        llm_agent, cfg.n_prompts, cfg.max_prompt_len, cfg.max_generation_len
+    )
     llm_agent.check_padding(start_episodes)
     train_stats = _episode_stats(start_episodes)
 
@@ -443,7 +481,7 @@ def train_llm_agent(cfg: LLMAgentConfig):
             trainer.maybe_checkpoint()
         if step < cfg.expected_train_steps:
             train_episodes = _collect_episodes(
-                llm_agent, cfg.n_prompts, cfg.episode_length
+                llm_agent, cfg.n_prompts, cfg.max_prompt_len, cfg.max_generation_len
             )
             for episode in train_episodes:
                 ep_len = len(episode["rewards"])
