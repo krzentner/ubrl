@@ -327,7 +327,7 @@ class TrainerConfig(simple_parsing.Serializable):
     this target.
     """
 
-    kl_fixup_coef: float = tunable(3, low=1.1, high=20.0, log=True)
+    kl_fixup_coef: float = tunable(3.0, low=1.1, high=20.0, log=True)
     """Multiple of the kl_soft_target to strictly enforce when kl_use_fixup is
     True.
 

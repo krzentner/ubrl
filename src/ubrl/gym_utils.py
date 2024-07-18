@@ -211,6 +211,7 @@ class GymAgent(Agent):
         return AgentOutput(
             state_encodings=state_encodings,
             action_lls=action_lls_valid,
+            n_timesteps=inputs.n_timesteps,
             action_dists=dists,
         )
 

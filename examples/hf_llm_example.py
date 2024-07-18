@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import random
 
 import torch
-from torch.distributions import Categorical, Independent
+from torch.distributions import Categorical
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -41,6 +41,7 @@ class LLMEpisode:
     action_lls: torch.Tensor
     logits: torch.Tensor
     rewards: torch.Tensor
+    # action_dist: Categorical
 
 
 class CausalLMAgent(ubrl.Agent):
@@ -68,10 +69,11 @@ class CausalLMAgent(ubrl.Agent):
         # This method needs to match how _collect_episodes runs the agent.
         # In this example, that is checked in agent.check_padding.
 
-        n_episodes = len(inputs.episodes)
+        in_episodes: list[LLMEpisode] = inputs.episodes
 
-        prompt_ids = [ep["prompt_ids"] for ep in inputs.episodes]
-        gen_ids = [ep["generated_ids"] for ep in inputs.episodes]
+        n_episodes = len(in_episodes)
+        prompt_ids = [ep.prompt_ids for ep in in_episodes]
+        gen_ids = [ep.generated_ids for ep in in_episodes]
 
         episodes_encoded = [
             # Don't re-encode a string here as one sequence.
@@ -130,7 +132,7 @@ class CausalLMAgent(ubrl.Agent):
         ).sum()
         # Those same pad tokens (and only those) should be visible "through" the mask
         assert original_pad_count == masked_pad_count
-        reward_count = sum([len(ep["rewards"]) for ep in inputs.episodes])
+        reward_count = sum([len(ep.rewards) for ep in in_episodes])
 
         assert action_lls_mask.sum() == reward_count
         assert state_encodings_mask.sum() == n_episodes + reward_count
@@ -156,20 +158,24 @@ class CausalLMAgent(ubrl.Agent):
 
         state_encodings = hidden_states[state_encodings_mask]
         action_lls = sampled_token_lls[action_lls_mask]
-        logits = model_out.logits[real_logits_mask]
+        all_logits = [model_out.logits[i, real_logits_mask[i]]
+                      for i in range(n_episodes)]
 
         return ubrl.AgentOutput(
             state_encodings=state_encodings,
             action_lls=action_lls,
+            n_timesteps=inputs.n_timesteps,
             # Only construct action dict on action tokens
-            action_dists=Independent(Categorical(logits=logits), 1),
+            # action_dists=[Categorical(logits=logits)
+            #               for logits in all_logits],
+
             # infos is optional, but we use it in this example to implement
             # check_padding()
-            infos={"logits": logits},
+            infos={"logits": list(all_logits)},
         )
 
 
-def check_padding(agent, episodes: list[dict[str, str | torch.Tensor]]):
+def check_padding(agent, episodes: list[LLMEpisode]):
     """Used to check that padding is consistently applied between
     _collect_episodes() and llm_agent.forward(). This method is not part of
     the agent API, and is not used by ubrl.
@@ -181,11 +187,11 @@ def check_padding(agent, episodes: list[dict[str, str | torch.Tensor]]):
     _collect_episodes() before training.
     """
     assert isinstance(episodes, list)
-    logits = torch.cat([ep["logits"] for ep in episodes])
-    agent_out = agent(AgentInput(episodes=episodes, need_full=True))
+    logits = torch.cat([ep.logits for ep in episodes])
+    agent_out = agent(AgentInput(episodes=episodes, need_full=True, n_timesteps=[ep.action_lls.shape[0] for ep in episodes]))
     # Check that logits during generation match logits during forward pass
     # These tolerances may be too strict for 16 bit (or smaller)
-    assert torch.allclose(agent_out.infos["logits"], logits, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(torch.cat(agent_out.infos["logits"]), logits, atol=1e-4, rtol=1e-4)
 
 def compute_rewards(
     prompt: str, prompt_tokens: list[str], tokens: list[str], full_text: str
@@ -215,7 +221,7 @@ def generate_prompt(agent: CausalLMAgent) -> str:
 
 def _collect_episodes(
     agent: CausalLMAgent, n_prompts: int, max_prompt_len: int, max_generation_len: int
-) -> list[dict[str, str | torch.Tensor]]:
+) -> list[LLMEpisode]:
     prompts = [generate_prompt(agent) for _ in range(n_prompts)]
     encoded_prompts_unpadded = [
         agent.tokenizer(prompt, return_tensors="pt").input_ids[0] for prompt in prompts
@@ -324,13 +330,14 @@ def _collect_episodes(
                 action_lls=act_lls,
                 logits=episode_logits,
                 rewards=torch.tensor(rewards),
+                # action_dist=Categorical(logits=episode_logits),
             )
         )
     return episodes
 
 
-def _episode_stats(episodes: list[dict[str, str | torch.Tensor]]) -> dict[str, float]:
-    all_rewards = torch.cat([ep["rewards"] for ep in episodes])
+def _episode_stats(episodes: list[LLMEpisode]) -> dict[str, float]:
+    all_rewards = torch.cat([ep.rewards for ep in episodes])
     return {"average_reward": all_rewards.mean().item()}
 
 
@@ -361,13 +368,14 @@ def train_llm_agent(cfg: LLMAgentConfig):
                 llm_agent, cfg.n_prompts, cfg.max_prompt_len, cfg.max_generation_len
             )
             for episode in train_episodes:
-                ep_len = len(episode["rewards"])
+                ep_len = len(episode.rewards)
                 action_mask = torch.ones(ep_len, dtype=torch.bool)
-                action_mask[0 : len(episode["prompt_ids"])] = False
+                action_mask[0 : len(episode.prompt_ids)] = False
                 trainer.add_episode(
                     episode,
-                    rewards=episode["rewards"],
-                    action_lls=episode["action_lls"],
+                    rewards=episode.rewards,
+                    action_lls=episode.action_lls,
+                    # action_dists=episode.action_dist,
                     terminated=False,
                     any_actions_possible=action_mask,
                 )

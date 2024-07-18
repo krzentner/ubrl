@@ -470,10 +470,16 @@ class TorchTrainer:
         used_for_logging(total_approx_kl)
         new_dists = agent_output.action_dists
         old_dists = loss_input.original_action_dists
-        assert (new_dists is None) == (old_dists is None), "dists do not consistently exist"
+        assert (new_dists is None) == (
+            old_dists is None
+        ), "dists do not consistently exist"
 
         # Compute KL Divergence
-        if self.cfg.use_approx_kl is False and new_dists is not None and old_dists is not None:
+        if (
+            self.cfg.use_approx_kl is False
+            and new_dists is not None
+            and old_dists is not None
+        ):
             # TODO: Add options for other KL directions
             try:
                 kl = kl_div_of(old_dists, new_dists)
@@ -483,7 +489,9 @@ class TorchTrainer:
             kl = approx_kl
 
         assert kl.shape == (total_timesteps,), "KL shape does not match total timesteps"
-        assert approx_kl.shape == (total_timesteps,), "KL approx shape does not match total timesteps"
+        assert approx_kl.shape == (
+            total_timesteps,
+        ), "KL approx shape does not match total timesteps"
         kl = kl[torch.isfinite(kl)]
 
         # Update KL loss coefficient
@@ -602,6 +610,9 @@ class TorchTrainer:
         del infos["self"]
         return entropy_loss, infos
 
+    def new_cached_agent(self):
+        return CachedAgent(self.agent, self.cfg, self.cluster)
+
     def train_step(self):
         """Runs one "policy step" of training.
 
@@ -617,7 +628,9 @@ class TorchTrainer:
             self._replay_buffer = list(
                 self._replay_buffer[-self.cfg.replay_buffer_episodes :]
             )
-            assert len(self._replay_buffer) == self.cfg.replay_buffer_episodes, "replay buffer length shorter than expected"
+            assert (
+                len(self._replay_buffer) == self.cfg.replay_buffer_episodes
+            ), "replay buffer length shorter than expected"
         self._maybe_record_starting_entropy()
 
         errors = 0
@@ -643,7 +656,7 @@ class TorchTrainer:
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
-        agent_w = _AgentWrapper(self.agent, self.cfg, self.cluster)
+        c_agent = self.new_cached_agent()
 
         pre_train_epochs = self.cfg.vf_pre_training_epochs
         if self.train_steps_so_far == 0:
@@ -651,20 +664,20 @@ class TorchTrainer:
 
         # Pre-train VF (usually only used for off-policy algorithms)
         if pre_train_epochs > 0:
-            agent_w.fill_caches(self._replay_buffer)
+            c_agent.fill_caches(self._replay_buffer)
             timed_out = self._train_vf(
-                agent_w.state_encodings_cache,
-                agent_w.action_lls_cache,
+                c_agent.state_encodings_cache,
+                c_agent.action_lls_cache,
                 pre_train_epochs,
                 desc="Pre Training VF",
                 deadline=deadline,
             )
 
         loss_inputs = self._prepare_loss_inputs(
-            agent_w.state_encodings_cache, agent_w.action_lls_cache
+            c_agent.state_encodings_cache, c_agent.action_lls_cache
         )
         self._log_dataset(loss_inputs)
-        agent_w.clear_caches()
+        c_agent.clear_caches()
 
         # Run primary training loop.
         for batch_i, minibatch in enumerate(
@@ -684,7 +697,7 @@ class TorchTrainer:
             loss_input = LossInput.pack(
                 [loss_inputs[ep_data.episode_id] for ep_data in minibatch]
             )
-            agent_output = agent_w.agent_forward(minibatch, need_full=False)
+            agent_output = c_agent.agent_forward(minibatch, need_full=False)
             loss, loss_infos = self._primary_loss_function(agent_output, loss_input)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
@@ -726,7 +739,7 @@ class TorchTrainer:
                     raise ex
             if self.cfg.recompute_loss_inputs:
                 loss_inputs = self._prepare_loss_inputs(
-                    agent_w.state_encodings_cache, agent_w.action_lls_cache
+                    c_agent.state_encodings_cache, c_agent.action_lls_cache
                 )
 
         # Extra VF tuning after the primary training loop.
@@ -735,10 +748,10 @@ class TorchTrainer:
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
         if self.cfg.vf_post_training_epochs > 0 and not timed_out:
-            agent_w.fill_caches(self._replay_buffer)
+            c_agent.fill_caches(self._replay_buffer)
             timed_out = self._train_vf(
-                agent_w.state_encodings_cache,
-                agent_w.action_lls_cache,
+                c_agent.state_encodings_cache,
+                c_agent.action_lls_cache,
                 self.cfg.vf_post_training_epochs,
                 desc="Post Training VF",
                 deadline=deadline,
@@ -787,7 +800,9 @@ class TorchTrainer:
         action_lls_now = pad_tensors(
             [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
         )
-        assert not state_enc_packed.requires_grad, "state_enc unexpectedly required grad"
+        assert (
+            not state_enc_packed.requires_grad
+        ), "state_enc unexpectedly required grad"
         assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         padded_rewards = self.cluster.prepare_tensor(
@@ -918,12 +933,16 @@ class TorchTrainer:
         action_lls_now = pad_tensors(
             [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
         )
-        assert not state_enc_packed.requires_grad, "state_enc unexpectedly required grad"
+        assert (
+            not state_enc_packed.requires_grad
+        ), "state_enc unexpectedly required grad"
         assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         episode_lengths = [len(data.rewards) for data in self._replay_buffer]
         # obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
-        assert [ep_len + 1 for ep_len in episode_lengths] == obs_lens, "rewards length do not match state_encodings length"
+        assert [
+            ep_len + 1 for ep_len in episode_lengths
+        ] == obs_lens, "rewards length do not match state_encodings length"
 
         # Compute vf_returns
         self.agent.train(mode=False)
@@ -946,7 +965,9 @@ class TorchTrainer:
         # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(episode_lengths):
             # Everything after last valid observation should have been padded to zero
-            assert (vf_returns[i, episode_length + 1 :] == 0.0).all(), "VF returns non-zero after last observation"
+            assert (
+                vf_returns[i, episode_length + 1 :] == 0.0
+            ).all(), "VF returns non-zero after last observation"
 
             # zero vf_{t+1} in terminated episodes
             if self._replay_buffer[i].terminated:
@@ -993,7 +1014,9 @@ class TorchTrainer:
             softmax_adv = softmax_clip(heated_adv, max_exp_adv)
             awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
             normed_exp_adv = softmax_adv * len(softmax_adv)
-            assert 0.9 <= normed_exp_adv.mean() <= 1.1, "normed_exp_adv outside expected range"
+            assert (
+                0.9 <= normed_exp_adv.mean() <= 1.1
+            ), "normed_exp_adv outside expected range"
         else:
             awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
@@ -1006,7 +1029,11 @@ class TorchTrainer:
                 exp_advantages=exp_adv,
                 original_action_lls=episode_data.original_action_lls,
                 episode_lengths=[episode_data.n_timesteps],
-                original_action_dists=[episode_data.original_action_dists] if episode_data.original_action_dists else None,
+                original_action_dists=(
+                    [episode_data.original_action_dists]
+                    if episode_data.original_action_dists
+                    else None
+                ),
             )
             for (episode_data, adv, vf_ret, vf_target, exp_adv) in zip(
                 self._replay_buffer,
@@ -1016,9 +1043,13 @@ class TorchTrainer:
                 unpack_tensors(normed_exp_adv, episode_lengths),
             )
         }
-        assert len(loss_inputs) == len(self._replay_buffer), "number of loss inputs do not match size of replay buffer"
+        assert len(loss_inputs) == len(
+            self._replay_buffer
+        ), "number of loss inputs do not match size of replay buffer"
         for data in self._replay_buffer:
-            assert len(loss_inputs[data.episode_id].advantages) == len(data.rewards), "number of advantages do not match number of rewards"
+            assert len(loss_inputs[data.episode_id].advantages) == len(
+                data.rewards
+            ), "number of advantages do not match number of rewards"
 
         used_for_logging(awr_clip_ratio)
         infos = locals()
@@ -1079,7 +1110,9 @@ class TorchTrainer:
         if any_actions_possible is None:
             any_actions_possible = torch.ones(n_timesteps, dtype=torch.bool)
         else:
-            assert isinstance(any_actions_possible, torch.Tensor), "any_actions_possible is not a torch.Tensor"
+            assert isinstance(
+                any_actions_possible, torch.Tensor
+            ), "any_actions_possible is not a torch.Tensor"
 
         rewards = rewards.to(dtype=self._loss_dtype)
         self.reward_normalizer.update(rewards)
@@ -1285,7 +1318,9 @@ class TorchTrainer:
             getattr(self, k).load_state_dict(state[k])
 
         # Make sure optimizers are attached to parameters
-        assert self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef, "kl_coef_opt not optimizing kl_coef"
+        assert (
+            self.kl_coef_opt.param_groups[0]["params"][0] is self.kl_coef
+        ), "kl_coef_opt not optimizing kl_coef"
         assert self.vf_optimizer.param_groups[0]["params"][0] is next(
             self.vf.parameters()
         ), "vf_optimizer not optimizing vf"
@@ -1388,7 +1423,7 @@ class AgentOutput:
     """Result from all episodes concatenated together when calling .forward()
     on an agent.
 
-    Differentiating both state_encodings and action_lls should affect
+    Differentiating both `state_encodings` and `action_lls` should affect
     earlier layers in the agent.
 
     See `AgentInput` for the input type.
@@ -1400,20 +1435,34 @@ class AgentOutput:
     the number of episodes in AgentInput."""
 
     action_lls: torch.Tensor
-    """Differentiable log-likelihood of actions taken."""
+    """Differentiable log-likelihood of actions taken, packed into a single
+    dimension."""
 
-    action_dists: Optional[ActionDist] = None
+    n_timesteps: list[int]
+    """Length of each episode packed together in action_lls.
+    Provided as input by AgentInput..n_timesteps.
+    Used for checking shape of other values, and for splitting episodes in CachedAgent.
+
+    If it is necessary to compute fewer timesteps, pad the values as if all
+    values were computed and set the valid_mask to indicate which timesteps are
+    fully computed.
+    Value function training always requires all state encodings and action lls,
+    which are requested by AgentInput.need_full.
+    """
+
+    action_dists: Optional[list[ActionDist]] = None
     """Distribution used to generate actions.
 
-    Will be used for the KL penalty if not None and cfg.use_approx_kl is False.
+    Will be used for the KL penalty if not None and `cfg.use_approx_kl` is False.
 
-    Will be used for entropy regularization if not None and cfg.approx_entropy
+    Will be used for entropy regularization if not None and `cfg.approx_entropy`
     is False.
     """
 
     valid_mask: Optional[torch.Tensor] = None
     """Mask of timesteps where `state_encodings` and `action_lls` were computed
     and can be differentiated for.
+    If not None, must have same shape as `action_encodings`.
 
     Mostly used for rescaling losses.
     If None, all timesteps are presumed to be valid.
@@ -1426,47 +1475,108 @@ class AgentOutput:
     Typically should be near unit scale when used.
     """
 
-    infos: Optional[dict[str, Any]] = None
+    infos: dict[str, list[Any]] = dataclasses.field(default_factory=dict)
     """Not used by ubrl, but can be used if agent.forward() needs to return
     additional values for other use cases."""
 
     def __post_init__(self):
-        # The number of state_encoding dimensions is not constant and cannot be
-        # checked here.
-        assert len(self.state_encodings.shape) == 2, "state_encodings should have exactly two dimensions"
-        assert len(self.action_lls.shape) == 1, "action_lls should have exactly one dimension"
+        """Checks types and shapes of output data."""
+
+        assert (
+            len(self.state_encodings.shape) == 2
+        ), "state_encodings should have exactly two dimensions"
+        assert (
+            len(self.action_lls.shape) == 1
+        ), "action_lls should have exactly one dimension"
+        assert (
+            sum(self.n_timesteps) == self.action_lls.shape[0]
+        ), "Total number of timesteps does not match number of provided action_lls"
         assert (
             self.state_encodings.shape[0] != self.action_lls.shape[0]
         ), "There should be one more state_encoding per episode than action_ll. "
+        num_expected_states = sum(self.n_timesteps) + len(self.n_timesteps)
+        if self.state_encodings.shape[0] != num_expected_states:
+            raise AssertionError(
+                f"AgentOutput number of state_encodings did not match total number of states in episodes. There should be one more state_encoding per episode than action_lls. Expected: {num_expected_states} Actual: {self.state_encodings.shape[0]}"
+            )
+
         if self.valid_mask is not None:
-            assert len(self.valid_mask.shape) == 1, "valid_mask should have exactly one dimension"
-            assert self.valid_mask.shape == self.state_encodings.shape, "valid_mask shape does not match state_encodings shape"
-            assert self.valid_mask.dtype == torch.bool, "valid_mask does not use torch.bool dtype"
+            assert (
+                len(self.valid_mask.shape) == 1
+            ), "valid_mask should have exactly one dimension"
+            assert (
+                self.valid_mask.shape == self.state_encodings.shape
+            ), "valid_mask shape does not match state_encodings shape"
+            assert (
+                self.valid_mask.dtype == torch.bool
+            ), "valid_mask does not use torch.bool dtype"
+
+        if self.inherent_loss is not None:
+            assert (
+                len(self.inherent_loss.shape) == 1
+            ), "Inherent loss should have one dimension, the episode / batch dimension"
+            assert self.inherent_loss.shape[0] == len(
+                self.n_timesteps
+            ), "If provided, there should be one inherent_loss value per episode"
+
+        if self.action_dists is not None:
+            assert isinstance(self.action_dists, list)
+            assert len(self.action_dists) == len(
+                self.n_timesteps
+            ), 'If provided, action_dists should be a list containing one "ActionDist" per episode'
 
     def full_valid(self):
         """If the AgentOutput has contains all timesteps for the requested
         episodes."""
         return self.valid_mask is None or self.valid_mask.all()
 
+    def _split(self) -> list["AgentOutput"]:
+        """Splits an `AgentOutput` into one `AgentOutput` per episode.
+        Used by `CachedAgent` to cache individual episode outputs.
+        """
+        n_timesteps = self.n_timesteps
+        if n_timesteps is None:
+            raise ValueError("Cannot split AgentOutput with no n_timesteps")
 
-# This function is here because of its close relationship to AgentOutput
-# It is not part of AgentOutput to avoid making it part of the API
-def _split_agent_output(
-    episode_data: list[_EpisodeData], agent_output: AgentOutput
-) -> list[tuple[EpisodeID, torch.Tensor, torch.Tensor]]:
-    """Split an AgentOutput into separate state_encodings and action_lls for
-    each episode.
-    """
-    action_lens = [ep_data.n_timesteps for ep_data in episode_data]
-    obs_lens = [ep_data.n_timesteps + 1 for ep_data in episode_data]
-    state_encodings = unpack_tensors(agent_output.state_encodings, obs_lens)
-    action_lls = unpack_tensors(agent_output.action_lls, action_lens)
-    episode_ids = [ep_data.episode_id for ep_data in episode_data]
-    assert len(episode_ids) == len(state_encodings)
-    assert len(episode_ids) == len(action_lls)
-    for i, ep_data in enumerate(episode_data):
-        assert ep_data.n_timesteps == action_lls[i].shape[0]
-    return list(zip(episode_ids, state_encodings, action_lls))
+        action_lens = n_timesteps
+        obs_lens = [n + 1 for n in n_timesteps]
+        state_encodings = unpack_tensors(self.state_encodings, obs_lens)
+        action_lls = unpack_tensors(self.action_lls, action_lens)
+
+        # Really pyright? This type is immutable
+        self_valid_mask = self.valid_mask
+        if self_valid_mask is not None:
+            valid_masks = unpack_tensors(self_valid_mask, obs_lens)
+        else:
+            valid_masks = None
+
+        action_lls = unpack_tensors(self.action_lls, action_lens)
+        results = []
+        for i, length in enumerate(n_timesteps):
+            if self.inherent_loss is None:
+                inherent_loss = None
+            else:
+                inherent_loss = self.inherent_loss[i, None]
+            if self.action_dists is None:
+                action_dists = None
+            else:
+                action_dists = [self.action_dists[i]]
+            if valid_masks is None:
+                valid_mask = None
+            else:
+                valid_mask = valid_masks[i]
+            results.append(
+                AgentOutput(
+                    state_encodings=state_encodings[i],
+                    action_lls=action_lls[i],
+                    n_timesteps=[length],
+                    action_dists=action_dists,
+                    valid_mask=valid_mask,
+                    inherent_loss=inherent_loss,
+                    infos={k: v[i] for (k, v) in self.infos.items()},
+                )
+            )
+        return results
 
 
 @dataclass(eq=False)
@@ -1488,9 +1598,18 @@ class AgentInput:
     If False, the agent can optionally only propagate a portion of timesteps.
     """
 
+    n_timesteps: list[int]
+    """Number of expected timesteps in each episode. It is recommended to pass
+    this field forward into the AgentOutput."""
 
-class _AgentWrapper:
-    """Performs checking of the Agent API and caches outputs."""
+
+class CachedAgent:
+    """Performs checking of the `Agent` API and caches outputs.
+
+    Cached values are used to cheaply fine-tune value function training.
+    This class does not implement Transformer key caching and is used with all
+    implementations of the `Agent` API.
+    """
 
     def __init__(
         self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"
@@ -1506,6 +1625,7 @@ class _AgentWrapper:
         self.action_lls_cache = {}
 
     def fill_caches(self, episode_data: list[_EpisodeData]):
+        """Ensure that all episodes in `episode_data` have cached values."""
         missing_episodes = [
             ep_data
             for ep_data in episode_data
@@ -1520,6 +1640,26 @@ class _AgentWrapper:
             ):
                 self.agent_forward(minibatch, need_full=True)
 
+    def cached_output(self, episode_data: list[_EpisodeData]) -> AgentOutput:
+        """Get output "as if" a forward pass was run, but avoid running the
+        forward pass if possible.
+
+        The `AgentOutput` returned by this method only contains
+        `state_encodings`, `action_lls`, and `n_timesteps`.
+        Furthermore, `state_encodings` and `action_lls` will not require
+        gradients (they are "detached").
+        """
+        self.fill_caches(episode_data)
+        n_timesteps = [ep.n_timesteps for ep in episode_data]
+        state_encodings = torch.cat([self.state_encodings_cache[ep.episode_id] for ep in episode_data])
+        action_lls = torch.cat([self.state_encodings_cache[ep.episode_id] for ep in episode_data])
+        return AgentOutput(
+            state_encodings=state_encodings,
+            action_lls=action_lls,
+            n_timesteps=n_timesteps
+        )
+            
+
     def agent_forward(
         self, episode_data: list[_EpisodeData], need_full: bool
     ) -> AgentOutput:
@@ -1530,21 +1670,20 @@ class _AgentWrapper:
         """
         episodes = [ep_data.episode for ep_data in episode_data]
         expected_lengths = [ep_data.n_timesteps for ep_data in episode_data]
-        agent_input = AgentInput(episodes=episodes, need_full=need_full)
+        agent_input = AgentInput(episodes=episodes, need_full=need_full, n_timesteps=expected_lengths)
         if hasattr(self.agent, "ubrl_forward"):
             agent_output = self.agent.ubrl_forward(agent_input)
         else:
             agent_output = self.agent(agent_input)
-        assert agent_output.state_encodings.shape[0] == sum(expected_lengths) + len(
-            expected_lengths
-        )
-        assert agent_output.action_lls.shape[0] == sum(expected_lengths)
+        if agent_output.n_timesteps != expected_lengths:
+            raise ValueError(
+                f"AgentOutput contained n_timesteps that did not match input. Expected: {expected_lengths} Actual: {agent_output.n_timesteps}"
+            )
         if agent_output.full_valid():
-            for episode_id, state_encodings, action_lls in _split_agent_output(
-                episode_data, agent_output
-            ):
-                self.state_encodings_cache[episode_id] = state_encodings.detach()
-                self.action_lls_cache[episode_id] = action_lls.detach()
+            for i, output in enumerate(agent_output._split()):
+                episode_id = episode_data[i].episode_id
+                self.state_encodings_cache[episode_id] = output.state_encodings.detach()
+                self.action_lls_cache[episode_id] = output.action_lls.detach()
         else:
             total_valid = agent_output.valid_mask.sum().item()
             total_timesteps = sum(expected_lengths)
@@ -1734,4 +1873,6 @@ __all__ = [
     "AgentOutput",
     "LossInput",
 ]
-import hot_restart; hot_restart.wrap_module()
+import hot_restart
+
+hot_restart.wrap_module()
