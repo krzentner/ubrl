@@ -8,4 +8,7 @@ gymnasium
 optuna-dashboard
 tensorboardX
 pip-tools
+libcst
+jupyterlab
+matplotlib
 noko[recommended]
