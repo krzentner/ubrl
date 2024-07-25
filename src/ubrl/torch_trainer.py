@@ -169,7 +169,7 @@ class LossInput:
     """Copied from TorchTrainer.add_episode(), these are the original log
     likelihoods of the actions taken when the data was collected."""
 
-    episode_lengths: list[int]
+    n_timesteps: list[int]
 
     original_action_dists: Optional[list[ActionDist]]
     """Copied from TorchTrainer.add_episode()."""
@@ -192,7 +192,7 @@ class LossInput:
                     new_fields[field.name] = None
                 else:
                     new_fields[field.name] = concat_lists(field_vals)
-            elif field.name == "episode_lengths":
+            elif field.name == "n_timesteps":
                 new_fields[field.name] = concat_lists(field_vals)
             else:
                 new_fields[field.name] = torch.cat(
@@ -226,26 +226,26 @@ class TorchTrainer:
     """An implementation of a bespoke reinforcement learning algorithm.
 
     The trainer trains an Agent to acquire higher rewards according to the data
-    provided to it. To allow repeatedly adding new data to the TorchTrainer, it is a
-    class instead of a function.
+    provided to it. To allow repeatedly adding new data to the `TorchTrainer`,
+    it is a class instead of a function.
 
     The typical sequence of methods called on this class are as follows:
 
-        1. Construction using a TrainerConfig (the default value is typically
-           fine) and Agent. Optionally, call TorchTrainer.attempt_resume() to resume
-           from a prior checkpoint.
+        1. Construction using a `TrainerConfig` (the default value is typically
+           fine) and `Agent`. Optionally, call `TorchTrainer.attempt_resume()`
+           to resume from a prior checkpoint.
 
-        2. Repeated calls to TorchTrainer.add_episode() to add new data and
-           TorchTrainer.train_step() to process the data. Typically multiple
+        2. Repeated calls to `TorchTrainer.add_episode()` to add new data and
+           `TorchTrainer.train_step()` to process the data. Typically multiple
            episodes (on the order of 10-100) should be added between each
-           TorchTrainer.train_step() call.
+           `TorchTrainer.train_step()` call.
 
-        3. Periodic calls to TorchTrainer.add_eval_stats() and
-           TorchTrainer.maybe_checkpoint().
+        3. Periodic calls to `TorchTrainer.add_eval_stats()` and
+           `TorchTrainer.maybe_checkpoint()`.
     """
 
     def __init__(self, cfg: "TrainerConfig", agent: "Agent"):
-        """Constructs a TorchTrainer."""
+        """Constructs a `TorchTrainer`."""
 
         super().__init__()
 
@@ -253,11 +253,11 @@ class TorchTrainer:
         cfg = cfg.choose_device(n_params=n_params)
 
         self.cfg: "TrainerConfig" = cfg
-        """The configuration used to contruct the TorchTrainer.
+        """The configuration used to contruct the `TorchTrainer`.
 
         Modifying this field after constructing the TorchTrainer *may* change the
         TorchTrainer's behavior, but is not guaranteed to and should be avoided
-        (except via load_state_dict()).
+        (except via `load_state_dict()`).
         """
         self.cluster = ubrl.torch_cluster.DefaultCluster(self.cfg)
 
@@ -442,7 +442,7 @@ class TorchTrainer:
         self, agent_output: "AgentOutput", loss_input: LossInput
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         state_enc_packed = truncate_packed(
-            agent_output.state_encodings, loss_input.episode_lengths, 1
+            agent_output.state_encodings, loss_input.n_timesteps, 1
         )
         critic_out = self.vf(state_enc_packed)
         vf_loss = F.mse_loss(critic_out, loss_input.vf_targets)
@@ -464,7 +464,7 @@ class TorchTrainer:
 
         # Approximate per-timestep KL by multiplying back in the number of timesteps
 
-        total_timesteps = sum(loss_input.episode_lengths)
+        total_timesteps = sum(loss_input.n_timesteps)
         approx_kl = total_timesteps * approx_kl_div_of(old_log_probs, log_probs)
         total_approx_kl = approx_kl.sum()
         used_for_logging(total_approx_kl)
@@ -662,16 +662,12 @@ class TorchTrainer:
         if self.train_steps_so_far == 0:
             pre_train_epochs = max(self.cfg.vf_warmup_training_epochs, pre_train_epochs)
 
-        # Pre-train VF (usually only used for off-policy algorithms)
-        if pre_train_epochs > 0:
-            c_agent.fill_caches(self._replay_buffer)
-            timed_out = self._train_vf(
-                c_agent.state_encodings_cache,
-                c_agent.action_lls_cache,
-                pre_train_epochs,
-                desc="Pre Training VF",
-                deadline=deadline,
-            )
+        timed_out = self._train_vf(
+            c_agent,
+            pre_train_epochs,
+            desc="Pre Training VF",
+            deadline=deadline,
+        )
 
         loss_inputs = self._prepare_loss_inputs(
             c_agent.state_encodings_cache, c_agent.action_lls_cache
@@ -747,15 +743,12 @@ class TorchTrainer:
         # on the agent network in this phase.
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
-        if self.cfg.vf_post_training_epochs > 0 and not timed_out:
-            c_agent.fill_caches(self._replay_buffer)
-            timed_out = self._train_vf(
-                c_agent.state_encodings_cache,
-                c_agent.action_lls_cache,
-                self.cfg.vf_post_training_epochs,
-                desc="Post Training VF",
-                deadline=deadline,
-            )
+        timed_out |= self._train_vf(
+            c_agent,
+            self.cfg.vf_post_training_epochs,
+            desc="Post Training VF",
+            deadline=deadline,
+        )
 
         # Update all the statistics.
         self.agent_lr_scheduler.step()
@@ -774,8 +767,7 @@ class TorchTrainer:
 
     def _train_vf(
         self,
-        state_encodings: dict[EpisodeID, torch.Tensor],
-        action_lls: dict[EpisodeID, torch.Tensor],
+        cached_agent: "CachedAgent",
         training_epochs: int,
         desc: str,
         deadline: float,
@@ -794,12 +786,16 @@ class TorchTrainer:
 
         Returns True iff the deadline is reached.
         """
-        state_enc_packed, obs_lens = pack_tensors(
-            [state_encodings[ep_data.episode_id] for ep_data in self._replay_buffer]
-        )
-        action_lls_now = pad_tensors(
-            [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
-        )
+
+        timed_out = time.monotonic() > deadline
+        if training_epochs == 0 or timed_out:
+            return timed_out
+
+        agent_out = cached_agent.cached_output(self._replay_buffer)
+        state_enc_packed = agent_out.state_encodings
+        action_lls_now = agent_out.action_lls
+        obs_lens = [ep_data.n_timesteps + 1 for ep_data in self._replay_buffer]
+
         assert (
             not state_enc_packed.requires_grad
         ), "state_enc unexpectedly required grad"
@@ -820,10 +816,10 @@ class TorchTrainer:
         discount = 1 - self.cfg.discount_inv
         gammas = discount * torch.ones_like(rewards_normed)
 
-        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        n_timesteps = [len(data.rewards) for data in self._replay_buffer]
         terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
 
-        with tqdm(desc=desc, total=training_epochs * sum(episode_lengths)) as pbar:
+        with tqdm(desc=desc, total=training_epochs * sum(n_timesteps)) as pbar:
             for epoch in range(training_epochs):
                 if (
                     epoch == 0
@@ -834,7 +830,7 @@ class TorchTrainer:
                     vf_x = pad_packed(vf_x_packed, obs_lens)
 
                     # TODO(krzentner): Refactor / eliminate this loop
-                    for i, episode_length in enumerate(episode_lengths):
+                    for i, episode_length in enumerate(n_timesteps):
                         # zero vf_{t+1} in terminated episodes
                         if self._replay_buffer[i].terminated:
                             vf_x[i, episode_length] = 0.0
@@ -852,7 +848,7 @@ class TorchTrainer:
                             action_lls=action_lls_now,
                             original_action_lls=original_action_lls,
                             terminated=terminated,
-                            episode_lengths=torch.tensor(episode_lengths),
+                            n_timesteps=torch.tensor(n_timesteps),
                         )
 
                     vf_targets_packed = pack_padded(vf_targets, obs_lens)
@@ -938,10 +934,10 @@ class TorchTrainer:
         ), "state_enc unexpectedly required grad"
         assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
-        episode_lengths = [len(data.rewards) for data in self._replay_buffer]
+        n_timesteps = [len(data.rewards) for data in self._replay_buffer]
         # obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
         assert [
-            ep_len + 1 for ep_len in episode_lengths
+            ep_len + 1 for ep_len in n_timesteps
         ] == obs_lens, "rewards length do not match state_encodings length"
 
         # Compute vf_returns
@@ -963,7 +959,7 @@ class TorchTrainer:
 
         # TODO(krzentner): Refactor / eliminate this loop
         # Can't use valids mask, since vf_returns goes to t + 1
-        for i, episode_length in enumerate(episode_lengths):
+        for i, episode_length in enumerate(n_timesteps):
             # Everything after last valid observation should have been padded to zero
             assert (
                 vf_returns[i, episode_length + 1 :] == 0.0
@@ -996,10 +992,10 @@ class TorchTrainer:
             action_lls=action_lls_now,
             original_action_lls=original_action_lls,
             terminated=terminated,
-            episode_lengths=self.cluster.prepare_tensor(torch.tensor(episode_lengths)),
+            n_timesteps=self.cluster.prepare_tensor(torch.tensor(n_timesteps)),
         )
 
-        adv_packed = pack_padded(padded_advantages, episode_lengths)
+        adv_packed = pack_padded(padded_advantages, n_timesteps)
         assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
 
         if self.cfg.normalize_awr_advantages:
@@ -1008,7 +1004,7 @@ class TorchTrainer:
 
         # This 1000 is documented in the TrainerConfig.awr_temperature
         # docstring.
-        if self.cfg.awr_temperature < 1000:
+        
             heated_adv = adv_packed / self.cfg.awr_temperature
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
             softmax_adv = softmax_clip(heated_adv, max_exp_adv)
@@ -1028,7 +1024,7 @@ class TorchTrainer:
                 vf_targets=vf_target,
                 exp_advantages=exp_adv,
                 original_action_lls=episode_data.original_action_lls,
-                episode_lengths=[episode_data.n_timesteps],
+                n_timesteps=[episode_data.n_timesteps],
                 original_action_dists=(
                     [episode_data.original_action_dists]
                     if episode_data.original_action_dists
@@ -1037,10 +1033,10 @@ class TorchTrainer:
             )
             for (episode_data, adv, vf_ret, vf_target, exp_adv) in zip(
                 self._replay_buffer,
-                unpack_tensors(adv_packed, episode_lengths),
-                unpad_tensors(vf_returns, episode_lengths),
-                unpad_tensors(vf_targets, episode_lengths),
-                unpack_tensors(normed_exp_adv, episode_lengths),
+                unpack_tensors(adv_packed, n_timesteps),
+                unpad_tensors(vf_returns, n_timesteps),
+                unpad_tensors(vf_targets, n_timesteps),
+                unpack_tensors(normed_exp_adv, n_timesteps),
             )
         }
         assert len(loss_inputs) == len(
@@ -1054,7 +1050,7 @@ class TorchTrainer:
         used_for_logging(awr_clip_ratio)
         infos = locals()
         del infos["self"]
-        del infos["episode_lengths"]
+        del infos["n_timesteps"]
         del infos["obs_lens"]
         del infos["loss_inputs"]
         noko.log_row(
@@ -1439,8 +1435,10 @@ class AgentOutput:
     dimension."""
 
     n_timesteps: list[int]
-    """Length of each episode packed together in action_lls.
-    Provided as input by AgentInput..n_timesteps.
+    """Length of each episode packed together in `action_lls`.
+    Provided as input by `AgentInput.n_timesteps`.
+    This is the number of rewards / actions in each episode.
+    Each episode should contain one additional `state_encoding`.
     Used for checking shape of other values, and for splitting episodes in CachedAgent.
 
     If it is necessary to compute fewer timesteps, pad the values as if all
@@ -1710,7 +1708,7 @@ def _v_trace_estimation(
     action_lls: torch.Tensor,
     original_action_lls: torch.Tensor,
     terminated: torch.Tensor,
-    episode_lengths: torch.Tensor,
+    n_timesteps: torch.Tensor,
 ):
     """Calculate value function targets using a V-Trace like estimator.
 
@@ -1737,7 +1735,7 @@ def _v_trace_estimation(
         rewards (torch.Tensor): A 2D tensor of per-step rewards with shape
             (N, T), where N is the batch dimension (number of episodes) and T
             is the maximum episode length experienced by the agent.
-        episode_lengths (torch.Tensor) A 1D tensor indicating the episode length.
+        n_timesteps (torch.Tensor) A 1D tensor indicating the episode length.
         terminated (torch.Tensor): A 1D tensor indicating if the episode
             ended in a terminal state.
 
@@ -1762,8 +1760,8 @@ def _v_trace_estimation(
 
     # Set gamma = 0 on the last timestep of terminated episodes
     ep_indices = torch.arange(n_episodes)
-    gammas[ep_indices, episode_lengths - 1] *= (~terminated).to(dtype=gammas.dtype)
-    assert bool(gammas[0, episode_lengths[0] - 1]) == (not terminated[0])
+    gammas[ep_indices, n_timesteps - 1] *= (~terminated).to(dtype=gammas.dtype)
+    assert bool(gammas[0, n_timesteps[0] - 1]) == (not terminated[0])
 
     # Multiply in the lambda term (not present in standard V-Trace, but matches
     # TD(lambda)).
