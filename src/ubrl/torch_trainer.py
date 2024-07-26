@@ -36,6 +36,7 @@ from ubrl.torch_utils import (
     pack_padded,
     explained_variance,
     unpack_tensors,
+    pack_tensors_check,
     RunningMeanVar,
     make_scheduler,
     DictDataset,
@@ -172,7 +173,7 @@ class LossInput:
     n_timesteps: list[int]
 
     original_action_dists: Optional[list[ActionDist]]
-    """Copied from TorchTrainer.add_episode()."""
+    """Copied from `TorchTrainer.add_episode()`."""
 
     def __post_init__(self):
         assert not self.original_action_lls.requires_grad
@@ -199,6 +200,24 @@ class LossInput:
                     [getattr(li, field.name) for li in loss_inputs]
                 )
         return cls(**new_fields)
+
+    def split(self) -> list["LossInput"]:
+        fields = {}
+        for field in dataclasses.fields(self):
+            field_val = getattr(self, field.name)
+            if field.name == "original_action_dists" and field_val is None:
+                field_val = [None] * len(self.n_timesteps)
+            elif field.name == "n_timesteps":
+                field_val = [[n] for n in self.n_timesteps]
+            else:
+                field_val = unpack_tensors(field_val, self.n_timesteps)
+            fields[field.name] = field_val
+
+        results = []
+        for i in range(len(self.n_timesteps)):
+            results.append(type(self)(**{k: v[i] for (k, v) in fields.items()}))
+
+        return results
 
 
 _OPTIMIZER_FIELDS = [
@@ -334,7 +353,7 @@ class TorchTrainer:
     def _setup_optimizers(self):
         """(Re)create all of the optimizers to use the current parameters.
 
-        This method is called in __init__ and also in load_state_dict().
+        This method is called in `__init__` and also in `load_state_dict()`.
         """
         self.agent, self.agent_optimizer = self.cluster.prepare_module_opt(
             self.agent,
@@ -912,6 +931,110 @@ class TorchTrainer:
             step=self.total_env_steps,
         )
 
+    def loss_inputs(
+        self,
+        agent_input: "AgentInput",
+        agent_output: "AgentOutput",
+    ) -> "LossInput":
+        # Compute vf_returns
+        self.agent.train(mode=False)
+        self.vf.train(mode=False)
+        obs_lens = agent_input.n_observations
+        n_timesteps = agent_input.n_timesteps
+
+        state_encodings = agent_output.state_encodings.detach()
+        action_lls_now = pad_packed(agent_output.action_lls.detach(), n_timesteps)
+        original_action_lls = pad_packed(agent_input.original_action_lls, n_timesteps)
+
+        with torch.no_grad():
+            # TODO(krzentner): split up this call if necessary
+            vf_returns_packed = self.vf(state_encodings)
+        self.agent.train(mode=True)
+        self.vf.train(mode=True)
+
+        vf_returns = pad_packed(vf_returns_packed, obs_lens)
+
+        # TODO(krzentner): Refactor / eliminate this loop
+        # Can't use valids mask, since vf_returns goes to t + 1
+        for i, episode_length in enumerate(n_timesteps):
+            # Everything after last valid observation should have been padded to zero
+            assert (
+                vf_returns[i, episode_length + 1 :] == 0.0
+            ).all(), "VF returns non-zero after last observation"
+
+            # zero vf_{t+1} in terminated episodes
+            if agent_input.terminated[i]:
+                vf_returns[i, episode_length] = 0.0
+
+        padded_rewards = pad_packed(agent_input.rewards, n_timesteps)
+        if self.cfg.normalize_rewards:
+            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
+        else:
+            rewards_normed = padded_rewards
+
+        discount = 1 - self.cfg.discount_inv
+        gammas = discount * torch.ones_like(rewards_normed)
+
+        padded_advantages, vf_targets = _v_trace_estimation(
+            lmbda=self.cfg.v_trace_lambda,
+            rho_max=self.cfg.v_trace_rho_max,
+            c_max=self.cfg.v_trace_c_max,
+            gammas=gammas,
+            vf_x=vf_returns,
+            rewards=rewards_normed,
+            action_lls=action_lls_now,
+            original_action_lls=original_action_lls,
+            terminated=agent_input.terminated,
+            n_timesteps=self.cluster.prepare_tensor(torch.tensor(n_timesteps)),
+        )
+
+        adv_packed = pack_padded(padded_advantages, n_timesteps)
+        assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
+
+        if self.cfg.normalize_awr_advantages:
+            adv_packed = adv_packed - adv_packed.mean()
+            adv_packed = adv_packed / adv_packed.std()
+
+        # This 1000 is documented in the TrainerConfig.awr_temperature
+        # docstring.
+
+        if self.cfg.awr_temperature >= 1000:
+            heated_adv = adv_packed / self.cfg.awr_temperature
+            max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
+            softmax_adv = softmax_clip(heated_adv, max_exp_adv)
+            awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
+            normed_exp_adv = softmax_adv * len(softmax_adv)
+            assert (
+                0.9 <= normed_exp_adv.mean() <= 1.1
+            ), "normed_exp_adv outside expected range"
+        else:
+            awr_clip_ratio = 0.0
+            normed_exp_adv = torch.ones_like(adv_packed)
+
+        loss_input = LossInput(
+            advantages=adv_packed,
+            vf_returns=vf_returns,
+            vf_targets=vf_targets,
+            exp_advantages=normed_exp_adv,
+            original_action_lls=agent_input.original_action_lls,
+            original_action_dists=agent_input.original_action_dists,
+            n_timesteps=n_timesteps,
+        )
+
+        used_for_logging(awr_clip_ratio)
+        infos = locals()
+        del infos["self"]
+        del infos["n_timesteps"]
+        del infos["obs_lens"]
+        del infos["loss_inputs"]
+        noko.log_row(
+            "preprocess",
+            infos,
+            level=noko.TRACE,
+            step=self.total_env_steps,
+        )
+        return loss_inputs
+
     def _prepare_loss_inputs(
         self,
         state_encodings: dict[EpisodeID, torch.Tensor],
@@ -1004,7 +1127,8 @@ class TorchTrainer:
 
         # This 1000 is documented in the TrainerConfig.awr_temperature
         # docstring.
-        
+
+        if self.cfg.awr_temperature >= 1000:
             heated_adv = adv_packed / self.cfg.awr_temperature
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
             softmax_adv = softmax_clip(heated_adv, max_exp_adv)
@@ -1477,6 +1601,10 @@ class AgentOutput:
     """Not used by ubrl, but can be used if agent.forward() needs to return
     additional values for other use cases."""
 
+    @property
+    def n_observations(self):
+        return [1 + n for n in self.n_timesteps]
+
     def __post_init__(self):
         """Checks types and shapes of output data."""
 
@@ -1600,6 +1728,57 @@ class AgentInput:
     """Number of expected timesteps in each episode. It is recommended to pass
     this field forward into the AgentOutput."""
 
+    rewards: torch.Tensor
+    """Packed tensor of rewards in original episodes. Can be unpacked using
+    `n_timesteps`."""
+
+    original_action_lls: torch.Tensor
+    """Packed action log-likelihoods when episodes were originally collected (as passed to `TorchTrainer.add_episode()`)."""
+
+    original_action_dists: Optional[list[ActionDist]]
+    """Action dists when episodes where originally collected. `None` if action
+    distributions were not provided in `TorchTrainer.add_episode()`."""
+
+    terminated: torch.Tensor
+    """Boolean tensor containing one value per episode indicating if that
+    episode was terminated."""
+
+    @property
+    def n_observations(self):
+        return [1 + n for n in self.n_timesteps]
+
+    @classmethod
+    def from_episode_data(cls, episode_data: list[_EpisodeData], need_full: bool):
+        episodes = [ep_data.episode for ep_data in episode_data]
+        n_timesteps = [ep_data.n_timesteps for ep_data in episode_data]
+        packed_rewards = pack_tensors_check(
+            [ep_data.rewards for ep_data in episode_data], n_timesteps
+        )
+        original_act_lls = pack_tensors_check(
+            [ep_data.original_action_lls for ep_data in episode_data], n_timesteps
+        )
+        terminated = torch.zeros(len(episode_data), dtype=torch.bool)
+        for i, ep_data in enumerate(episode_data):
+            terminated[i] = ep_data.terminated
+
+        act_dists = [ep_data.original_action_dists for ep_data in episode_data]
+
+        if None not in act_dists:
+            original_act_dists: Optional[list[ActionDist]] = act_dists
+        else:
+            assert all([dist is None for dist in act_dists])
+            original_act_dists = None
+
+        return AgentInput(
+            episodes=episodes,
+            need_full=need_full,
+            n_timesteps=n_timesteps,
+            rewards=packed_rewards,
+            original_action_lls=original_act_lls,
+            original_action_dists=original_act_dists,
+            terminated=terminated,
+        )
+
 
 class CachedAgent:
     """Performs checking of the `Agent` API and caches outputs.
@@ -1649,14 +1828,17 @@ class CachedAgent:
         """
         self.fill_caches(episode_data)
         n_timesteps = [ep.n_timesteps for ep in episode_data]
-        state_encodings = torch.cat([self.state_encodings_cache[ep.episode_id] for ep in episode_data])
-        action_lls = torch.cat([self.state_encodings_cache[ep.episode_id] for ep in episode_data])
+        state_encodings = torch.cat(
+            [self.state_encodings_cache[ep.episode_id] for ep in episode_data]
+        )
+        action_lls = torch.cat(
+            [self.state_encodings_cache[ep.episode_id] for ep in episode_data]
+        )
         return AgentOutput(
             state_encodings=state_encodings,
             action_lls=action_lls,
-            n_timesteps=n_timesteps
+            n_timesteps=n_timesteps,
         )
-            
 
     def agent_forward(
         self, episode_data: list[_EpisodeData], need_full: bool
@@ -1666,9 +1848,9 @@ class CachedAgent:
         Handles delegating to ubrl_forward() if necessary, checking that
         need_full is respected, and caching.
         """
-        episodes = [ep_data.episode for ep_data in episode_data]
         expected_lengths = [ep_data.n_timesteps for ep_data in episode_data]
-        agent_input = AgentInput(episodes=episodes, need_full=need_full, n_timesteps=expected_lengths)
+        agent_input = AgentInput.from_episode_data(episode_data, need_full=need_full)
+
         if hasattr(self.agent, "ubrl_forward"):
             agent_output = self.agent.ubrl_forward(agent_input)
         else:

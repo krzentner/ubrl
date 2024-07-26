@@ -5,7 +5,7 @@ libraries.
 """
 
 import logging
-from typing import Any
+from typing import Any, TypeVar
 import torch
 import ubrl
 
@@ -16,15 +16,19 @@ try:
 except ImportError:
     Accelerator = None
 
+TMod = TypeVar('TMod', bound=torch.nn.Module)
+
 
 class Cluster:
     def __init__(self, cfg: "ubrl.TrainerConfig"):
-        pass
+        del cfg
 
-    def prepare_module(self, module: torch.nn.Module) -> torch.nn.Module:
+    def prepare_module(self, module: TMod) -> TMod:
+        del module
         raise NotImplementedError()
 
     def prepare_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        del tensor
         raise NotImplementedError()
 
     def shard_episodes(
@@ -60,7 +64,7 @@ class LocalCluster(Cluster):
         _LOGGER.info(f"Using LocalCluster(device={cfg.device!r})")
         self.device = cfg.device
 
-    def prepare_module(self, module: torch.nn.Module) -> torch.nn.Module:
+    def prepare_module(self, module: TMod) -> TMod:
         module = module.to(device=self.device)
         return module
 
@@ -108,7 +112,7 @@ class AcceleratorCluster(Cluster):
 
         self.accelerator = Accelerator()
 
-    def prepare_module(self, module: torch.nn.Module) -> torch.nn.Module:
+    def prepare_module(self, module: TMod) -> TMod:
         return self.accelerator.prepare(module)
 
     def prepare_module_opt(

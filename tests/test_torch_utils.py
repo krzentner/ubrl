@@ -1,5 +1,4 @@
 import torch
-from torch.nn.functional import soft_margin_loss
 from ubrl.torch_utils import clamp_identity_grad, soft_clamp
 
 
