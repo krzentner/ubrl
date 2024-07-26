@@ -460,12 +460,12 @@ def unpad_tensors(padded: torch.Tensor, lengths: list[int]) -> list[torch.Tensor
 
 
 def pack_padded(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
-    """Equivelant to pack_tensors_check(unpad_tensors(...))."""
+    """Equivelant to `pack_tensors_check(unpad_tensors(...))`."""
     return pack_tensors_check(unpad_tensors(padded, lengths), lengths)
 
 
 def pad_packed(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
-    """Equivelant to pad_tensors(unpack_tensors(...))."""
+    """Equivelant to `pad_tensors(unpack_tensors(...))`."""
     return pad_tensors(unpack_tensors(padded, lengths))
 
 
