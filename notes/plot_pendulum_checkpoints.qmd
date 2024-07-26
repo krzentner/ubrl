@@ -1,0 +1,133 @@
+---
+title: "Pendulum Checkpoint Visualization"
+format:
+  html:
+    code-fold: true
+jupyter: python3
+---
+
+This notebook visualizes the training process of a simple gaussian policy training on the pendulum task. It is useful for understanding the relationship between advantages and policy improvement in ubrl.
+
+
+```{python}
+import os
+import pickle
+from glob import glob
+from subprocess import run
+from pprint import pprint
+
+from tqdm import tqdm, trange
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+```
+
+
+```{python}
+# Take arguments as env variables with defaults
+RUN_DIR = os.environ.get('NOTEBOOK_RUN_DIR', 'runs/visualization_run/')
+HEATMAP_SIZE = int(os.environ.get('NOTEBOOK_HEATMAP_SIZE', '64'))
+N_TRAIN_STEPS = int(os.environ.get('NOTEBOOK_N_TRAIN_STEPS', '1'))
+OUT_FILE = os.environ.get('NOTEBOOK_OUT_FILE', f'{RUN_DIR}/pendulum_1.webm')
+```
+
+
+```{python}
+print("Looking for root dir")
+while not glob('.git/'):
+    print("No git repo in", os.getcwd())
+    os.chdir('..')
+print("Found git repo in", os.getcwd())
+```
+
+    Looking for root dir
+    Found git repo in /home/kr/ubrl
+
+
+
+```{python}
+import ubrl
+from ubrl.gym_utils import make_gym_agent
+import examples.gym_example as gym_example
+```
+
+
+```{python}
+frame = 0
+train_step = 1
+os.makedirs("plots/frames", exist_ok=True)
+
+checkpoints = glob(f"{RUN_DIR}/train_step_*.pkl")
+print(f'Found {len(checkpoints)} checkpoints')
+with_idx = sorted([
+    (int(f_name.rsplit("_", 1)[-1].split(".", 1)[0]), f_name)
+    for f_name in checkpoints
+])[-N_TRAIN_STEPS:]
+pprint(with_idx)
+for i, checkpoint_path in tqdm(with_idx):
+    with open(checkpoint_path, 'rb') as f:
+        data = torch.load(f)
+    if len(data['_replay_buffer']) == 0:
+        continue
+    def obs_to_coord(obs):
+        assert len(obs.shape) == 2
+        assert obs.shape[0] == 3
+        theta = np.arctan2(raw_obs[:, 0], raw_obs[:, 1])
+        theta_norm = (HEATMAP_SIZE) * theta / (2 * np.pi)
+        ang_vel_norm = (HEATMAP_SIZE) * (raw_obs[:, 2] + 8.0) / 16.0
+        return theta_norm, ang_vel_norm
+    
+    obs_heatmap = np.zeros((HEATMAP_SIZE, HEATMAP_SIZE))
+    all_obs = np.stack([ep_data.episode['observations'] for ep_data in data['_replay_buffer']]).transpose(2, 0, 1)
+    
+    theta = np.arctan2(all_obs[0], all_obs[1])
+    theta_idx = np.floor((HEATMAP_SIZE - 1) * theta / (2 * np.pi)).astype(int).flatten()
+    ang_vel = all_obs[2]
+    ang_vel_idx = np.floor((HEATMAP_SIZE - 1) * (ang_vel + 8.0) / 16.0).astype(int).flatten()
+    for i, x in enumerate(theta_idx):
+        obs_heatmap[x,ang_vel_idx[i]] += 1
+        
+    cfg = gym_example.GymConfig.from_dict(data['cfg'])
+    actor = GymBoxGaussianAgent(
+        obs_size=3,
+        action_size=1,
+        hidden_sizes=cfg.encoder_hidden_sizes, 
+        pi_hidden_sizes=cfg.pi_hidden_sizes, 
+        init_std=cfg.init_std, 
+        min_std=cfg.min_std,
+        loc=np.array([0.0]),
+        scale=np.array([2.0]))
+    
+    trainer = ubrl.TorchTrainer(cfg, actor)
+    trainer.load_state_dict(data)
+
+    c_agent = trainer.new_cached_agent()
+    c_agent.fill_caches(train._replay_buffer)
+    train_inputs = trainer._prepare_loss_inputs(
+        c_agent.state_encodings_cache,
+        c_agent.action_lls_cache)
+    vf_vals = np.stack([train_input.vf_returns for train_input in train_inputs])
+    advantages = np.stack([train_input.advantages for train_input in train_inputs])
+
+    d_ang_vel = ang_vel[:, 1:] - ang_vel[:, -1:]
+    d_theta = theta[:, 1:] - theta[:, -1:]
+
+    all_actions = np.stack([ep_data.episode['actions']
+                            for ep_data in data['_replay_buffer']]).transpose(2, 0, 1)
+
+    for t in trange(vf_vals.shape[1]):
+        plt.clf()
+        plt.imshow(np.log(obs_heatmap), extent=[-8, 8, -np.pi, np.pi,], aspect=16.0 / (2 * np.pi), cmap='Greys')
+        plt.scatter(ang_vel[:, t], theta[:, t], c=vf_vals[:, t])
+        plt.quiver(ang_vel[:, t], theta[:, t],
+                   all_actions[0, :, t], 0, advantages[:, t], width=0.01, cmap='plasma')
+        plt.savefig(f"plots/frames/pendulum_frame={frame}.png")
+        frame += 1
+```
+
+```{python}
+run(['ffmpeg', '-y', '-i', 'plots/frames/pendulum_frame=%d.png', OUT_FILE])
+```
