@@ -1,0 +1,4 @@
+project:
+  type: default
+  execute-dir: project
+  output-dir: quarto_output

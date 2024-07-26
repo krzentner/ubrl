@@ -3,5 +3,6 @@ title: "Test Quarto"
 ---
 
 ```{python}
-import tqdm
+import sys
+print(sys.executable)
 ```

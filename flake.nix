@@ -28,7 +28,6 @@
             pkgs.quarto
           ];
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath buildInputs;
-          QUARTO_PYTHON = "${toString ./.}/.venv/bin/python";
         };
       }
     );

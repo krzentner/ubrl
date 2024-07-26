@@ -173,3 +173,6 @@ cython_debug/
 /plots*
 /.idea
 /.direnv
+/notes/*.html
+/notes/*_files
+/notes/*.ipynb
