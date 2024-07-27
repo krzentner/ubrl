@@ -206,7 +206,7 @@ class GymAgent(Agent):
             for i in range(len(episodes))
         ]
         action_lls_valid = truncate_packed(
-            action_lls, [pack_len - 1 for pack_len in action_pack_lens], 1
+            action_lls, new_lengths=inputs.n_timesteps, to_cut=1
         )
         return AgentOutput(
             state_encodings=state_encodings,

@@ -1,0 +1,93 @@
+---
+title: "Agent API"
+---
+
+One of the primary API surfaces in UBRL is the `Agent` abstract base class.
+The expected way of using `Agent` is to subcless it to implement a specific neural network.
+This notebook shows a simple example of using the `Agent` API.
+For more detailed examples, please look at
+[`src/ubrl/gym_utils.py`](src/ubrl/gym_utils.py) or
+[`examples/hf_llm_example.py`](examples/hf_llm_example.py).
+
+## Example Agent Implementation
+
+```{python}
+import torch
+from torch import nn
+from ubrl.torch_trainer import Agent, AgentInput, AgentOutput
+from ubrl.torch_utils import truncate_packed
+
+OBS_DIM = 3
+ACT_DIM = 2
+HIDDEN_DIM = 8
+
+class ExampleAgent(Agent):
+
+    def __init__(self):
+        super().__init__()
+        self._encoder = nn.Linear(OBS_DIM, HIDDEN_DIM)
+        self._action_head = nn.Linear(HIDDEN_DIM, ACT_DIM)
+
+    def forward(self, agent_input: AgentInput) -> AgentOutput:
+        state_encodings = self._encoder(torch.cat(
+            [ep['obs'] for ep in agent_input.episodes]))
+
+        # There is no action for each final state, remove the final state
+        # encodings to compute actions.
+        non_final_states = truncate_packed(
+            state_encodings,
+            new_lengths=agent_input.n_timesteps,
+            to_cut=1
+        )
+        action_logits = self._action_head(torch.relu(non_final_states))
+        action_lls = torch.softmax(action_logits, dim=1)
+        return AgentOutput(
+                state_encodings=state_encodings,
+                action_lls=action_lls,
+                n_timesteps=agent_input.n_timesteps)
+```
+
+## Example Implementation Points of Interest
+
+The above example shows a few key points of the API:
+
+- `ubrl.torch_trainer.Agent` is a subclass of `torch.nn.Module`, and needs to
+    be initialized so that `nn.Modules` can be added to it as fields.
+- The `Agent` should implement the `forward()` method, similar to other
+  `torch.nn.Module` subclasses.
+- The `forward()` method takes in an `AgentInput` and returns an `AgentOutput`.
+  These are both simple `dataclasses` used to avoid having to enumerate all
+  optional input and output values, and to check consistency of the output
+  values of `forward()`.
+- The `AgentInput` will always contain some number of full episodes, which can
+  be of any type (in this example, a dictionary with an `'obs'` key). This type
+  is considered "opaque" to UBRL, and UBRL avoids looking at fields or keys on
+  this type, it is just passed directly back to your `Agent` Note however that
+  this type might be pickled or copied over the network if using distributed
+  training or `TorchConfig.checkpoint_replay_buffer` is set.
+- The `AgentOutput` should contain a flattened representation of each state
+  (`state_encodings`) for each state in the episode (including the initial and
+  final state). Note that the final state is not necessarily a _terminal_
+  state, just the last state in the episode provided to `TorchTrainer`.
+- The `AgentOutput` should contain an action log-likelihood (`action_lls`) for
+  each non-final state (and consequently one fewer elements per episode than
+  the number of `state_encodings`). This is implemented using `truncate_packed`
+  in the above example.
+- Both `state_encodings` and `action_lls` for all episodes are concatenated,
+  since episodes _may_ be of different lengths.
+
+## How `ubrl` uses your `Agent`
+
+When using `ubrl`, your code is responsible for "collecting" episodes and
+adding them to the trainer.
+
+For example, you might collect episodes from an infinite horizon MDP, and add
+them to the trainer like so:
+```python
+    my_episode = my_episode_collector.collect(agent)
+    trainer.add_episode(
+        episode=my_episode,
+        rewards=my_episode['rewards'],
+        action_lls=my_episode['act_lls'],
+        terminated=False)
+```

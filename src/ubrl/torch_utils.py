@@ -370,7 +370,7 @@ class RunningMeanVar(nn.Module):
 
 
 def truncate_packed(
-    tensor: torch.Tensor, new_lengths: list[int], to_cut: int
+    tensor: torch.Tensor, *, new_lengths: list[int], to_cut: int
 ) -> torch.Tensor:
     """Truncate a packed tensor by a fixed number of elements along the first dimension."""
     assert tensor.shape[0] == sum(new_lengths) + to_cut * len(new_lengths)

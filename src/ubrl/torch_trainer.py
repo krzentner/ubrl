@@ -147,12 +147,18 @@ class _EpisodeData:
                         )
 
 
+class ReplayBuffer:
+
+    def __init__(self):
+        self._episode_data: list[_EpisodeData] = []
+
+
 @dataclass(eq=False)
 class LossInput:
     """Input values to the loss function not present in AgentOutput.
 
     Analogous to "targets" or "labels" in supervised learning.
-    These values are recomputed every train_step()."""
+    These values are recomputed every `TorchTrainer.train_step()`."""
 
     advantages: torch.Tensor
     """Advantages for this episode. Used in PPO loss (when enabled)."""
@@ -461,7 +467,7 @@ class TorchTrainer:
         self, agent_output: "AgentOutput", loss_input: LossInput
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         state_enc_packed = truncate_packed(
-            agent_output.state_encodings, loss_input.n_timesteps, 1
+            agent_output.state_encodings, new_lengths=loss_input.n_timesteps, to_cut=1
         )
         critic_out = self.vf(state_enc_packed)
         vf_loss = F.mse_loss(critic_out, loss_input.vf_targets)
@@ -1656,7 +1662,7 @@ class AgentOutput:
         episodes."""
         return self.valid_mask is None or self.valid_mask.all()
 
-    def _split(self) -> list["AgentOutput"]:
+    def split(self) -> list["AgentOutput"]:
         """Splits an `AgentOutput` into one `AgentOutput` per episode.
         Used by `CachedAgent` to cache individual episode outputs.
         """
