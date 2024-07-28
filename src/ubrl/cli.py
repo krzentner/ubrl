@@ -413,7 +413,7 @@ def run(
     *,
     train_fn: "Callable[[config_type], None]",
     config_type: "type[ubrl.TrainerConfig]",
-    run_command: bool = True
+    run_command: bool = True,
 ) -> Any | argparse.ArgumentParser:
     """Provides a standard command line interface to ubrl launcher scripts.
 

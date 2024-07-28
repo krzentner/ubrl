@@ -158,8 +158,9 @@ class CausalLMAgent(ubrl.Agent):
 
         state_encodings = hidden_states[state_encodings_mask]
         action_lls = sampled_token_lls[action_lls_mask]
-        all_logits = [model_out.logits[i, real_logits_mask[i]]
-                      for i in range(n_episodes)]
+        all_logits = [
+            model_out.logits[i, real_logits_mask[i]] for i in range(n_episodes)
+        ]
 
         return ubrl.AgentOutput(
             state_encodings=state_encodings,
@@ -168,7 +169,6 @@ class CausalLMAgent(ubrl.Agent):
             # Only construct action dict on action tokens
             # action_dists=[Categorical(logits=logits)
             #               for logits in all_logits],
-
             # infos is optional, but we use it in this example to implement
             # check_padding()
             infos={"logits": list(all_logits)},
@@ -188,10 +188,19 @@ def check_padding(agent, episodes: list[LLMEpisode]):
     """
     assert isinstance(episodes, list)
     logits = torch.cat([ep.logits for ep in episodes])
-    agent_out = agent(AgentInput(episodes=episodes, need_full=True, n_timesteps=[ep.action_lls.shape[0] for ep in episodes]))
+    agent_out = agent(
+        AgentInput(
+            episodes=episodes,
+            need_full=True,
+            n_timesteps=[ep.action_lls.shape[0] for ep in episodes],
+        )
+    )
     # Check that logits during generation match logits during forward pass
     # These tolerances may be too strict for 16 bit (or smaller)
-    assert torch.allclose(torch.cat(agent_out.infos["logits"]), logits, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(
+        torch.cat(agent_out.infos["logits"]), logits, atol=1e-4, rtol=1e-4
+    )
+
 
 def compute_rewards(
     prompt: str, prompt_tokens: list[str], tokens: list[str], full_text: str
@@ -227,13 +236,15 @@ def _collect_episodes(
         agent.tokenizer(prompt, return_tensors="pt").input_ids[0] for prompt in prompts
     ]
     # If the following assert fails, remove, you should probably change :-1] to :] in the code below.
-    assert all([enc[-1] == agent.tokenizer.eos_token_id for enc in encoded_prompts_unpadded])
+    assert all(
+        [enc[-1] == agent.tokenizer.eos_token_id for enc in encoded_prompts_unpadded]
+    )
     # Truncate to have at most max_prompt_len (including a single starting
     # beginning-of-sequence token, which might be the same as the <pad> token),
     # and remove the trailing end-of-sequence token.
     decoder_inputs_unpadded = [
         # Remove end-of-sequence token
-        enc_prompt[max(0, len(enc_prompt) - max_prompt_len - 1):-1]
+        enc_prompt[max(0, len(enc_prompt) - max_prompt_len - 1) : -1]
         for enc_prompt in encoded_prompts_unpadded
     ]
 

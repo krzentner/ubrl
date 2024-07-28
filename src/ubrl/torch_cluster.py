@@ -16,7 +16,7 @@ try:
 except ImportError:
     Accelerator = None
 
-TMod = TypeVar('TMod', bound=torch.nn.Module)
+TMod = TypeVar("TMod", bound=torch.nn.Module)
 
 
 class Cluster:

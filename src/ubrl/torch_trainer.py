@@ -148,7 +148,6 @@ class _EpisodeData:
 
 
 class ReplayBuffer:
-
     def __init__(self):
         self._episode_data: list[_EpisodeData] = []
 
@@ -1653,8 +1652,8 @@ class AgentOutput:
 
         if self.action_dists is not None:
             assert isinstance(self.action_dists, list)
-            assert len(self.action_dists) == len(
-                self.n_timesteps
+            assert (
+                len(self.action_dists) == len(self.n_timesteps)
             ), 'If provided, action_dists should be a list containing one "ActionDist" per episode'
 
     def full_valid(self):
@@ -1723,13 +1722,6 @@ class AgentInput:
     `TorchTrainer.add_episode`.
     """
 
-    need_full: bool
-    """If True, the agent must return action_lls and state_encodings for the
-    entire episode (i.e. `AgentOutput.valid_mask` should be None or all True).
-
-    If False, the agent can optionally only propagate a portion of timesteps.
-    """
-
     n_timesteps: list[int]
     """Number of expected timesteps in each episode. It is recommended to pass
     this field forward into the AgentOutput."""
@@ -1741,13 +1733,20 @@ class AgentInput:
     original_action_lls: torch.Tensor
     """Packed action log-likelihoods when episodes were originally collected (as passed to `TorchTrainer.add_episode()`)."""
 
-    original_action_dists: Optional[list[ActionDist]]
-    """Action dists when episodes where originally collected. `None` if action
-    distributions were not provided in `TorchTrainer.add_episode()`."""
-
     terminated: torch.Tensor
     """Boolean tensor containing one value per episode indicating if that
     episode was terminated."""
+
+    original_action_dists: Optional[list[ActionDist]] = None
+    """Action dists when episodes where originally collected. `None` if action
+    distributions were not provided in `TorchTrainer.add_episode()`."""
+
+    need_full: bool = True
+    """If True, the agent must return action_lls and state_encodings for the
+    entire episode (i.e. `AgentOutput.valid_mask` should be None or all True).
+
+    If False, the agent can optionally only propagate a portion of timesteps.
+    """
 
     @property
     def n_observations(self):

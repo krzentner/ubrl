@@ -2,7 +2,9 @@
 title: "Agent API"
 ---
 
-One of the primary API surfaces in UBRL is the `Agent` abstract base class.
+TODO(krzentner): Fix links to examples
+
+One of the primary API surfaces in `ubrl` is the `Agent` abstract base class.
 The expected way of using `Agent` is to subcless it to implement a specific neural network.
 This notebook shows a simple example of using the `Agent` API.
 For more detailed examples, please look at
@@ -24,9 +26,9 @@ HIDDEN_DIM = 8
 class ExampleAgent(Agent):
 
     def __init__(self):
-        super().__init__()
+        super().__init__(HIDDEN_DIM)
         self._encoder = nn.Linear(OBS_DIM, HIDDEN_DIM)
-        self._action_head = nn.Linear(HIDDEN_DIM, ACT_DIM)
+        self._action_tail = nn.Linear(HIDDEN_DIM, ACT_DIM)
 
     def forward(self, agent_input: AgentInput) -> AgentOutput:
         state_encodings = self._encoder(torch.cat(
@@ -39,12 +41,21 @@ class ExampleAgent(Agent):
             new_lengths=agent_input.n_timesteps,
             to_cut=1
         )
-        action_logits = self._action_head(torch.relu(non_final_states))
-        action_lls = torch.softmax(action_logits, dim=1)
+
+        action_logits = self._action_tail(torch.tanh(non_final_states))
+        all_action_lls = torch.softmax(action_logits, dim=1)
+
+        taken_actions = torch.cat([ep['acts'] for ep in agent_input.episodes])
+        taken_action_lls = torch.gather(
+            all_action_lls, 1, taken_actions.unsqueeze(-1)
+        ).squeeze(-1)
+
         return AgentOutput(
                 state_encodings=state_encodings,
-                action_lls=action_lls,
+                action_lls=taken_action_lls,
                 n_timesteps=agent_input.n_timesteps)
+
+agent = ExampleAgent()
 ```
 
 ## Example Implementation Points of Interest
@@ -53,6 +64,8 @@ The above example shows a few key points of the API:
 
 - `ubrl.torch_trainer.Agent` is a subclass of `torch.nn.Module`, and needs to
     be initialized so that `nn.Modules` can be added to it as fields.
+- The `super().__init__` call expects to be given the shape that will be used
+  by `state_encodings` later.
 - The `Agent` should implement the `forward()` method, similar to other
   `torch.nn.Module` subclasses.
 - The `forward()` method takes in an `AgentInput` and returns an `AgentOutput`.
@@ -60,21 +73,25 @@ The above example shows a few key points of the API:
   optional input and output values, and to check consistency of the output
   values of `forward()`.
 - The `AgentInput` will always contain some number of full episodes, which can
-  be of any type (in this example, a dictionary with an `'obs'` key). This type
-  is considered "opaque" to UBRL, and UBRL avoids looking at fields or keys on
-  this type, it is just passed directly back to your `Agent` Note however that
-  this type might be pickled or copied over the network if using distributed
-  training or `TorchConfig.checkpoint_replay_buffer` is set.
+  be of any type (in this example, a dictionary with `'obs'` and `'acts'`
+  keys). This type is considered "opaque" to UBRL, and UBRL avoids looking at
+  fields or keys on this type, it is just passed directly back to your `Agent`
+  Note however that this type might be pickled or copied over the network if
+  using distributed training or `TorchConfig.checkpoint_replay_buffer` is set.
 - The `AgentOutput` should contain a flattened representation of each state
   (`state_encodings`) for each state in the episode (including the initial and
   final state). Note that the final state is not necessarily a _terminal_
   state, just the last state in the episode provided to `TorchTrainer`.
 - The `AgentOutput` should contain an action log-likelihood (`action_lls`) for
-  each non-final state (and consequently one fewer elements per episode than
-  the number of `state_encodings`). This is implemented using `truncate_packed`
-  in the above example.
+  the action taked during the episode for each non-final state (and
+  consequently one fewer elements per episode than the number of
+  `state_encodings`). This is implemented using `truncate_packed` in the above
+  example.
 - Both `state_encodings` and `action_lls` for all episodes are concatenated,
-  since episodes _may_ be of different lengths.
+  since episodes may be of different lengths. If all of your episodes are
+  similar lengths, you may find `ubrl.torch_utils.pad_packed` to be useful.
+- Both `state_encodings` and `action_lls` can have losses applied to them to
+  train the `Agent`.
 
 ## How `ubrl` uses your `Agent`
 
@@ -83,11 +100,120 @@ adding them to the trainer.
 
 For example, you might collect episodes from an infinite horizon MDP, and add
 them to the trainer like so:
+
 ```python
-    my_episode = my_episode_collector.collect(agent)
-    trainer.add_episode(
-        episode=my_episode,
-        rewards=my_episode['rewards'],
-        action_lls=my_episode['act_lls'],
-        terminated=False)
+my_episode = my_episode_collector.collect(agent)
+trainer.add_episode(
+    episode=my_episode,
+    rewards=my_episode['rewards'],
+    action_lls=my_episode['act_lls'],
+    terminated=False)
 ```
+
+Suppose you've added a set of episodes like the following:
+
+```{python}
+from math import prod
+example_t = lambda *shape: torch.arange(prod(shape), dtype=torch.float).reshape(shape)
+
+episodes = [
+    {'obs': example_t(10, OBS_DIM), 'acts': torch.arange(9) % ACT_DIM },
+    {'obs': example_t(5, OBS_DIM), 'acts': torch.arange(4) % ACT_DIM },
+    {'obs': example_t(3, OBS_DIM), 'acts': torch.arange(2) % ACT_DIM },
+    {'obs': example_t(20, OBS_DIM), 'acts': torch.arange(19) % ACT_DIM },
+    {'obs': example_t(31, OBS_DIM), 'acts': torch.arange(30) % ACT_DIM },
+]
+rewards = [
+    example_t(9),
+    example_t(4),
+    example_t(2),
+    example_t(19),
+    example_t(30),
+]
+original_action_lls = [
+    torch.zeros(rew.shape[0]) for rew in rewards
+]
+terminated = [
+    False,
+    False,
+    False,
+    True,
+    True
+]
+```
+
+To train your agent, `TorchTrainer` will group those episodes into minibatches
+and construct a `AgentInput` for each minibatch, in a procedure similar to but
+more complex than the following:
+
+```{python}
+from ubrl.torch_utils import discount_cumsum
+
+# Optimizers and VF are stored in TorchTrainer across training steps
+vf = nn.Linear(HIDDEN_DIM, 1)
+vf_opt = torch.optim.Adam(vf.parameters())
+agent_opt = torch.optim.Adam(agent.parameters())
+
+for minibatch_indices in [[0, 1, 2], [3, 4]]:
+    n_timesteps = [rewards[i].shape[0] for i in minibatch_indices]
+
+    agent_input = AgentInput(
+        episodes=[episodes[i] for i in minibatch_indices],
+        rewards=torch.cat([rewards[i] for i in minibatch_indices]),
+        n_timesteps=n_timesteps,
+        original_action_lls=torch.cat([original_action_lls[i] for i in minibatch_indices]),
+        terminated=torch.tensor([terminated[i] for i in minibatch_indices], dtype=torch.bool)
+    )
+    agent_output = agent(agent_input)
+    vf_x = vf(agent_output.state_encodings).squeeze()
+
+    final_state_idx = list(n_timesteps)
+    for j in range(1, len(final_state_idx)):
+        final_state_idx[j] += final_state_idx[j - 1]
+
+    # Extend rewards with VF estimate.
+    inf_horizon_rewards = [torch.cat([rewards[i],
+                                      vf_x[final_state_idx[j]].detach().unsqueeze(-1)
+                                      if not terminated[i] else torch.zeros(1)])
+                           for (j, i) in enumerate(minibatch_indices)]
+
+    # Compute discounted returns and naive advantages.
+    # ubrl will use V-Trace (lambda) instead.
+    returns = torch.cat([
+        discount_cumsum(inf_horizon_rewards[j].unsqueeze(0), 0.9).squeeze(0)
+        for j in range(len(minibatch_indices))
+    ])
+    advantages = truncate_packed(
+        returns - vf_x,
+        new_lengths=n_timesteps,
+        to_cut=1
+    )
+    vf_loss = (vf_x - returns)**2
+
+    pi_loss = -advantages * (agent_output.action_lls - agent_input.original_action_lls).exp()
+    approx_kl_loss = agent_input.original_action_lls.exp() * (
+        agent_output.action_lls - agent_input.original_action_lls)
+
+    loss = (pi_loss.sum() +
+            0.1 * vf_loss.sum() +
+            0.1 * approx_kl_loss.sum()) / sum(n_timesteps)
+    loss.backward()
+    agent_opt.step()
+    vf_opt.step()
+```
+
+## Optional `AgentInput` and `AgentOutput` Fields
+
+TODO(krzentner): Fix link to reference documentation
+
+For detailed descriptions of each `AgentInput` and `AgentOuput` field, see the
+[reference documentation](docs/ubrl/torch_trainer.py#AgentInput).
+
+The main fields to be aware of on `AgentOutput` are:
+
+- `action_dists`: A list of `torch.distributions.Distribution` or
+  `ubrl.torch_utils.CustomTorchDist`. Is used to implement exact KL and entropy
+  losses.
+- `inherent_loss`: A loss which will be added to the `pi_loss`. Used to
+  optimize the model for auxiliary objectives (such as regularization or
+  auto-regressive losses).
