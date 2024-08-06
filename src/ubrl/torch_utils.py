@@ -407,6 +407,7 @@ def unpack_tensors(tensor: torch.Tensor, lengths: list[int]) -> list[torch.Tenso
 
     Inverse of pack_tensors.
     """
+    assert isinstance(tensor, torch.Tensor)
     start_i = 0
     out = []
     for length in lengths:
@@ -721,16 +722,6 @@ def make_scheduler(
         raise NotImplementedError(f"LR scheduling of type {name} is not implemented")
 
 
-def used_for_logging(*args):
-    """No-op function used to document that a local variable is used for
-    logging and should not be deleted.
-
-    This function is preferred over just leaving a comment since it will also
-    "inform" the linter.
-    """
-    del args
-
-
 def discount_cumsum(x: torch.Tensor, discount: float) -> torch.Tensor:
     """Discounted cumulative sum."""
     B, L = x.shape
@@ -749,8 +740,33 @@ def discount_cumsum(x: torch.Tensor, discount: float) -> torch.Tensor:
     return returns.squeeze()
 
 
+## Utilities not technically specific to torch
+
+def used_for_logging(*args):
+    """No-op function used to document that a local variable is used for
+    logging and should not be deleted.
+
+    This function is preferred over just leaving a comment since it will also
+    "inform" the linter.
+    """
+    del args
+
+
 def concat_lists(lists: list[list[T]]) -> list[T]:
+    """Concatenate a sequence of lists. Also known as "flatten once"."""
     new_list = []
-    for l in lists:
-        new_list.extend(l)
+    for ls in lists:
+        new_list.extend(ls)
     return new_list
+
+
+def strict_zip(*args):
+    """Compute zip() of arguments, but strictly evaluates all inputs into lists
+    and asserts that all inputs are the same length."""
+    args_list = [list(a) for a in args]
+    for i, a in enumerate(args_list):
+        assert len(a) == len(args_list[0]), f"len(args[0]) != len(args[{i}]"
+    results = []
+    for i in range(len(args_list[0])):
+        results.append([a[i] for a in args_list])
+    return results

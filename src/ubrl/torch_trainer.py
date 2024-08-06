@@ -47,6 +47,7 @@ from ubrl.torch_utils import (
     discount_cumsum,
     truncate_packed,
     concat_lists,
+    strict_zip
 )
 import ubrl.torch_cluster
 from ubrl.config import TrainerConfig
@@ -186,6 +187,14 @@ class LossInput:
         assert not self.vf_targets.requires_grad
         assert not self.exp_advantages.requires_grad
         assert not self.advantages.requires_grad
+        total_timesteps = sum(self.n_timesteps)
+        n_observations = len(self.n_timesteps) + total_timesteps
+        # All of these fields should be packed
+        assert self.advantages.shape == (total_timesteps,)
+        assert self.exp_advantages.shape == (total_timesteps,)
+        assert self.original_action_lls.shape == (total_timesteps,)
+        assert self.vf_targets.shape == (n_observations,)
+        assert self.vf_returns.shape == (n_observations,)
 
     @classmethod
     def pack(cls, loss_inputs: list["LossInput"]) -> "LossInput":
@@ -212,8 +221,10 @@ class LossInput:
             field_val = getattr(self, field.name)
             if field.name == "original_action_dists" and field_val is None:
                 field_val = [None] * len(self.n_timesteps)
-            elif field.name == "n_timesteps":
-                field_val = [[n] for n in self.n_timesteps]
+            elif field.name in ["original_action_dists", "n_timesteps"]:
+                field_val = [[v] for v in field_val]
+            elif field.name in ("vf_targets", "vf_returns"):
+                field_val = unpack_tensors(field_val, [n + 1 for n in self.n_timesteps])
             else:
                 field_val = unpack_tensors(field_val, self.n_timesteps)
             fields[field.name] = field_val
@@ -465,10 +476,7 @@ class TorchTrainer:
     def _vf_loss(
         self, agent_output: "AgentOutput", loss_input: LossInput
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        state_enc_packed = truncate_packed(
-            agent_output.state_encodings, new_lengths=loss_input.n_timesteps, to_cut=1
-        )
-        critic_out = self.vf(state_enc_packed)
+        critic_out = self.vf(agent_output.state_encodings)
         vf_loss = F.mse_loss(critic_out, loss_input.vf_targets)
 
         norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
@@ -693,10 +701,12 @@ class TorchTrainer:
             deadline=deadline,
         )
 
-        loss_inputs = self._prepare_loss_inputs(
-            c_agent.state_encodings_cache, c_agent.action_lls_cache
-        )
-        self._log_dataset(loss_inputs)
+        rb_inputs = AgentInput.from_episode_data(self._replay_buffer, need_full=True)
+        cache_out = c_agent.cached_forward(self._replay_buffer)
+        loss_input = self.loss_inputs_of(rb_inputs, cache_out)
+        loss_inputs = {ep_data.episode_id: loss_in for (ep_data, loss_in)
+                       in strict_zip(self._replay_buffer, loss_input.split())}
+        self._log_dataset(loss_input)
         c_agent.clear_caches()
 
         # Run primary training loop.
@@ -758,9 +768,10 @@ class TorchTrainer:
                 if errors > self.cfg.max_permitted_errors_per_train_step:
                     raise ex
             if self.cfg.recompute_loss_inputs:
-                loss_inputs = self._prepare_loss_inputs(
-                    c_agent.state_encodings_cache, c_agent.action_lls_cache
-                )
+                cache_out = c_agent.cached_forward(self._replay_buffer)
+                loss_input = self.loss_inputs_of(rb_inputs, cache_out)
+                loss_inputs = {ep_data.episode_id: loss_in for (ep_data, loss_in)
+                            in strict_zip(self._replay_buffer, loss_input.split())}
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
@@ -815,9 +826,9 @@ class TorchTrainer:
         if training_epochs == 0 or timed_out:
             return timed_out
 
-        agent_out = cached_agent.cached_output(self._replay_buffer)
+        agent_out = cached_agent.cached_forward(self._replay_buffer)
         state_enc_packed = agent_out.state_encodings
-        action_lls_now = agent_out.action_lls
+        action_lls_now = pad_packed(agent_out.action_lls, agent_out.n_timesteps)
         obs_lens = [ep_data.n_timesteps + 1 for ep_data in self._replay_buffer]
 
         assert (
@@ -903,8 +914,7 @@ class TorchTrainer:
                         return True
         return False
 
-    def _log_dataset(self, loss_inputs: dict[EpisodeID, LossInput]):
-        loss_input = LossInput.pack(list(loss_inputs.values()))
+    def _log_dataset(self, loss_input: LossInput):
         full_episode_rewards = self.cluster.prepare_tensor(
             pad_tensors([data.rewards for data in self._replay_buffer])
         )
@@ -913,10 +923,15 @@ class TorchTrainer:
             discount_cumsum(full_episode_rewards, discount=1 - self.cfg.discount_inv),
             ep_lengths,
         )
+        vf_returns_no_final = truncate_packed(
+            loss_input.vf_returns,
+            new_lengths=loss_input.n_timesteps,
+            to_cut=1
+        )
         dataset_stats = {
             "episode_total_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
             "vf_explained_variance": explained_variance(
-                loss_input.vf_returns,
+                vf_returns_no_final,
                 discounted_returns,
             ),
             "discounted_rewards": discounted_returns.mean(),
@@ -926,7 +941,7 @@ class TorchTrainer:
         }
         for k in self._replay_buffer[0].infos.keys():
             dataset_stats[k] = force_concat(
-                data.infos[k] for data in self._replay_buffer
+                [data.infos[k] for data in self._replay_buffer]
             )
 
         noko.log_row(
@@ -936,7 +951,7 @@ class TorchTrainer:
             step=self.total_env_steps,
         )
 
-    def loss_inputs(
+    def loss_inputs_of(
         self,
         agent_input: "AgentInput",
         agent_output: "AgentOutput",
@@ -1018,8 +1033,8 @@ class TorchTrainer:
 
         loss_input = LossInput(
             advantages=adv_packed,
-            vf_returns=vf_returns,
-            vf_targets=vf_targets,
+            vf_returns=pack_padded(vf_returns, obs_lens),
+            vf_targets=pack_padded(vf_targets, obs_lens),
             exp_advantages=normed_exp_adv,
             original_action_lls=agent_input.original_action_lls,
             original_action_dists=agent_input.original_action_dists,
@@ -1031,164 +1046,13 @@ class TorchTrainer:
         del infos["self"]
         del infos["n_timesteps"]
         del infos["obs_lens"]
-        del infos["loss_inputs"]
         noko.log_row(
             "preprocess",
             infos,
             level=noko.TRACE,
             step=self.total_env_steps,
         )
-        return loss_inputs
-
-    def _prepare_loss_inputs(
-        self,
-        state_encodings: dict[EpisodeID, torch.Tensor],
-        action_lls: dict[EpisodeID, torch.Tensor],
-    ) -> dict[EpisodeID, LossInput]:
-        """Compute training inputs from the replay buffer and value function.
-
-        Mostly this consists of the advantages and value function
-        targets. See the LossInput class for more
-        information.
-        """
-        state_enc_packed, obs_lens = pack_tensors(
-            [state_encodings[ep_data.episode_id] for ep_data in self._replay_buffer]
-        )
-        action_lls_now = pad_tensors(
-            [action_lls[ep_data.episode_id] for ep_data in self._replay_buffer]
-        )
-        assert (
-            not state_enc_packed.requires_grad
-        ), "state_enc unexpectedly required grad"
-        assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
-
-        n_timesteps = [len(data.rewards) for data in self._replay_buffer]
-        # obs_lens = [len(data.episode["observations"]) for data in self._replay_buffer]
-        assert [
-            ep_len + 1 for ep_len in n_timesteps
-        ] == obs_lens, "rewards length do not match state_encodings length"
-
-        # Compute vf_returns
-        self.agent.train(mode=False)
-        self.vf.train(mode=False)
-
-        with torch.no_grad():
-            # TODO(krzentner): split up this call if necessary
-            vf_returns_packed = self.vf(state_enc_packed)
-        self.agent.train(mode=True)
-        self.vf.train(mode=True)
-
-        original_action_lls = self.cluster.prepare_tensor(
-            pad_tensors([data.original_action_lls for data in self._replay_buffer])
-        )
-        terminated = torch.zeros(len(self._replay_buffer), dtype=torch.bool)
-
-        vf_returns = pad_packed(vf_returns_packed, obs_lens)
-
-        # TODO(krzentner): Refactor / eliminate this loop
-        # Can't use valids mask, since vf_returns goes to t + 1
-        for i, episode_length in enumerate(n_timesteps):
-            # Everything after last valid observation should have been padded to zero
-            assert (
-                vf_returns[i, episode_length + 1 :] == 0.0
-            ).all(), "VF returns non-zero after last observation"
-
-            # zero vf_{t+1} in terminated episodes
-            if self._replay_buffer[i].terminated:
-                vf_returns[i, episode_length] = 0.0
-                terminated[i] = True
-        terminated = self.cluster.prepare_tensor(terminated)
-
-        padded_rewards = self.cluster.prepare_tensor(
-            pad_tensors([data.rewards for data in self._replay_buffer])
-        )
-        if self.cfg.normalize_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
-        else:
-            rewards_normed = padded_rewards
-
-        discount = 1 - self.cfg.discount_inv
-        gammas = discount * torch.ones_like(rewards_normed)
-
-        padded_advantages, vf_targets = _v_trace_estimation(
-            lmbda=self.cfg.v_trace_lambda,
-            rho_max=self.cfg.v_trace_rho_max,
-            c_max=self.cfg.v_trace_c_max,
-            gammas=gammas,
-            vf_x=vf_returns,
-            rewards=rewards_normed,
-            action_lls=action_lls_now,
-            original_action_lls=original_action_lls,
-            terminated=terminated,
-            n_timesteps=self.cluster.prepare_tensor(torch.tensor(n_timesteps)),
-        )
-
-        adv_packed = pack_padded(padded_advantages, n_timesteps)
-        assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
-
-        if self.cfg.normalize_awr_advantages:
-            adv_packed = adv_packed - adv_packed.mean()
-            adv_packed = adv_packed / adv_packed.std()
-
-        # This 1000 is documented in the TrainerConfig.awr_temperature
-        # docstring.
-
-        if self.cfg.awr_temperature >= 1000:
-            heated_adv = adv_packed / self.cfg.awr_temperature
-            max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-            softmax_adv = softmax_clip(heated_adv, max_exp_adv)
-            awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
-            normed_exp_adv = softmax_adv * len(softmax_adv)
-            assert (
-                0.9 <= normed_exp_adv.mean() <= 1.1
-            ), "normed_exp_adv outside expected range"
-        else:
-            awr_clip_ratio = 0.0
-            normed_exp_adv = torch.ones_like(adv_packed)
-
-        loss_inputs = {
-            episode_data.episode_id: LossInput(
-                advantages=adv,
-                vf_returns=vf_ret,
-                vf_targets=vf_target,
-                exp_advantages=exp_adv,
-                original_action_lls=episode_data.original_action_lls,
-                n_timesteps=[episode_data.n_timesteps],
-                original_action_dists=(
-                    [episode_data.original_action_dists]
-                    if episode_data.original_action_dists
-                    else None
-                ),
-            )
-            for (episode_data, adv, vf_ret, vf_target, exp_adv) in zip(
-                self._replay_buffer,
-                unpack_tensors(adv_packed, n_timesteps),
-                unpad_tensors(vf_returns, n_timesteps),
-                unpad_tensors(vf_targets, n_timesteps),
-                unpack_tensors(normed_exp_adv, n_timesteps),
-            )
-        }
-        assert len(loss_inputs) == len(
-            self._replay_buffer
-        ), "number of loss inputs do not match size of replay buffer"
-        for data in self._replay_buffer:
-            assert len(loss_inputs[data.episode_id].advantages) == len(
-                data.rewards
-            ), "number of advantages do not match number of rewards"
-
-        used_for_logging(awr_clip_ratio)
-        infos = locals()
-        del infos["self"]
-        del infos["n_timesteps"]
-        del infos["obs_lens"]
-        del infos["loss_inputs"]
-        noko.log_row(
-            "preprocess",
-            infos,
-            level=noko.TRACE,
-            step=self.total_env_steps,
-        )
-        return loss_inputs
+        return loss_input
 
     def add_episode(
         self,
@@ -1789,8 +1653,8 @@ class CachedAgent:
     """Performs checking of the `Agent` API and caches outputs.
 
     Cached values are used to cheaply fine-tune value function training.
-    This class does not implement Transformer key caching and is used with all
-    implementations of the `Agent` API.
+    This class does _not_ implement Transformer key caching and is used with
+    all implementations of the `Agent` API.
     """
 
     def __init__(
@@ -1822,7 +1686,7 @@ class CachedAgent:
             ):
                 self.agent_forward(minibatch, need_full=True)
 
-    def cached_output(self, episode_data: list[_EpisodeData]) -> AgentOutput:
+    def cached_forward(self, episode_data: list[_EpisodeData]) -> AgentOutput:
         """Get output "as if" a forward pass was run, but avoid running the
         forward pass if possible.
 
@@ -1837,7 +1701,7 @@ class CachedAgent:
             [self.state_encodings_cache[ep.episode_id] for ep in episode_data]
         )
         action_lls = torch.cat(
-            [self.state_encodings_cache[ep.episode_id] for ep in episode_data]
+            [self.action_lls_cache[ep.episode_id] for ep in episode_data]
         )
         return AgentOutput(
             state_encodings=state_encodings,
@@ -1865,7 +1729,7 @@ class CachedAgent:
                 f"AgentOutput contained n_timesteps that did not match input. Expected: {expected_lengths} Actual: {agent_output.n_timesteps}"
             )
         if agent_output.full_valid():
-            for i, output in enumerate(agent_output._split()):
+            for i, output in enumerate(agent_output.split()):
                 episode_id = episode_data[i].episode_id
                 self.state_encodings_cache[episode_id] = output.state_encodings.detach()
                 self.action_lls_cache[episode_id] = output.action_lls.detach()
