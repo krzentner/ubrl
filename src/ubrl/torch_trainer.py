@@ -47,7 +47,7 @@ from ubrl.torch_utils import (
     discount_cumsum,
     truncate_packed,
     concat_lists,
-    strict_zip
+    strict_zip,
 )
 import ubrl.torch_cluster
 from ubrl.config import TrainerConfig
@@ -172,6 +172,10 @@ class LossInput:
     vf_returns: torch.Tensor
     """Estimated returns from the value function. Used in logging."""
 
+    vf_loss_mask: torch.Tensor
+    """Mask for which states the VF loss should be applied to.
+    Mostly used to exclude final non-terminal states."""
+
     original_action_lls: torch.Tensor
     """Copied from TorchTrainer.add_episode(), these are the original log
     likelihoods of the actions taken when the data was collected."""
@@ -195,6 +199,7 @@ class LossInput:
         assert self.original_action_lls.shape == (total_timesteps,)
         assert self.vf_targets.shape == (n_observations,)
         assert self.vf_returns.shape == (n_observations,)
+        assert self.vf_loss_mask.shape == (n_observations,)
 
     @classmethod
     def pack(cls, loss_inputs: list["LossInput"]) -> "LossInput":
@@ -223,7 +228,7 @@ class LossInput:
                 field_val = [None] * len(self.n_timesteps)
             elif field.name in ["original_action_dists", "n_timesteps"]:
                 field_val = [[v] for v in field_val]
-            elif field.name in ("vf_targets", "vf_returns"):
+            elif field.name in ("vf_targets", "vf_returns", "vf_loss_mask"):
                 field_val = unpack_tensors(field_val, [n + 1 for n in self.n_timesteps])
             else:
                 field_val = unpack_tensors(field_val, self.n_timesteps)
@@ -404,7 +409,7 @@ class TorchTrainer:
 
         self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
 
-    def _primary_loss_function(
+    def _combined_loss_function(
         self, agent_output: "AgentOutput", loss_input: LossInput
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Reinforcement learning loss function.
@@ -448,7 +453,7 @@ class TorchTrainer:
         policy_gradient = ratio * loss_input.advantages
         clip_policy_gradient = ratio_clipped * loss_input.advantages
 
-        # Mean is handled in the primary_loss_function
+        # Mean is handled in the combined_loss_function
         ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
         norm_coef = self.cfg.ppo_loss_coef / self.cfg.minibatch_target_timesteps
         ppo_loss_scaled = norm_coef * ppo_loss.sum()
@@ -477,10 +482,12 @@ class TorchTrainer:
         self, agent_output: "AgentOutput", loss_input: LossInput
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         critic_out = self.vf(agent_output.state_encodings)
-        vf_loss = F.mse_loss(critic_out, loss_input.vf_targets)
+        vf_loss = F.mse_loss(critic_out, loss_input.vf_targets, reduction="none")
+        # Excludes non-terminal final states
+        vf_loss_no_final = loss_input.vf_loss_mask * vf_loss
 
         norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_target_timesteps
-        vf_loss_scaled = norm_coef * vf_loss
+        vf_loss_scaled = norm_coef * vf_loss_no_final.sum()
         infos = locals()
         del infos["self"]
         return (vf_loss_scaled, infos)
@@ -704,8 +711,12 @@ class TorchTrainer:
         rb_inputs = AgentInput.from_episode_data(self._replay_buffer, need_full=True)
         cache_out = c_agent.cached_forward(self._replay_buffer)
         loss_input = self.loss_inputs_of(rb_inputs, cache_out)
-        loss_inputs = {ep_data.episode_id: loss_in for (ep_data, loss_in)
-                       in strict_zip(self._replay_buffer, loss_input.split())}
+        loss_inputs = {
+            ep_data.episode_id: loss_in
+            for (ep_data, loss_in) in strict_zip(
+                self._replay_buffer, loss_input.split()
+            )
+        }
         self._log_dataset(loss_input)
         c_agent.clear_caches()
 
@@ -728,7 +739,7 @@ class TorchTrainer:
                 [loss_inputs[ep_data.episode_id] for ep_data in minibatch]
             )
             agent_output = c_agent.agent_forward(minibatch, need_full=False)
-            loss, loss_infos = self._primary_loss_function(agent_output, loss_input)
+            loss, loss_infos = self._combined_loss_function(agent_output, loss_input)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
             self.cluster.backward(loss)
@@ -770,8 +781,12 @@ class TorchTrainer:
             if self.cfg.recompute_loss_inputs:
                 cache_out = c_agent.cached_forward(self._replay_buffer)
                 loss_input = self.loss_inputs_of(rb_inputs, cache_out)
-                loss_inputs = {ep_data.episode_id: loss_in for (ep_data, loss_in)
-                            in strict_zip(self._replay_buffer, loss_input.split())}
+                loss_inputs = {
+                    ep_data.episode_id: loss_in
+                    for (ep_data, loss_in) in strict_zip(
+                        self._replay_buffer, loss_input.split()
+                    )
+                }
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
@@ -924,9 +939,7 @@ class TorchTrainer:
             ep_lengths,
         )
         vf_returns_no_final = truncate_packed(
-            loss_input.vf_returns,
-            new_lengths=loss_input.n_timesteps,
-            to_cut=1
+            loss_input.vf_returns, new_lengths=loss_input.n_timesteps, to_cut=1
         )
         dataset_stats = {
             "episode_total_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
@@ -973,6 +986,7 @@ class TorchTrainer:
         self.vf.train(mode=True)
 
         vf_returns = pad_packed(vf_returns_packed, obs_lens)
+        vf_loss_masks = []
 
         # TODO(krzentner): Refactor / eliminate this loop
         # Can't use valids mask, since vf_returns goes to t + 1
@@ -982,9 +996,14 @@ class TorchTrainer:
                 vf_returns[i, episode_length + 1 :] == 0.0
             ).all(), "VF returns non-zero after last observation"
 
+            ep_loss_mask = self.cluster.prepare_tensor(torch.ones(episode_length + 1))
             # zero vf_{t+1} in terminated episodes
             if agent_input.terminated[i]:
                 vf_returns[i, episode_length] = 0.0
+            else:
+                ep_loss_mask[episode_length] = 0.0
+                assert ep_loss_mask[-1] == 0.0
+            vf_loss_masks.append(ep_loss_mask)
 
         padded_rewards = pad_packed(agent_input.rewards, n_timesteps)
         if self.cfg.normalize_rewards:
@@ -1031,10 +1050,12 @@ class TorchTrainer:
             awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
 
+        vf_loss_mask = pack_tensors_check(vf_loss_masks, obs_lens)
         loss_input = LossInput(
             advantages=adv_packed,
             vf_returns=pack_padded(vf_returns, obs_lens),
             vf_targets=pack_padded(vf_targets, obs_lens),
+            vf_loss_mask=vf_loss_mask,
             exp_advantages=normed_exp_adv,
             original_action_lls=agent_input.original_action_lls,
             original_action_dists=agent_input.original_action_dists,
