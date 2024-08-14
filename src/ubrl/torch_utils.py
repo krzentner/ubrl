@@ -515,23 +515,49 @@ def pack_dataclass(cls: type[T], instances: list[T]) -> T:
     return cls(**new_fields)
 
 
-def unpack_dataclass(data: T) -> list[T]:
-    fields = {}
-    for field in dataclasses.fields(self):
-        field_val = getattr(self, field.name)
-        if field.name == "original_action_dists" and field_val is None:
-            field_val = [None] * len(self.n_timesteps)
-        elif field.name in ["original_action_dists", "n_timesteps"]:
-            field_val = [[v] for v in field_val]
-        elif field.name in ("vf_targets", "vf_returns", "vf_loss_mask"):
-            field_val = tu.unpack_tensors(field_val, [n + 1 for n in self.n_timesteps])
-        else:
-            field_val = tu.unpack_tensors(field_val, self.n_timesteps)
-        fields[field.name] = field_val
+def unpack_dataclass(data: T, packed_lengths: dict[str, list[int]]) -> list[T]:
+    # Check that lengths have the same number of values
+    n_results = None
+    n_results_field = ""
+    for field_name, lengths in packed_lengths.items():
+        if n_results is None:
+            n_results = len(lengths)
+            n_results_field = field_name
+        elif len(lengths) != n_results:
+            raise ValueError(
+                f"Inconsistent pack lengths between {T}.{n_results_field} and {T}.{field_name}: {n_results} vs {len(lengths)}"
+            )
+    if n_results is None:
+        raise ValueError("unpack_dataclass requires at least one set of packed lengths")
 
+    # Split fields into arguments
+    kwarg_lists = {}
+    for field in dataclasses.fields(data):
+        field_val = getattr(T, field.name)
+        if _is_optional(field.type) and field_val is None:
+            field_val = [None] * n_results
+        elif typing.get_origin(field.type) == list:
+            field_val = [[v] for v in field_val]
+        elif field.type == torch.Tensor:
+            try:
+                lengths = packed_lengths[field.name]
+            except KeyError:
+                raise ValueError(f"lengths for Tensor field {field.name} not specified")
+            field_val = unpack_tensors(field_val, lengths)
+        elif field.type == dict[str, list[Any]]:
+            field_val = [
+                {k: [v[i]] for (k, v) in field_val.items()} for i in range(n_results)
+            ]
+        else:
+            raise ValueError(
+                f"While unpacking {cls}.{field.name}, unhandled type: {field.type}"
+            )
+        kwarg_lists[field.name] = field_val
+
+    # Construct outputs
     results = []
-    for i in range(len(self.n_timesteps)):
-        results.append(type(self)(**{k: v[i] for (k, v) in fields.items()}))
+    for i in range(n_results):
+        results.append(type(data)(**{k: v[i] for (k, v) in kwarg_lists.items()}))
 
     return results
 
