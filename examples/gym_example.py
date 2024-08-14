@@ -107,11 +107,8 @@ def train(cfg: GymConfig):
         for episode in train_episodes:
             trainer.add_episode(
                 episode,
-                rewards=episode["rewards"],
-                action_lls=episode["action_lls"],
-                terminated=episode["terminated"],
-                action_dists=episode["action_dists"],
-                any_actions_possible=episode["any_actions_possible"],
+                n_timesteps=len(episode["rewards"]),
+                memory_size=len(episode["rewards"]),
                 infos=episode["env_infos"] | episode["agent_infos"],
             )
         trainer.train_step()

@@ -169,7 +169,7 @@ class GymAgent(Agent):
         )
         return np.asarray(action.cpu()), infos
 
-    def forward(self, inputs: AgentInput) -> AgentOutput:
+    def forward(self, agent_input: AgentInput) -> AgentOutput:
         """Implements the OutRL forward pass API in terms of run_net().
 
         Args:
@@ -180,8 +180,11 @@ class GymAgent(Agent):
 
             A list of AgentOutput objects.
         """
-        episodes = inputs.episodes
-        observations, pack_lens = pack_tensors([ep["observations"] for ep in episodes])
+        episodes = agent_input.episodes
+        observations, n_observations = pack_tensors(
+            [ep["observations"] for ep in episodes]
+        )
+        n_timesteps = [n - 1 for n in n_observations]
         observations = observations.to(
             dtype=self._input_dtype, device=self._input_device
         )
@@ -193,7 +196,7 @@ class GymAgent(Agent):
             ]
         )
         actions = actions.to(dtype=self._input_dtype, device=self._input_device)
-        assert action_pack_lens == pack_lens
+        assert action_pack_lens == n_observations
         state_encodings, params, infos = self.run_net(observations)
         del infos
 
@@ -201,18 +204,20 @@ class GymAgent(Agent):
         action_lls = batch_dist.log_prob(actions).squeeze(-1)
         assert torch.isfinite(action_lls).all()
 
-        unpacked_params = {k: unpack_tensors(v, pack_lens) for (k, v) in params.items()}
+        unpacked_params = {
+            k: unpack_tensors(v, n_observations) for (k, v) in params.items()
+        }
         dists = [
             self.construct_dist({k: v[i][:-1] for (k, v) in unpacked_params.items()})[0]
             for i in range(len(episodes))
         ]
         action_lls_valid = truncate_packed(
-            action_lls, new_lengths=inputs.n_timesteps, to_cut=1
+            action_lls, new_lengths=n_timesteps, to_cut=1
         )
         return AgentOutput(
             state_encodings=state_encodings,
             action_lls=action_lls_valid,
-            n_timesteps=inputs.n_timesteps,
+            n_timesteps=n_timesteps,
             action_dists=dists,
             rewards=torch.cat([ep["rewards"] for ep in episodes]),
             original_action_lls=torch.cat([ep["action_lls"] for ep in episodes]),

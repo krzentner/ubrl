@@ -132,10 +132,10 @@ class CausalLMAgent(ubrl.Agent):
         ).sum()
         # Those same pad tokens (and only those) should be visible "through" the mask
         assert original_pad_count == masked_pad_count
-        reward_count = sum([len(ep.rewards) for ep in in_episodes])
+        rewards = torch.cat([ep.rewards for ep in in_episodes])
 
-        assert action_lls_mask.sum() == reward_count
-        assert state_encodings_mask.sum() == n_episodes + reward_count
+        assert action_lls_mask.sum() == len(rewards)
+        assert state_encodings_mask.sum() == n_episodes + len(rewards)
 
         task_desc_enc = self.tokenizer(
             self.encoder_task_description, return_tensors="pt"
@@ -161,11 +161,16 @@ class CausalLMAgent(ubrl.Agent):
         all_logits = [
             model_out.logits[i, real_logits_mask[i]] for i in range(n_episodes)
         ]
+        original_action_lls = torch.cat([ep.action_lls for ep in in_episodes])
+        terminated = torch.zeros(len(in_episodes), dtype=torch.bool)
 
         return ubrl.AgentOutput(
             state_encodings=state_encodings,
             action_lls=action_lls,
-            n_timesteps=inputs.n_timesteps,
+            n_timesteps=[ep.action_lls.shape[0] for ep in in_episodes],
+            rewards=rewards,
+            original_action_lls=original_action_lls,
+            terminated=terminated,
             # Only construct action dict on action tokens
             # action_dists=[Categorical(logits=logits)
             #               for logits in all_logits],
@@ -192,7 +197,6 @@ def check_padding(agent, episodes: list[LLMEpisode]):
         AgentInput(
             episodes=episodes,
             need_full=True,
-            n_timesteps=[ep.action_lls.shape[0] for ep in episodes],
         )
     )
     # Check that logits during generation match logits during forward pass
@@ -379,16 +383,14 @@ def train_llm_agent(cfg: LLMAgentConfig):
                 llm_agent, cfg.n_prompts, cfg.max_prompt_len, cfg.max_generation_len
             )
             for episode in train_episodes:
-                ep_len = len(episode.rewards)
-                action_mask = torch.ones(ep_len, dtype=torch.bool)
-                action_mask[0 : len(episode.prompt_ids)] = False
+                ep_len = len(episode.action_lls)
                 trainer.add_episode(
                     episode,
-                    rewards=episode.rewards,
-                    action_lls=episode.action_lls,
-                    # action_dists=episode.action_dist,
-                    terminated=False,
-                    any_actions_possible=action_mask,
+                    n_timesteps=ep_len,
+                    memory_size=ep_len**2,
+                    # Transformer models tend to use T^2 memory
+                    # It may make more sense to use a different function of
+                    # ep_len here, depending on the model architecture.
                 )
             train_stats = _episode_stats(train_episodes)
             noko.log_row(

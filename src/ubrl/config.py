@@ -58,17 +58,16 @@ class TrainerConfig(simple_parsing.Serializable):
     replay_buffer_episodes: int = 128
     """Maximum number of episodes to keep in replay buffer."""
 
-    minibatch_max_timesteps: Optional[int] = None
-    """Maximum number of timesteps to include in a forward pass to the agent.
+    minibatch_max_size: Optional[int] = None
+    """Maximum size to include in a forward pass to the agent.
     Used to avoid out-of-memory errors.
 
     Defaults to no limit. Automatically decreases on (most) memory errors.
     """
 
-    minibatch_target_timesteps: int = tunable(1024, low=1, high=50000, log=True)
-    """Attempt to use minibatches near this number of timesteps.
-    In practice, this acts a divisor on most losses and a minimum size of most
-    minibatches.
+    minibatch_target_size: int = tunable(1024, low=1, high=50000, log=True)
+    """Attempt to use minibatches near this total size.
+    In practice, this acts as a minimum size of most minibatches.
 
     Will still run whole episodes if they exceed this cap.
     """
@@ -100,6 +99,11 @@ class TrainerConfig(simple_parsing.Serializable):
     `vf_warmup_training_epochs`).
 
     Has no effect if train_step_timeout_seconds is None.
+    """
+
+    minibatch_norm_div: float = tunable(1024.0, low=1.0, high=4096.0, log=True)
+    """Divisor applied to all loss coefficients in place of taking .mean() over
+    the minibatch.
     """
 
     ppo_loss_coef: float = tunable(0.0, low=0.0, high=1000.0)

@@ -26,10 +26,9 @@ from typing import (
     Optional,
     Sequence,
     Union,
-    Callable,
     Tuple,
-    Optional,
 )
+import types
 import math
 
 import torch
@@ -474,7 +473,9 @@ def pad_packed(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
 
 
 def _is_optional(typ):
-    return typing.get_origin(typ) is Union and type(None) in typing.get_args(typ)
+    return typing.get_origin(typ) in (Union, types.UnionType) and type(
+        None
+    ) in typing.get_args(typ)
 
 
 def pack_dataclass(cls: type[T], instances: list[T]) -> T:
