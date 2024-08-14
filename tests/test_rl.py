@@ -1,5 +1,6 @@
 import torch
-from ubrl import _discount_cumsum, _v_trace_estimation
+from ubrl.torch_utils import _discount_cumsum
+from ubrl.torch_trainer import _v_trace_estimation
 
 
 def test_discount_cumsum():
@@ -32,7 +33,7 @@ def test_v_trace_estimation():
         action_lls=ones,
         original_action_lls=ones,
         terminated=terminated,
-        episode_lengths=T * torch.ones(B).long(),
+        n_timesteps=T * torch.ones(B).long(),
     )
 
     expected_advantages = torch.Tensor(
@@ -64,7 +65,7 @@ def test_v_trace_estimation():
         action_lls=ones,
         original_action_lls=ones,
         terminated=terminated,
-        episode_lengths=T * torch.ones(B).long(),
+        n_timesteps=T * torch.ones(B).long(),
     )
 
     expected_advantages = torch.Tensor(
@@ -97,7 +98,7 @@ def test_v_trace_estimation():
         action_lls=ones,
         original_action_lls=ones,
         terminated=terminated,
-        episode_lengths=T * torch.ones(B).long(),
+        n_timesteps=T * torch.ones(B).long(),
     )
 
     expected_advantages = torch.Tensor(

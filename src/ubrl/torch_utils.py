@@ -16,7 +16,9 @@ into a few categories:
 import copy
 import dataclasses
 from dataclasses import dataclass
+import typing
 from typing import (
+    Any,
     TypeVar,
     Callable,
     Generator,
@@ -408,6 +410,7 @@ def unpack_tensors(tensor: torch.Tensor, lengths: list[int]) -> list[torch.Tenso
     Inverse of pack_tensors.
     """
     assert isinstance(tensor, torch.Tensor)
+    assert tensor.shape[0] == sum(lengths)
     start_i = 0
     out = []
     for length in lengths:
@@ -468,6 +471,68 @@ def pack_padded(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
 def pad_packed(padded: torch.Tensor, lengths: list[int]) -> torch.Tensor:
     """Equivelant to `pad_tensors(unpack_tensors(...))`."""
     return pad_tensors(unpack_tensors(padded, lengths))
+
+
+def _is_optional(typ):
+    return typing.get_origin(typ) is Union and type(None) in typing.get_args(typ)
+
+
+def pack_dataclass(cls: type[T], instances: list[T]) -> T:
+    new_fields = {}
+    for field in dataclasses.fields(cls):
+        field_vals = [getattr(li, field.name) for li in instances]
+        if _is_optional(field.type):
+            if None in field_vals:
+                if field_vals != [None] * len(field_vals):
+                    raise ValueError(
+                        f"While packing {cls}.{field.name} mixed None and non-None entries"
+                    )
+                new_fields[field.name] = None
+            elif torch.Tensor in typing.get_args(field.type):
+                new_fields[field.name] = torch.cat(field_vals)
+            else:
+                new_fields[field.name] = concat_lists(field_vals)
+        elif typing.get_origin(field.type) == list:
+            new_fields[field.name] = concat_lists(field_vals)
+        elif field.type == torch.Tensor:
+            new_fields[field.name] = torch.cat(field_vals)
+        elif field.type == dict[str, list[Any]]:
+            keys = set(field_vals[0].keys())
+            for val in field_vals:
+                ks = set(val.keys())
+                if keys != ks:
+                    raise ValueError(
+                        f"While packing {cls}.{field.name}, inconsistent keys {keys} != {ks}"
+                    )
+            new_fields[field.name] = {
+                k: concat_lists([val[k] for val in field_vals]) for k in keys
+            }
+        else:
+            raise ValueError(
+                f"While packing {cls}.{field.name}, unhandled type: {field.type}"
+            )
+    return cls(**new_fields)
+
+
+def unpack_dataclass(data: T) -> list[T]:
+    fields = {}
+    for field in dataclasses.fields(self):
+        field_val = getattr(self, field.name)
+        if field.name == "original_action_dists" and field_val is None:
+            field_val = [None] * len(self.n_timesteps)
+        elif field.name in ["original_action_dists", "n_timesteps"]:
+            field_val = [[v] for v in field_val]
+        elif field.name in ("vf_targets", "vf_returns", "vf_loss_mask"):
+            field_val = tu.unpack_tensors(field_val, [n + 1 for n in self.n_timesteps])
+        else:
+            field_val = tu.unpack_tensors(field_val, self.n_timesteps)
+        fields[field.name] = field_val
+
+    results = []
+    for i in range(len(self.n_timesteps)):
+        results.append(type(self)(**{k: v[i] for (k, v) in fields.items()}))
+
+    return results
 
 
 @dataclass(eq=False)
@@ -742,6 +807,7 @@ def discount_cumsum(x: torch.Tensor, discount: float) -> torch.Tensor:
 
 ## Utilities not technically specific to torch
 
+
 def used_for_logging(*args):
     """No-op function used to document that a local variable is used for
     logging and should not be deleted.
@@ -770,3 +836,8 @@ def strict_zip(*args):
     for i in range(len(args_list[0])):
         results.append([a[i] for a in args_list])
     return results
+
+
+import hot_restart
+
+hot_restart.wrap_module()

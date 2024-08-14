@@ -23,32 +23,7 @@ from tqdm import tqdm
 
 import noko
 
-from ubrl.torch_utils import (
-    approx_entropy_of,
-    entropy_of,
-    force_concat,
-    make_mlp,
-    pack_tensors,
-    pad_packed,
-    pad_tensors,
-    softmax_clip,
-    unpad_tensors,
-    pack_padded,
-    explained_variance,
-    unpack_tensors,
-    pack_tensors_check,
-    RunningMeanVar,
-    make_scheduler,
-    DictDataset,
-    ActionDist,
-    kl_div_of,
-    approx_kl_div_of,
-    used_for_logging,
-    discount_cumsum,
-    truncate_packed,
-    concat_lists,
-    strict_zip,
-)
+import ubrl.torch_utils as tu
 import ubrl.torch_cluster
 from ubrl.config import TrainerConfig
 
@@ -82,7 +57,7 @@ class _EpisodeData:
     Do not require gradients.
     """
 
-    original_action_dists: Optional[ActionDist]
+    original_action_dists: Optional[tu.ActionDist]
     """Original action distributions optionally provided when the episode was
     added."""
 
@@ -182,7 +157,7 @@ class LossInput:
 
     n_timesteps: list[int]
 
-    original_action_dists: Optional[list[ActionDist]]
+    original_action_dists: Optional[list[tu.ActionDist]]
     """Copied from `TorchTrainer.add_episode()`."""
 
     def __post_init__(self):
@@ -211,13 +186,11 @@ class LossInput:
                     assert field_vals == [None] * len(field_vals)
                     new_fields[field.name] = None
                 else:
-                    new_fields[field.name] = concat_lists(field_vals)
+                    new_fields[field.name] = tu.concat_lists(field_vals)
             elif field.name == "n_timesteps":
-                new_fields[field.name] = concat_lists(field_vals)
+                new_fields[field.name] = tu.concat_lists(field_vals)
             else:
-                new_fields[field.name] = torch.cat(
-                    [getattr(li, field.name) for li in loss_inputs]
-                )
+                new_fields[field.name] = torch.cat(field_vals)
         return cls(**new_fields)
 
     def split(self) -> list["LossInput"]:
@@ -229,9 +202,11 @@ class LossInput:
             elif field.name in ["original_action_dists", "n_timesteps"]:
                 field_val = [[v] for v in field_val]
             elif field.name in ("vf_targets", "vf_returns", "vf_loss_mask"):
-                field_val = unpack_tensors(field_val, [n + 1 for n in self.n_timesteps])
+                field_val = tu.unpack_tensors(
+                    field_val, [n + 1 for n in self.n_timesteps]
+                )
             else:
-                field_val = unpack_tensors(field_val, self.n_timesteps)
+                field_val = tu.unpack_tensors(field_val, self.n_timesteps)
             fields[field.name] = field_val
 
         results = []
@@ -309,7 +284,7 @@ class TorchTrainer:
         self._state_encoding_size = self.agent.state_encoding_size
 
         # Will be passed through accelerator in _setup_optimizers
-        self.vf: nn.Module = make_mlp(
+        self.vf: nn.Module = tu.make_mlp(
             input_size=self._state_encoding_size,
             hidden_sizes=self.cfg.vf_hidden_sizes,
             output_size=0,
@@ -322,8 +297,8 @@ class TorchTrainer:
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer: RunningMeanVar = self.cluster.prepare_module(
-            RunningMeanVar(use_mean=False)
+        self.reward_normalizer: tu.RunningMeanVar = self.cluster.prepare_module(
+            tu.RunningMeanVar(use_mean=False)
         )
         """Normalized used to make rewards have unit variance if
         cfg.normalize_rewards is True."""
@@ -384,7 +359,7 @@ class TorchTrainer:
                 weight_decay=self.cfg.agent_weight_decay,
             ),
         )
-        self.agent_lr_scheduler = make_scheduler(
+        self.agent_lr_scheduler = tu.make_scheduler(
             self.agent_optimizer,
             self.cfg.agent_lr_schedule,
             self.cfg.agent_lr_start,
@@ -399,7 +374,7 @@ class TorchTrainer:
                 weight_decay=self.cfg.vf_weight_decay,
             ),
         )
-        self.vf_lr_scheduler = make_scheduler(
+        self.vf_lr_scheduler = tu.make_scheduler(
             self.vf_optimizer,
             self.cfg.vf_lr_schedule,
             self.cfg.vf_lr_start,
@@ -439,7 +414,7 @@ class TorchTrainer:
         loss = ppo_loss + awr_loss + vf_loss + kl_loss + entropy_loss + inherent_loss
 
         # *_infos will all get included in locals of this method
-        used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos, entropy_infos)
+        tu.used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos, entropy_infos)
         return loss, locals()
 
     def _ppo_loss(
@@ -469,7 +444,7 @@ class TorchTrainer:
         awr_loss = -agent_output.action_lls * loss_input.exp_advantages
 
         log_probs_scale = agent_output.action_lls.detach().abs().mean()
-        used_for_logging(log_probs_scale)
+        tu.used_for_logging(log_probs_scale)
         norm_coef = self.cfg.awr_loss_coef / (self.cfg.minibatch_target_timesteps)
 
         awr_loss_scaled = norm_coef * awr_loss.sum()
@@ -504,9 +479,9 @@ class TorchTrainer:
         # Approximate per-timestep KL by multiplying back in the number of timesteps
 
         total_timesteps = sum(loss_input.n_timesteps)
-        approx_kl = total_timesteps * approx_kl_div_of(old_log_probs, log_probs)
+        approx_kl = total_timesteps * tu.approx_kl_div_of(old_log_probs, log_probs)
         total_approx_kl = approx_kl.sum()
-        used_for_logging(total_approx_kl)
+        tu.used_for_logging(total_approx_kl)
         new_dists = agent_output.action_dists
         old_dists = loss_input.original_action_dists
         assert (new_dists is None) == (
@@ -521,7 +496,7 @@ class TorchTrainer:
         ):
             # TODO: Add options for other KL directions
             try:
-                kl = kl_div_of(old_dists, new_dists)
+                kl = tu.kl_div_of(old_dists, new_dists)
             except NotImplementedError:
                 kl = approx_kl
         else:
@@ -563,7 +538,7 @@ class TorchTrainer:
 
         kl_mean = kl.mean()
         kl_max = kl.max()
-        used_for_logging(kl_mean, kl_max)
+        tu.used_for_logging(kl_mean, kl_max)
 
         norm_coef = kl_coef / self.cfg.minibatch_target_timesteps
 
@@ -644,7 +619,7 @@ class TorchTrainer:
             entropy_target = entropy.mean()
             entropy_loss = torch.tensor(0.0)
 
-        used_for_logging(approx_entropy)
+        tu.used_for_logging(approx_entropy)
         infos = locals()
         del infos["self"]
         return entropy_loss, infos
@@ -713,7 +688,7 @@ class TorchTrainer:
         loss_input = self.loss_inputs_of(rb_inputs, cache_out)
         loss_inputs = {
             ep_data.episode_id: loss_in
-            for (ep_data, loss_in) in strict_zip(
+            for (ep_data, loss_in) in tu.strict_zip(
                 self._replay_buffer, loss_input.split()
             )
         }
@@ -783,7 +758,7 @@ class TorchTrainer:
                 loss_input = self.loss_inputs_of(rb_inputs, cache_out)
                 loss_inputs = {
                     ep_data.episode_id: loss_in
-                    for (ep_data, loss_in) in strict_zip(
+                    for (ep_data, loss_in) in tu.strict_zip(
                         self._replay_buffer, loss_input.split()
                     )
                 }
@@ -843,7 +818,7 @@ class TorchTrainer:
 
         agent_out = cached_agent.cached_forward(self._replay_buffer)
         state_enc_packed = agent_out.state_encodings
-        action_lls_now = pad_packed(agent_out.action_lls, agent_out.n_timesteps)
+        action_lls_now = tu.pad_packed(agent_out.action_lls, agent_out.n_timesteps)
         obs_lens = [ep_data.n_timesteps + 1 for ep_data in self._replay_buffer]
 
         assert (
@@ -852,14 +827,14 @@ class TorchTrainer:
         assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         padded_rewards = self.cluster.prepare_tensor(
-            pad_tensors([data.rewards for data in self._replay_buffer])
+            tu.pad_tensors([data.rewards for data in self._replay_buffer])
         )
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
             rewards_normed = padded_rewards
 
-        original_action_lls = pad_tensors(
+        original_action_lls = tu.pad_tensors(
             [data.original_action_lls for data in self._replay_buffer]
         )
 
@@ -877,7 +852,7 @@ class TorchTrainer:
                     or self.cfg.vf_recompute_targets
                 ):
                     vf_x_packed = self.vf(state_enc_packed)
-                    vf_x = pad_packed(vf_x_packed, obs_lens)
+                    vf_x = tu.pad_packed(vf_x_packed, obs_lens)
 
                     # TODO(krzentner): Refactor / eliminate this loop
                     for i, episode_length in enumerate(n_timesteps):
@@ -901,10 +876,10 @@ class TorchTrainer:
                             n_timesteps=torch.tensor(n_timesteps),
                         )
 
-                    vf_targets_packed = pack_padded(vf_targets, obs_lens)
+                    vf_targets_packed = tu.pack_padded(vf_targets, obs_lens)
 
                 # pyright doesn't understand that epoch 0 is guaranteed to happen first
-                dataset = DictDataset(
+                dataset = tu.DictDataset(
                     state_encodings=state_enc_packed, vf_targets=vf_targets_packed
                 )
                 for batch in dataset.minibatches(self.cfg.vf_minibatch_size):
@@ -931,19 +906,21 @@ class TorchTrainer:
 
     def _log_dataset(self, loss_input: LossInput):
         full_episode_rewards = self.cluster.prepare_tensor(
-            pad_tensors([data.rewards for data in self._replay_buffer])
+            tu.pad_tensors([data.rewards for data in self._replay_buffer])
         )
         ep_lengths = [len(data.rewards) for data in self._replay_buffer]
-        discounted_returns = pack_padded(
-            discount_cumsum(full_episode_rewards, discount=1 - self.cfg.discount_inv),
+        discounted_returns = tu.pack_padded(
+            tu.discount_cumsum(
+                full_episode_rewards, discount=1 - self.cfg.discount_inv
+            ),
             ep_lengths,
         )
-        vf_returns_no_final = truncate_packed(
+        vf_returns_no_final = tu.truncate_packed(
             loss_input.vf_returns, new_lengths=loss_input.n_timesteps, to_cut=1
         )
         dataset_stats = {
             "episode_total_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
-            "vf_explained_variance": explained_variance(
+            "vf_explained_variance": tu.explained_variance(
                 vf_returns_no_final,
                 discounted_returns,
             ),
@@ -953,7 +930,7 @@ class TorchTrainer:
             "total_env_steps": self.total_env_steps,
         }
         for k in self._replay_buffer[0].infos.keys():
-            dataset_stats[k] = force_concat(
+            dataset_stats[k] = tu.force_concat(
                 [data.infos[k] for data in self._replay_buffer]
             )
 
@@ -976,8 +953,10 @@ class TorchTrainer:
         n_timesteps = agent_input.n_timesteps
 
         state_encodings = agent_output.state_encodings.detach()
-        action_lls_now = pad_packed(agent_output.action_lls.detach(), n_timesteps)
-        original_action_lls = pad_packed(agent_input.original_action_lls, n_timesteps)
+        action_lls_now = tu.pad_packed(agent_output.action_lls.detach(), n_timesteps)
+        original_action_lls = tu.pad_packed(
+            agent_input.original_action_lls, n_timesteps
+        )
 
         with torch.no_grad():
             # TODO(krzentner): split up this call if necessary
@@ -985,7 +964,7 @@ class TorchTrainer:
         self.agent.train(mode=True)
         self.vf.train(mode=True)
 
-        vf_returns = pad_packed(vf_returns_packed, obs_lens)
+        vf_returns = tu.pad_packed(vf_returns_packed, obs_lens)
         vf_loss_masks = []
 
         # TODO(krzentner): Refactor / eliminate this loop
@@ -1005,7 +984,7 @@ class TorchTrainer:
                 assert ep_loss_mask[-1] == 0.0
             vf_loss_masks.append(ep_loss_mask)
 
-        padded_rewards = pad_packed(agent_input.rewards, n_timesteps)
+        padded_rewards = tu.pad_packed(agent_input.rewards, n_timesteps)
         if self.cfg.normalize_rewards:
             rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
         else:
@@ -1027,7 +1006,7 @@ class TorchTrainer:
             n_timesteps=self.cluster.prepare_tensor(torch.tensor(n_timesteps)),
         )
 
-        adv_packed = pack_padded(padded_advantages, n_timesteps)
+        adv_packed = tu.pack_padded(padded_advantages, n_timesteps)
         assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
 
         if self.cfg.normalize_awr_advantages:
@@ -1040,7 +1019,7 @@ class TorchTrainer:
         if self.cfg.awr_temperature >= 1000:
             heated_adv = adv_packed / self.cfg.awr_temperature
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-            softmax_adv = softmax_clip(heated_adv, max_exp_adv)
+            softmax_adv = tu.softmax_clip(heated_adv, max_exp_adv)
             awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
             normed_exp_adv = softmax_adv * len(softmax_adv)
             assert (
@@ -1050,11 +1029,11 @@ class TorchTrainer:
             awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
 
-        vf_loss_mask = pack_tensors_check(vf_loss_masks, obs_lens)
+        vf_loss_mask = tu.pack_tensors_check(vf_loss_masks, obs_lens)
         loss_input = LossInput(
             advantages=adv_packed,
-            vf_returns=pack_padded(vf_returns, obs_lens),
-            vf_targets=pack_padded(vf_targets, obs_lens),
+            vf_returns=tu.pack_padded(vf_returns, obs_lens),
+            vf_targets=tu.pack_padded(vf_targets, obs_lens),
             vf_loss_mask=vf_loss_mask,
             exp_advantages=normed_exp_adv,
             original_action_lls=agent_input.original_action_lls,
@@ -1062,7 +1041,7 @@ class TorchTrainer:
             n_timesteps=n_timesteps,
         )
 
-        used_for_logging(awr_clip_ratio)
+        tu.used_for_logging(awr_clip_ratio)
         infos = locals()
         del infos["self"]
         del infos["n_timesteps"]
@@ -1081,7 +1060,7 @@ class TorchTrainer:
         rewards: torch.Tensor,
         action_lls: torch.Tensor,
         terminated: bool,
-        action_dists: Optional[ActionDist] = None,
+        action_dists: Optional[tu.ActionDist] = None,
         any_actions_possible: Optional[torch.Tensor] = None,
         weight: float = 1.0,
         infos: Optional[dict[str, torch.Tensor]] = None,
@@ -1097,7 +1076,7 @@ class TorchTrainer:
             terminated (bool): True if the episode ended in a terminal state,
                 and False if the episode timed-out, was abandoned, or is still
                 ongoing.
-            action_dists (Optional[ActionDist]): Optional original action
+            action_dists (Optional[tu.ActionDist]): Optional original action
                 distributions. Used to compute exact KL divergence and entropy
                 regularization depending on the config.
             any_actions_possible (Optional[torch.Tensor]): Boolean Tensor
@@ -1339,16 +1318,16 @@ class TorchTrainer:
         ), "agent optimizer not optimizing ageint"
 
     def _entropy_of(
-        self, action_lls: torch.Tensor, action_dists: Optional[ActionDist]
+        self, action_lls: torch.Tensor, action_dists: Optional[tu.ActionDist]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes the approximate entropy (and exact entropy, if possible)."""
-        approx_entropy = approx_entropy_of(action_lls)
+        approx_entropy = tu.approx_entropy_of(action_lls)
         entropy = None
         if not self.cfg.use_approx_entropy:
             try:
                 # Mixed case is warned on add_episode()
                 if action_dists is not None:
-                    entropy = entropy_of(action_dists)
+                    entropy = tu.entropy_of(action_dists)
             except NotImplementedError:
                 pass
         if entropy is None:
@@ -1462,7 +1441,26 @@ class AgentOutput:
     which are requested by AgentInput.need_full.
     """
 
-    action_dists: Optional[list[ActionDist]] = None
+    terminated: torch.Tensor
+    """Boolean Tensor indicating if the episode reached a terminal state.
+    Should have length equal to the number of episodes.
+    Should contain False for an episode in an infinite horizon MDPs or when an
+    episode reaches a timeout."""
+
+    original_action_lls: torch.Tensor
+    """Original action lls provided when the episode was added. Used for
+    v-trace off-policy correction and in the PPO loss (when enabled).
+    Packed into a single dimansion.
+
+    Do not require gradients.
+    """
+
+    rewards: torch.Tensor
+    """Rewards acquired in the episode. Should be packed into a single
+    dimension of the same shape as the action_lls (i.e. sum(n_timesteps)).
+    """
+
+    action_dists: Optional[list[tu.ActionDist]] = None
     """Distribution used to generate actions.
 
     Will be used for the KL penalty if not None and `cfg.use_approx_kl` is False.
@@ -1470,6 +1468,10 @@ class AgentOutput:
     Will be used for entropy regularization if not None and `cfg.approx_entropy`
     is False.
     """
+
+    original_action_dists: Optional[tu.ActionDist] = None
+    """Original action distributions optionally provided when the episode was
+    added."""
 
     valid_mask: Optional[torch.Tensor] = None
     """Mask of timesteps where `state_encodings` and `action_lls` were computed
@@ -1505,7 +1507,13 @@ class AgentOutput:
             len(self.action_lls.shape) == 1
         ), "action_lls should have exactly one dimension"
         assert (
-            sum(self.n_timesteps) == self.action_lls.shape[0]
+            self.action_lls.shape[0] == sum(self.n_timesteps)
+        ), "Total number of timesteps does not match number of provided action_lls"
+        assert (
+            len(self.original_action_lls.shape) == 1
+        ), "action_lls should have exactly one dimension"
+        assert (
+            self.original_action_lls.shape[0] == sum(self.n_timesteps)
         ), "Total number of timesteps does not match number of provided action_lls"
         assert (
             self.state_encodings.shape[0] != self.action_lls.shape[0]
@@ -1550,49 +1558,55 @@ class AgentOutput:
         """Splits an `AgentOutput` into one `AgentOutput` per episode.
         Used by `CachedAgent` to cache individual episode outputs.
         """
-        n_timesteps = self.n_timesteps
-        if n_timesteps is None:
-            raise ValueError("Cannot split AgentOutput with no n_timesteps")
 
-        action_lens = n_timesteps
-        obs_lens = [n + 1 for n in n_timesteps]
-        state_encodings = unpack_tensors(self.state_encodings, obs_lens)
-        action_lls = unpack_tensors(self.action_lls, action_lens)
+        _OPTIONAL_FIELDS = (
+            "action_dists",
+            "original_action_dists",
+            "valid_mask",
+            "inherent_loss",
+        )
 
-        # Really pyright? This type is immutable
-        self_valid_mask = self.valid_mask
-        if self_valid_mask is not None:
-            valid_masks = unpack_tensors(self_valid_mask, obs_lens)
-        else:
-            valid_masks = None
+        obs_lens = [n + 1 for n in self.n_timesteps]
+        fields = {}
+        for field in dataclasses.fields(self):
+            field_val = getattr(self, field.name)
+            if field.name in _OPTIONAL_FIELDS and field_val is None:
+                field_val = [None] * len(self.n_timesteps)
+            elif field.name in _OPTIONAL_FIELDS or field.name == "n_timesteps":
+                field_val = [[v] for v in field_val]
+            elif field.name in ("terminated"):
+                field_val = field_val.unsqueeze(-1)
+            elif field.name in ("state_encodings",):
+                field_val = tu.unpack_tensors(field_val, obs_lens)
+            elif field.name == "infos":
+                continue
+            else:
+                field_val = tu.unpack_tensors(field_val, self.n_timesteps)
+            fields[field.name] = field_val
 
-        action_lls = unpack_tensors(self.action_lls, action_lens)
         results = []
-        for i, length in enumerate(n_timesteps):
-            if self.inherent_loss is None:
-                inherent_loss = None
-            else:
-                inherent_loss = self.inherent_loss[i, None]
-            if self.action_dists is None:
-                action_dists = None
-            else:
-                action_dists = [self.action_dists[i]]
-            if valid_masks is None:
-                valid_mask = None
-            else:
-                valid_mask = valid_masks[i]
-            results.append(
-                AgentOutput(
-                    state_encodings=state_encodings[i],
-                    action_lls=action_lls[i],
-                    n_timesteps=[length],
-                    action_dists=action_dists,
-                    valid_mask=valid_mask,
-                    inherent_loss=inherent_loss,
-                    infos={k: v[i] for (k, v) in self.infos.items()},
-                )
-            )
+        for i in range(len(self.n_timesteps)):
+            args = {k: v[i] for (k, v) in fields.items()}
+            args["infos"] = {k: [v[i]] for (k, v) in self.infos.items()}
+            results.append(type(self)(**args))
         return results
+
+    @classmethod
+    def pack(cls, agent_outputs: list["AgentOutput"]) -> "AgentOutput":
+        return tu.pack_dataclass(cls, agent_outputs)
+
+    def detach(self) -> "AgentOutput":
+        detached = dataclasses.replace(
+            self,
+            state_encodings=self.state_encodings.detach(),
+            action_lls=self.action_lls.detach(),
+        )
+        for field_name, field_val in vars(detached).items():
+            if isinstance(field_val, torch.Tensor) and field_val.requires_grad:
+                raise ValueError(
+                    f"AgentOutput.{field_name} should not require_grad after being detached"
+                )
+        return detached
 
 
 @dataclass(eq=False)
@@ -1622,7 +1636,7 @@ class AgentInput:
     """Boolean tensor containing one value per episode indicating if that
     episode was terminated."""
 
-    original_action_dists: Optional[list[ActionDist]] = None
+    original_action_dists: Optional[list[tu.ActionDist]] = None
     """Action dists when episodes where originally collected. `None` if action
     distributions were not provided in `TorchTrainer.add_episode()`."""
 
@@ -1641,10 +1655,10 @@ class AgentInput:
     def from_episode_data(cls, episode_data: list[_EpisodeData], need_full: bool):
         episodes = [ep_data.episode for ep_data in episode_data]
         n_timesteps = [ep_data.n_timesteps for ep_data in episode_data]
-        packed_rewards = pack_tensors_check(
+        packed_rewards = tu.pack_tensors_check(
             [ep_data.rewards for ep_data in episode_data], n_timesteps
         )
-        original_act_lls = pack_tensors_check(
+        original_act_lls = tu.pack_tensors_check(
             [ep_data.original_action_lls for ep_data in episode_data], n_timesteps
         )
         terminated = torch.zeros(len(episode_data), dtype=torch.bool)
@@ -1654,7 +1668,7 @@ class AgentInput:
         act_dists = [ep_data.original_action_dists for ep_data in episode_data]
 
         if None not in act_dists:
-            original_act_dists: Optional[list[ActionDist]] = act_dists
+            original_act_dists: Optional[list[tu.ActionDist]] = act_dists
         else:
             assert all([dist is None for dist in act_dists])
             original_act_dists = None
@@ -1684,19 +1698,21 @@ class CachedAgent:
         self.agent: Agent = agent
         self.cfg = cfg
         self.cluster = cluster
-        self.state_encodings_cache: dict[EpisodeID, torch.Tensor] = {}
-        self.action_lls_cache: dict[EpisodeID, torch.Tensor] = {}
+        # self.state_encodings_cache: dict[EpisodeID, torch.Tensor] = {}
+        # self.action_lls_cache: dict[EpisodeID, torch.Tensor] = {}
+        self.agent_out_cache: dict[EpisodeID, AgentOutput] = {}
 
     def clear_caches(self):
-        self.state_encodings_cache = {}
-        self.action_lls_cache = {}
+        self.agent_out_cache = {}
+        # self.state_encodings_cache = {}
+        # self.action_lls_cache = {}
 
     def fill_caches(self, episode_data: list[_EpisodeData]):
         """Ensure that all episodes in `episode_data` have cached values."""
         missing_episodes = [
             ep_data
             for ep_data in episode_data
-            if ep_data.episode_id not in self.state_encodings_cache
+            if ep_data.episode_id not in self.agent_out_cache
         ]
         with torch.no_grad():
             for minibatch in _minibatch_episodes(
@@ -1717,18 +1733,12 @@ class CachedAgent:
         gradients (they are "detached").
         """
         self.fill_caches(episode_data)
-        n_timesteps = [ep.n_timesteps for ep in episode_data]
-        state_encodings = torch.cat(
-            [self.state_encodings_cache[ep.episode_id] for ep in episode_data]
-        )
-        action_lls = torch.cat(
-            [self.action_lls_cache[ep.episode_id] for ep in episode_data]
-        )
-        return AgentOutput(
-            state_encodings=state_encodings,
-            action_lls=action_lls,
-            n_timesteps=n_timesteps,
-        )
+        agent_outputs = [
+            self.agent_out_cache[ep_data.episode_id] for ep_data in episode_data
+        ]
+        for output in agent_outputs:
+            assert len(output.n_timesteps) == 1, "More than one episode in cached AgentOutput"
+        return AgentOutput.pack(agent_outputs)
 
     def agent_forward(
         self, episode_data: list[_EpisodeData], need_full: bool
@@ -1752,8 +1762,7 @@ class CachedAgent:
         if agent_output.full_valid():
             for i, output in enumerate(agent_output.split()):
                 episode_id = episode_data[i].episode_id
-                self.state_encodings_cache[episode_id] = output.state_encodings.detach()
-                self.action_lls_cache[episode_id] = output.action_lls.detach()
+                self.agent_out_cache[episode_id] = output.detach()
         else:
             total_valid = agent_output.valid_mask.sum().item()
             total_timesteps = sum(expected_lengths)

@@ -34,6 +34,7 @@ from ubrl.torch_utils import (
     clamp_identity_grad,
     soft_clamp,
     truncate_packed,
+    concat_lists,
 )
 
 
@@ -213,6 +214,20 @@ class GymAgent(Agent):
             action_lls=action_lls_valid,
             n_timesteps=inputs.n_timesteps,
             action_dists=dists,
+            rewards=torch.cat([ep["rewards"] for ep in episodes]),
+            original_action_lls=torch.cat([ep["action_lls"] for ep in episodes]),
+            terminated=torch.tensor(
+                [ep["terminated"] for ep in episodes], dtype=torch.bool
+            ),
+            original_action_dists=[ep["action_dists"] for ep in episodes],
+            infos={
+                k: concat_lists([ep["env_infos"][k] for ep in episodes])
+                for k in episodes[0]["env_infos"].keys()
+            }
+            | {
+                k: concat_lists([ep["agent_infos"][k] for ep in episodes])
+                for k in episodes[0]["agent_infos"].keys()
+            },
         )
 
 
