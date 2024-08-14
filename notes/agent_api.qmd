@@ -31,6 +31,7 @@ class ExampleAgent(Agent):
         self._action_tail = nn.Linear(HIDDEN_DIM, ACT_DIM)
 
     def forward(self, agent_input: AgentInput) -> AgentOutput:
+        n_timesteps = [ep['acts'].shape[0] for ep in agent_input.episodes]
         state_encodings = self._encoder(torch.cat(
             [ep['obs'] for ep in agent_input.episodes]))
 
@@ -38,7 +39,7 @@ class ExampleAgent(Agent):
         # encodings to compute actions.
         non_final_states = truncate_packed(
             state_encodings,
-            new_lengths=agent_input.n_timesteps,
+            new_lengths=n_timesteps,
             to_cut=1
         )
 
@@ -51,9 +52,14 @@ class ExampleAgent(Agent):
         ).squeeze(-1)
 
         return AgentOutput(
-                state_encodings=state_encodings,
-                action_lls=taken_action_lls,
-                n_timesteps=agent_input.n_timesteps)
+            state_encodings=state_encodings,
+            action_lls=taken_action_lls,
+            n_timesteps=n_timesteps,
+            rewards=torch.cat([ep['rew'] for ep in agent_input.episodes]),
+            terminated=torch.tensor([ep['term'] for ep in agent_input.episodes],
+                                    dtype=torch.bool),
+            original_action_lls=torch.cat([ep['orig_lls'] for ep in agent_input.episodes]),
+        )
 
 agent = ExampleAgent()
 ```
@@ -86,7 +92,13 @@ The above example shows a few key points of the API:
   the action taked during the episode for each non-final state (and
   consequently one fewer elements per episode than the number of
   `state_encodings`). This is implemented using `truncate_packed` in the above
-  example.
+  example. 
+- The `AgentOutput` also contains important information for optimizing the
+  agent, notably `rewards`, `terminated`, and `original_action_lls`.
+  These values are typically constant for an episode, but UBRL allows providing
+  them late in case these values depend on the output of the model. For
+  example, if you are using a reward model that shares parameters with your
+  agent.
 - Both `state_encodings` and `action_lls` for all episodes are concatenated,
   since episodes may be of different lengths. If all of your episodes are
   similar lengths, you may find `ubrl.torch_utils.pad_packed` to be useful.
@@ -105,9 +117,7 @@ them to the trainer like so:
 my_episode = my_episode_collector.collect(agent)
 trainer.add_episode(
     episode=my_episode,
-    rewards=my_episode['rewards'],
-    action_lls=my_episode['act_lls'],
-    terminated=False)
+    n_timesteps=len(my_episode['act_lls']))
 ```
 
 Suppose you've added a set of episodes like the following:
@@ -115,30 +125,20 @@ Suppose you've added a set of episodes like the following:
 ```{python}
 from math import prod
 example_t = lambda *shape: torch.arange(prod(shape), dtype=torch.float).reshape(shape)
+example_ep = lambda ep_len, term: {
+    'obs': example_t(ep_len + 1, OBS_DIM),
+    'acts': torch.arange(ep_len) % ACT_DIM,
+    'rew': example_t(ep_len),
+    'orig_lls': example_t(ep_len),
+    'term': term,
+}
 
 episodes = [
-    {'obs': example_t(10, OBS_DIM), 'acts': torch.arange(9) % ACT_DIM },
-    {'obs': example_t(5, OBS_DIM), 'acts': torch.arange(4) % ACT_DIM },
-    {'obs': example_t(3, OBS_DIM), 'acts': torch.arange(2) % ACT_DIM },
-    {'obs': example_t(20, OBS_DIM), 'acts': torch.arange(19) % ACT_DIM },
-    {'obs': example_t(31, OBS_DIM), 'acts': torch.arange(30) % ACT_DIM },
-]
-rewards = [
-    example_t(9),
-    example_t(4),
-    example_t(2),
-    example_t(19),
-    example_t(30),
-]
-original_action_lls = [
-    torch.zeros(rew.shape[0]) for rew in rewards
-]
-terminated = [
-    False,
-    False,
-    False,
-    True,
-    True
+    example_ep(10, True),
+    example_ep(5, False),
+    example_ep(5, True),
+    example_ep(9, False),
+    example_ep(4, False),
 ]
 ```
 
@@ -147,56 +147,61 @@ and construct a `AgentInput` for each minibatch, in a procedure similar to but
 more complex than the following:
 
 ```{python}
-from ubrl.torch_utils import discount_cumsum
+from ubrl.torch_utils import discount_cumsum, unpack_tensors
 
 # Optimizers and VF are stored in TorchTrainer across training steps
 vf = nn.Linear(HIDDEN_DIM, 1)
 vf_opt = torch.optim.Adam(vf.parameters())
 agent_opt = torch.optim.Adam(agent.parameters())
 
-for minibatch_indices in [[0, 1, 2], [3, 4]]:
-    n_timesteps = [rewards[i].shape[0] for i in minibatch_indices]
-
+TARGET_MINIBATCH_SIZE = 10
+# minibatches of target size 10
+for minibatch_indices in [[0], [1, 2], [3, 4]]:
     agent_input = AgentInput(
         episodes=[episodes[i] for i in minibatch_indices],
-        rewards=torch.cat([rewards[i] for i in minibatch_indices]),
-        n_timesteps=n_timesteps,
-        original_action_lls=torch.cat([original_action_lls[i] for i in minibatch_indices]),
-        terminated=torch.tensor([terminated[i] for i in minibatch_indices], dtype=torch.bool)
     )
     agent_output = agent(agent_input)
     vf_x = vf(agent_output.state_encodings).squeeze()
 
-    final_state_idx = list(n_timesteps)
+    final_state_idx = list(agent_output.n_timesteps)
     for j in range(1, len(final_state_idx)):
         final_state_idx[j] += final_state_idx[j - 1]
 
+    rewards = unpack_tensors(
+        agent_output.rewards, agent_output.n_timesteps)
+
     # Extend rewards with VF estimate.
-    inf_horizon_rewards = [torch.cat([rewards[i],
-                                      vf_x[final_state_idx[j]].detach().unsqueeze(-1)
-                                      if not terminated[i] else torch.zeros(1)])
-                           for (j, i) in enumerate(minibatch_indices)]
+    inf_horizon_rewards = []
+    for i in range(len(minibatch_indices)):
+        if agent_output.terminated[i]:
+            final_state_reward = torch.zeros(1)
+        else:
+            final_state_reward = vf_x[final_state_idx[i]].detach().unsqueeze(-1)
+        inf_horizon_rewards.append(
+            torch.cat([rewards[i], final_state_reward])
+        )
 
     # Compute discounted returns and naive advantages.
     # ubrl will use V-Trace (lambda) instead.
     returns = torch.cat([
-        discount_cumsum(inf_horizon_rewards[j].unsqueeze(0), 0.9).squeeze(0)
-        for j in range(len(minibatch_indices))
+        discount_cumsum(inf_horizon_rewards[i].unsqueeze(0), 0.9).squeeze(0)
+        for i in range(len(minibatch_indices))
     ])
     advantages = truncate_packed(
         returns - vf_x,
-        new_lengths=n_timesteps,
+        new_lengths=agent_output.n_timesteps,
         to_cut=1
     )
-    vf_loss = (vf_x - returns)**2
 
-    pi_loss = -advantages * (agent_output.action_lls - agent_input.original_action_lls).exp()
-    approx_kl_loss = agent_input.original_action_lls.exp() * (
-        agent_output.action_lls - agent_input.original_action_lls)
+    vf_loss = (vf_x - returns)**2
+    pi_loss = -advantages * (
+        agent_output.action_lls - agent_output.original_action_lls).exp()
+    approx_kl_loss = agent_output.original_action_lls.exp() * (
+        agent_output.action_lls - agent_output.original_action_lls)
 
     loss = (pi_loss.sum() +
             0.1 * vf_loss.sum() +
-            0.1 * approx_kl_loss.sum()) / sum(n_timesteps)
+            0.1 * approx_kl_loss.sum()) / TARGET_MINIBATCH_SIZE
     loss.backward()
     agent_opt.step()
     vf_opt.step()
@@ -204,10 +209,8 @@ for minibatch_indices in [[0, 1, 2], [3, 4]]:
 
 ## Optional `AgentInput` and `AgentOutput` Fields
 
-TODO(krzentner): Fix link to reference documentation
-
-For detailed descriptions of each `AgentInput` and `AgentOuput` field, see the
-[reference documentation](docs/ubrl/torch_trainer.py#AgentInput).
+For detailed descriptions of each `AgentOuput` field, see the
+[reference documentation](docs/ubrl/torch_trainer.py#AgentOutput).
 
 The main fields to be aware of on `AgentOutput` are:
 
