@@ -533,12 +533,12 @@ def unpack_dataclass(data: T, packed_lengths: dict[str, list[int]]) -> list[T]:
     # Split fields into arguments
     kwarg_lists = {}
     for field in dataclasses.fields(data):
-        field_val = getattr(T, field.name)
+        field_val = getattr(data, field.name)
         if _is_optional(field.type) and field_val is None:
             field_val = [None] * n_results
-        elif typing.get_origin(field.type) == list:
+        elif typing.get_origin(field.type) == list or isinstance(field_val, list):
             field_val = [[v] for v in field_val]
-        elif field.type == torch.Tensor:
+        elif field.type == torch.Tensor or isinstance(field_val, torch.Tensor):
             try:
                 lengths = packed_lengths[field.name]
             except KeyError:
@@ -550,7 +550,7 @@ def unpack_dataclass(data: T, packed_lengths: dict[str, list[int]]) -> list[T]:
             ]
         else:
             raise ValueError(
-                f"While unpacking {cls}.{field.name}, unhandled type: {field.type}"
+                f"While unpacking {type(data)}.{field.name}, unhandled type: {field.type}"
             )
         kwarg_lists[field.name] = field_val
 

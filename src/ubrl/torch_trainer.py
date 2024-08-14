@@ -112,34 +112,19 @@ class LossInput:
     @classmethod
     def pack(cls, loss_inputs: list["LossInput"]) -> "LossInput":
         return tu.pack_dataclass(cls, loss_inputs)
-        # new_fields = {}
-        # for field in dataclasses.fields(cls):
-        #     field_vals = [getattr(li, field.name) for li in loss_inputs]
-        #     if field.name == "n_timesteps":
-        #         new_fields[field.name] = tu.concat_lists(field_vals)
-        #     else:
-        #         new_fields[field.name] = torch.cat(field_vals)
-        # return cls(**new_fields)
 
-    def split(self) -> list["LossInput"]:
-        fields = {}
-        for field in dataclasses.fields(self):
-            field_val = getattr(self, field.name)
-            if field.name == "n_timesteps":
-                field_val = [[v] for v in field_val]
-            elif field.name in ("vf_targets", "vf_returns", "vf_loss_mask"):
-                field_val = tu.unpack_tensors(
-                    field_val, [n + 1 for n in self.n_timesteps]
-                )
-            else:
-                field_val = tu.unpack_tensors(field_val, self.n_timesteps)
-            fields[field.name] = field_val
-
-        results = []
-        for i in range(len(self.n_timesteps)):
-            results.append(type(self)(**{k: v[i] for (k, v) in fields.items()}))
-
-        return results
+    def unpack(self) -> list["LossInput"]:
+        n_observations = [n + 1 for n in self.n_timesteps]
+        return tu.unpack_dataclass(
+            self,
+            {
+                "advantages": self.n_timesteps,
+                "exp_advantages": self.n_timesteps,
+                "vf_targets": n_observations,
+                "vf_returns": n_observations,
+                "vf_loss_mask": n_observations,
+            },
+        )
 
 
 _OPTIMIZER_FIELDS = [
@@ -616,7 +601,7 @@ class TorchTrainer:
         loss_inputs = {
             ep_data.episode_id: loss_in
             for (ep_data, loss_in) in tu.strict_zip(
-                self.replay_buffer, loss_input.split()
+                self.replay_buffer, loss_input.unpack()
             )
         }
         self._log_dataset(cache_out, loss_input)
@@ -686,7 +671,7 @@ class TorchTrainer:
                 loss_inputs = {
                     ep_data.episode_id: loss_in
                     for (ep_data, loss_in) in tu.strict_zip(
-                        self.replay_buffer, loss_input.split()
+                        self.replay_buffer, loss_input.unpack()
                     )
                 }
 
@@ -1441,41 +1426,22 @@ class AgentOutput:
         episodes."""
         return self.valid_mask is None or self.valid_mask.all()
 
-    def split(self) -> list["AgentOutput"]:
+    def unpack(self) -> list["AgentOutput"]:
         """Splits an `AgentOutput` into one `AgentOutput` per episode.
         Used by `CachedAgent` to cache individual episode outputs.
         """
-
-        _OPTIONAL_FIELDS = (
-            "action_dists",
-            "original_action_dists",
-            "valid_mask",
-            "inherent_loss",
+        return tu.unpack_dataclass(
+            self,
+            {
+                "action_lls": self.n_timesteps,
+                "rewards": self.n_timesteps,
+                "terminated": [1 for _ in self.n_timesteps],
+                "inherent_loss": [1 for _ in self.n_timesteps],
+                "original_action_lls": self.n_timesteps,
+                "state_encodings": self.n_observations,
+                "valid_mask": self.n_observations,
+            },
         )
-
-        fields = {}
-        for field in dataclasses.fields(self):
-            field_val = getattr(self, field.name)
-            if field.name in _OPTIONAL_FIELDS and field_val is None:
-                field_val = [None] * len(self.n_timesteps)
-            elif field.name in _OPTIONAL_FIELDS or field.name == "n_timesteps":
-                field_val = [[v] for v in field_val]
-            elif field.name in ("terminated"):
-                field_val = field_val.unsqueeze(-1)
-            elif field.name in ("state_encodings",):
-                field_val = tu.unpack_tensors(field_val, self.n_observations)
-            elif field.name == "infos":
-                continue
-            else:
-                field_val = tu.unpack_tensors(field_val, self.n_timesteps)
-            fields[field.name] = field_val
-
-        results = []
-        for i in range(len(self.n_timesteps)):
-            args = {k: v[i] for (k, v) in fields.items()}
-            args["infos"] = {k: [v[i]] for (k, v) in self.infos.items()}
-            results.append(type(self)(**args))
-        return results
 
     @classmethod
     def pack(cls, agent_outputs: list["AgentOutput"]) -> "AgentOutput":
@@ -1593,7 +1559,7 @@ class CachedAgent:
         else:
             agent_output = self.agent(agent_input)
         if agent_output.full_valid():
-            for i, output in enumerate(agent_output.split()):
+            for i, output in enumerate(agent_output.unpack()):
                 episode_id = episode_data[i].episode_id
                 self.agent_out_cache[episode_id] = output.detach()
         elif need_full:
