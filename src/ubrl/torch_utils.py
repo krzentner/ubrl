@@ -34,6 +34,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import noko
 
 T = TypeVar("T")
 
@@ -245,6 +246,7 @@ class RunningMeanVar(nn.Module):
 
     def __init__(
         self,
+        *,
         init_mean: torch.Tensor = torch.tensor(0.0),
         init_var: torch.Tensor = torch.tensor(1.0),
         count: int = 0,
@@ -363,11 +365,75 @@ class RunningMeanVar(nn.Module):
         cvar = self.var * self.count / d
         return torch.clamp(cvar, self.min_var)
 
-    def noko_preprocess(self, prefix: str, dst: dict):
-        """Provide statistics for the noko logging library."""
-        dst[f"{prefix}.var"] = self.var.mean().item()
-        dst[f"{prefix}.mean"] = self.mean.mean().item()
-        dst[f"{prefix}.count"] = self.count
+
+@noko.declare_summarizer(RunningMeanVar)
+def summarize_running_mean_var(rmv, prefix: str, dst: dict):
+    """Provide statistics for the noko logging library."""
+    dst[f"{prefix}.var"] = rmv.var.mean().item()
+    dst[f"{prefix}.mean"] = rmv.mean.mean().item()
+    dst[f"{prefix}.count"] = rmv.count
+
+
+class ExponentialWeightedNormalizer(RunningMeanVar):
+    """Calculates exponentially weighted running mean and variance of sequence
+    of tensors.
+
+    When used as a module, records inputs such that outputs will become zero
+    mean and unit variance.
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 0.99,
+        init_mean: torch.Tensor = torch.tensor(0.0),
+        init_var: torch.Tensor = torch.tensor(1.0),
+        clip_max: Optional[float] = 10.0,
+        min_var: float = 1e-6,
+        trainable: bool = False,
+        use_mean: bool = True,
+        use_var: bool = True,
+    ):
+        super().__init__(
+            init_mean=init_mean,
+            init_var=init_var,
+            clip_max=clip_max,
+            min_var=min_var,
+            trainable=trainable,
+            use_mean=use_mean,
+            use_var=use_var,
+        )
+        self.alpha: float = alpha
+        """Smoothing coefficient. Values closer to 1.0 cause more smoothing
+        (similar to `RollingMeanVar`).
+        """
+
+    def update(self, x: torch.Tensor):
+        """Update the statistics using a batch."""
+        if len(x.shape) < len(self.mean.shape):
+            x = x.unsqueeze(0)
+        # Flatten all batch, time dimensions
+        while len(x.shape) > len(self.mean.shape) + 1:
+            x = x.flatten(end_dim=1)
+        x_mean = x.mean(dim=0)
+        x_var = x.var(dim=0, correction=0)
+        x_size = len(x)
+        new_total = self.count + x_size
+        new_factor = max(x_size / new_total, 1 - self.alpha**x_size)
+
+        delta = x_mean - self.mean
+        m2_a = self.var * self.count
+        m2_b = x_var * x_size
+        m2 = m2_a + m2_b + delta**2 * self.count * new_factor
+
+        new_mean = self.mean + delta * new_factor
+        new_var = m2 / new_total
+
+        assert self.var.shape == new_var.shape
+        assert self.mean.shape == new_mean.shape
+        self.var = new_var
+        self.mean = new_mean
+        self.count = new_total
 
 
 def truncate_packed(
