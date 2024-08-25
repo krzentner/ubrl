@@ -21,6 +21,9 @@ import hot_restart
 @dataclass
 class LLMAgentConfig(ubrl.TrainerConfig):
     # pretrained_name: str = "microsoft/Phi-3-mini-128k-instruct"
+    # pretrained_name: str = "allenai/OLMo-1B-0724-hf"
+    # pretrained_revision: str = "step1000-tokens4B"
+    pretrained_revision: str = ""
     pretrained_name: str = "google/flan-t5-small"
     trust_remote_code: bool = True
 
@@ -47,8 +50,13 @@ class LLMEpisode:
 class CausalLMAgent(ubrl.Agent):
     def __init__(self, cfg: LLMAgentConfig):
         super().__init__(cfg.state_encoding_size)
+        pretrained_kwargs = {}
+        if cfg.pretrained_revision:
+            pretrained_kwargs["revision"] = cfg.pretrained_revision
         self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.pretrained_name, trust_remote_code=cfg.trust_remote_code
+            cfg.pretrained_name,
+            trust_remote_code=cfg.trust_remote_code,
+            **pretrained_kwargs,
         )
         try:
             self.causal_llm = AutoModelForCausalLM.from_pretrained(

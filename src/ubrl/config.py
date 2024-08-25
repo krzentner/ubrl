@@ -321,7 +321,7 @@ class TrainerConfig(simple_parsing.Serializable):
     can improve stability during long runs with little disadvantage.
     """
 
-    kl_soft_target: float = tunable(0.5, low=1e-3, high=10.0, log=True)
+    kl_soft_target: float = tunable(0.1, low=1e-3, high=10.0, log=True)
     """Target per-timestep KL divergence per train-step.
 
     If this value is exceeded, the kl_coef will become non-zero to limit the
@@ -405,12 +405,8 @@ class TrainerConfig(simple_parsing.Serializable):
     If set to >=1000, will literally just perform behavioral cloning.
     """
 
-    normalize_awr_advantages: bool = tunable(True, choices=[False, True])
-    """Whether to normalize the advantages across the batch before computing
-    the AWR coefficients.
-
-    Note that this is not used in the PPO loss.
-    """
+    normalize_batch_advantages: bool = tunable(True, choices=[False, True])
+    """Whether to normalize the advantages across the batch."""
 
     advantage_clip: float = tunable(8.0, low=0.1, high=12.0)
     """Max exponent value for advantages in AWR loss.
@@ -428,10 +424,18 @@ class TrainerConfig(simple_parsing.Serializable):
     Small values will consistently lower the loss.
     """
 
-    recompute_loss_inputs: bool = tunable(False, choices=[False, True])
-    """Recompute advantages and VF targets every epoch inside a train_step().
+    precompute_loss_inputs: bool = tunable(False, choices=[False, True])
+    """Compute advantages and VF targets for all minibatches before running
+    loss on any minibatch.
 
-    This causes full off-policy steps to be taken every train_step().
+    If True, and `vf_pre_training_epochs == 0`, an additional forward pass may
+    be required for each timestep.
+    If False, minibatches will become off-policy.
+    """
+
+    loss_input_vf_mini_epochs: int = tunable(0, low=0, high=1)
+    """Number of epochs of vf training to run on each minibatch when
+    `precompute_loss_inputs` is False.
     """
 
     checkpoint_interval: int = 1

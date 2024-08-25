@@ -6,7 +6,7 @@ TorchTrainer contains the primary interface to ubrl.
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Optional, Generator
+from typing import Any, Optional, Generator, Callable
 import os
 import logging
 import pickle
@@ -29,6 +29,243 @@ from ubrl.config import TrainerConfig
 _LOGGER = logging.getLogger("ubrl")
 
 EpisodeID = int
+
+
+class Agent(nn.Module):
+    """Agent API optimized by ubrl.
+
+    You do not need to actually inherit from this class, it exists for
+    documentation purposes.
+    """
+
+    def __init__(self, state_encoding_size: int):
+        super().__init__()
+
+        self.state_encoding_size = state_encoding_size
+        """Species the dimensionality of encoded states in the
+        AgentOutput.state_encodings field."""
+
+    def forward(self, inputs: "AgentInput") -> "AgentOutput":
+        """Run the agent's forward pass. This is the main API entry point
+        between your agent and ubrl's trainer.
+
+        If you already need to use the forward pass for another purpose, you
+        can define ubrl_forward() instead, but note that this will not invoke
+        torch forward hooks.
+
+        Episodes can be any value passed to TorchTrainer.add_episode().
+        See [gym_utils.py](examples/hf_llm_example.py) or
+        [hf_llm_example.py](examples/hf_llm_example.py) for example
+        implementations.
+
+        More in depth documentation is available in
+        [agent_api.qmd](notes/agent_api.qmd).
+        """
+        del inputs
+        raise NotImplementedError()
+
+
+@dataclass(eq=False)
+class AgentInput:
+    """Input to Agent forward() method.
+
+    See `AgentOutput` for the return type.
+    """
+
+    episodes: list[Any]
+    """List of episodes. Will be whatever type was passed in to
+    `TorchTrainer.add_episode`.
+    """
+
+    need_full: bool = True
+    """If True, the agent must return action_lls and state_encodings for the
+    entire episode (i.e. `AgentOutput.valid_mask` should be None or all True).
+
+    If False, the agent can optionally only propagate a portion of timesteps.
+    """
+
+
+@dataclass(eq=False)
+class AgentOutput:
+    """Result from all episodes concatenated together when calling .forward()
+    on an agent.
+
+    Differentiating both `state_encodings` and `action_lls` should affect
+    earlier layers in the agent.
+
+    See `AgentInput` for the input type.
+    """
+
+    state_encodings: torch.Tensor
+    """Differentiable representation of the observations. Because there should
+    be a trailing final state, this tensor should be longer than action_lls by
+    the number of episodes in AgentInput."""
+
+    action_lls: torch.Tensor
+    """Differentiable log-likelihood of actions taken, packed into a single
+    dimension."""
+
+    n_timesteps: list[int]
+    """Length of each episode packed together in `action_lls`.
+    Provided as input by `AgentInput.n_timesteps`.
+    This is the number of rewards / actions in each episode.
+    Each episode should contain one additional `state_encoding`.
+    Used for checking shape of other values, and for splitting episodes in CachedAgent.
+
+    If it is necessary to compute fewer timesteps, pad the values as if all
+    values were computed and set the valid_mask to indicate which timesteps are
+    fully computed.
+    Value function training always requires all state encodings and action lls,
+    which are requested by AgentInput.need_full.
+    """
+
+    terminated: torch.Tensor
+    """Boolean Tensor indicating if the episode reached a terminal state.
+    Should have length equal to the number of episodes.
+    Should contain False for an episode in an infinite horizon MDPs or when an
+    episode reaches a timeout.
+    """
+
+    original_action_lls: torch.Tensor
+    """Original action lls provided when the episode was added. Used for
+    v-trace off-policy correction and in the PPO loss (when enabled).
+    Packed into a single dimansion.
+
+    Do not require gradients.
+    """
+
+    rewards: torch.Tensor
+    """Rewards acquired in the episode. Should be packed into a single
+    dimension of the same shape as the action_lls (i.e. sum(n_timesteps)).
+    """
+
+    action_dists: Optional[list[tu.ActionDist]] = None
+    """Distribution used to generate actions.
+
+    Will be used for the KL penalty if not None and `cfg.use_approx_kl` is False.
+
+    Will be used for entropy regularization if not None and `cfg.approx_entropy`
+    is False.
+    """
+
+    original_action_dists: Optional[tu.ActionDist] = None
+    """Original action distributions optionally provided when the episode was
+    added."""
+
+    valid_mask: Optional[torch.Tensor] = None
+    """Mask of timesteps where `state_encodings` and `action_lls` were computed
+    and can be differentiated for.
+    If not None, must have same shape as `action_encodings`.
+
+    Mostly used for rescaling losses.
+    If None, all timesteps are presumed to be valid.
+    """
+
+    inherent_loss: Optional[torch.Tensor] = None
+    """Loss computed by the model itself. Can be used for regularization or
+    supervised co-training.
+
+    Typically should be near unit scale when used.
+    """
+
+    infos: dict[str, list[Any]] = dataclasses.field(default_factory=dict)
+    """Not used by ubrl, but can be used if agent.forward() needs to return
+    additional values for other use cases."""
+
+    @property
+    def n_observations(self):
+        return [n + 1 for n in self.n_timesteps]
+
+    def __post_init__(self):
+        """Checks types and shapes of output data."""
+
+        assert (
+            len(self.state_encodings.shape) == 2
+        ), "state_encodings should have exactly two dimensions"
+        assert (
+            len(self.action_lls.shape) == 1
+        ), "action_lls should have exactly one dimension"
+        assert self.action_lls.shape[0] == sum(
+            self.n_timesteps
+        ), "Total number of timesteps does not match number of provided action_lls"
+        assert (
+            len(self.original_action_lls.shape) == 1
+        ), "action_lls should have exactly one dimension"
+        assert self.original_action_lls.shape[0] == sum(
+            self.n_timesteps
+        ), "Total number of timesteps does not match number of provided action_lls"
+        assert (
+            self.state_encodings.shape[0] != self.action_lls.shape[0]
+        ), "There should be one more state_encoding per episode than action_ll. "
+        num_expected_states = sum(self.n_timesteps) + len(self.n_timesteps)
+        if self.state_encodings.shape[0] != num_expected_states:
+            raise AssertionError(
+                f"AgentOutput number of state_encodings did not match total number of states in episodes. There should be one more state_encoding per episode than action_lls. Expected: {num_expected_states} Actual: {self.state_encodings.shape[0]}"
+            )
+
+        if self.valid_mask is not None:
+            assert (
+                len(self.valid_mask.shape) == 1
+            ), "valid_mask should have exactly one dimension"
+            assert (
+                self.valid_mask.shape[0] == self.state_encodings.shape[0]
+            ), "valid_mask shape does not match state_encodings shape"
+            assert (
+                self.valid_mask.dtype == torch.bool
+            ), "valid_mask does not use torch.bool dtype"
+
+        if self.inherent_loss is not None:
+            assert (
+                len(self.inherent_loss.shape) == 1
+            ), "Inherent loss should have one dimension, the episode / batch dimension"
+            assert self.inherent_loss.shape[0] == len(
+                self.n_timesteps
+            ), "If provided, there should be one inherent_loss value per episode"
+
+        if self.action_dists is not None:
+            assert isinstance(self.action_dists, list)
+            assert (
+                len(self.action_dists) == len(self.n_timesteps)
+            ), 'If provided, action_dists should be a list containing one "ActionDist" per episode'
+
+    def full_valid(self):
+        """If the AgentOutput has contains all timesteps for the requested
+        episodes."""
+        return self.valid_mask is None or self.valid_mask.all()
+
+    def unpack(self) -> list["AgentOutput"]:
+        """Splits an `AgentOutput` into one `AgentOutput` per episode.
+        Used by `CachedAgent` to cache individual episode outputs.
+        """
+        return tu.unpack_dataclass(
+            self,
+            {
+                "action_lls": self.n_timesteps,
+                "rewards": self.n_timesteps,
+                "terminated": [1 for _ in self.n_timesteps],
+                "inherent_loss": [1 for _ in self.n_timesteps],
+                "original_action_lls": self.n_timesteps,
+                "state_encodings": self.n_observations,
+                "valid_mask": self.n_observations,
+            },
+        )
+
+    @classmethod
+    def pack(cls, agent_outputs: list["AgentOutput"]) -> "AgentOutput":
+        return tu.pack_dataclass(cls, agent_outputs)
+
+    def detach(self) -> "AgentOutput":
+        detached = dataclasses.replace(
+            self,
+            state_encodings=self.state_encodings.detach(),
+            action_lls=self.action_lls.detach(),
+        )
+        for field_name, field_val in vars(detached).items():
+            if isinstance(field_val, torch.Tensor) and field_val.requires_grad:
+                raise ValueError(
+                    f"AgentOutput.{field_name} should not require_grad after being detached"
+                )
+        return detached
 
 
 @dataclass(eq=False)
@@ -127,6 +364,88 @@ class LossInput:
         )
 
 
+class CachedAgent:
+    """Performs checking of the `Agent` API and caches outputs.
+
+    Cached values are used to cheaply fine-tune value function training.
+    This class does _not_ implement Transformer key caching and is used with
+    all implementations of the `Agent` API.
+    """
+
+    def __init__(
+        self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"
+    ):
+        self.agent: Agent = agent
+        self.cfg = cfg
+        self.cluster = cluster
+        self.agent_out_cache: dict[EpisodeID, AgentOutput] = {}
+
+    def clear_caches(self):
+        self.agent_out_cache = {}
+
+    def fill_caches(self, episode_data: list[EpisodeData]):
+        """Ensure that all episodes in `episode_data` have cached values."""
+        missing_episodes = [
+            ep_data
+            for ep_data in episode_data
+            if ep_data.episode_id not in self.agent_out_cache
+        ]
+        with torch.no_grad():
+            for minibatch in _minibatch_episodes(
+                self.cluster,
+                missing_episodes,
+                desc="Caching state encodings",
+                minibatch_max_size=self.cfg.minibatch_max_size,
+            ):
+                self.agent_forward(minibatch, need_full=True)
+
+    def cached_forward(self, episode_data: list[EpisodeData]) -> AgentOutput:
+        """Get output "as if" a forward pass was run, but avoid running the
+        forward pass if possible.
+
+        The `AgentOutput` returned by this method will not require gradients
+        (they are "detached").
+        """
+        self.fill_caches(episode_data)
+        agent_outputs = [
+            self.agent_out_cache[ep_data.episode_id] for ep_data in episode_data
+        ]
+        for output in agent_outputs:
+            assert (
+                len(output.n_timesteps) == 1
+            ), "More than one episode in cached AgentOutput"
+        return AgentOutput.pack(agent_outputs)
+
+    def agent_forward(
+        self, episode_data: list[EpisodeData], need_full: bool
+    ) -> AgentOutput:
+        """Wrapper around the Agent forward() method.
+
+        Handles delegating to ubrl_forward() if necessary, checking that
+        need_full is respected, and caching.
+        """
+        agent_input = AgentInput(
+            episodes=[ep_data.episode for ep_data in episode_data],
+            need_full=need_full,
+        )
+
+        if hasattr(self.agent, "ubrl_forward"):
+            agent_output = self.agent.ubrl_forward(agent_input)
+        else:
+            agent_output = self.agent(agent_input)
+        if agent_output.full_valid():
+            for i, output in enumerate(agent_output.unpack()):
+                episode_id = episode_data[i].episode_id
+                self.agent_out_cache[episode_id] = output.detach()
+        elif need_full:
+            total_valid = agent_output.valid_mask.sum().item()
+            total_timesteps = sum(agent_output.n_timesteps)
+            raise ValueError(
+                f"Requested fully valid output but Agent only provided valid output for {total_valid}/{total_timesteps}"
+            )
+        return agent_output
+
+
 _OPTIMIZER_FIELDS = [
     "agent_optimizer",
     "vf_optimizer",
@@ -139,6 +458,8 @@ _SUBMODULE_FIELDS = [
     "agent",
     "vf",
     "reward_normalizer",
+    "advantage_normalizer",
+    "awr_coef_normalizer",
 ]
 
 _PARAM_FIELDS = [
@@ -202,37 +523,68 @@ class TorchTrainer:
             use_dropout=True,
         )
         """The value function. Feed-forward networks that predicts future
-        rewards from state_encodings."""
+        rewards from `state_encodings`."""
 
         # Zero the initial VF output to stabilize training
         vf_output = self.vf.get_submodule("output_linear")
         vf_output.weight.data.copy_(0.01 * vf_output.weight.data)
 
-        self.reward_normalizer: tu.RunningMeanVar = self.cluster.prepare_module(
-            tu.RunningMeanVar(use_mean=False)
+        self.reward_normalizer: tu.ExponentialWeightedNormalizer = (
+            self.cluster.prepare_module(
+                tu.ExponentialWeightedNormalizer(
+                    use_mean=False, use_var=cfg.normalize_rewards
+                )
+            )
         )
-        """Normalized used to make rewards have unit variance if
-        cfg.normalize_rewards is True."""
+        """Normalizer used to make rewards have unit variance if
+        `cfg.normalize_rewards` is True."""
+
+        self.advantage_normalizer: tu.ExponentialWeightedNormalizer = (
+            self.cluster.prepare_module(
+                tu.ExponentialWeightedNormalizer(
+                    use_mean=cfg.normalize_batch_advantages,
+                    use_var=cfg.normalize_batch_advantages,
+                )
+            )
+        )
+        """Normalizer used to make advantages have zero mean and unit variance
+        if `cfg.normalize_batch_advantages` is True."""
+
+        self.awr_coef_normalizer: tu.ExponentialWeightedNormalizer = (
+            self.cluster.prepare_module(
+                tu.ExponentialWeightedNormalizer(
+                    use_mean=True,
+                    use_var=True,
+                )
+            )
+        )
+        """Normalizer used to AWR coefficients have zero mean and unit variance."""
 
         self.total_env_steps: int = 0
-        """Total number of environment steps passed to add_episode().
+        """Total number of environment steps passed to `add_episode()`.
         May not count timesteps only used to compute statistics passed to
-        add_eval_stats()."""
+        `add_eval_stats()`."""
 
         self.train_steps_so_far: int = 0
-        """Number of times train_step() has been called."""
+        """Number of times `train_step()` has been called."""
 
         self.last_eval_stats: dict[str, float] = {}
-        """Last stats passd to add_eval_stats()."""
+        """Last stats passd to `add_eval_stats()`."""
 
         self.primary_performance: float = float("-inf")
-        """Value of the "primary_performance" stat at the last add_eval_stats() call."""
+        """Value of the `"primary_performance"` stat at the last
+        `add_eval_stats()` call.
+        """
 
         self.best_checkpoint_primary_performance: float = float("-inf")
-        """Largest value of the "primary_performance" stat among all add_eval_stats() calls."""
+        """Largest value of the `"primary_performance"` stat among all
+        `add_eval_stats()` calls.
+        """
 
         self.train_steps_so_far_at_last_checkpoint: int = 0
-        """Number of (completed) train_step() calls at last periodic checkpoint."""
+        """Number of (completed) `train_step()` calls at last periodic
+        checkpoint.
+        """
 
         # TODO(krzentner): Figure out if kl_coef should be on cpu or used through cluster
         # Maybe it would be simpler to just make kl_coef a nn.Linear(1, 1, bias=False)
@@ -545,7 +897,7 @@ class TorchTrainer:
 
         This method should be called repeatedly until training is complete.
         Unless training is completely off-policy, new episodes should be added
-        between each call to this method using add_episode().
+        between each call to this method using `add_episode()`.
 
         All options for tuning this method are present in the TrainerConfig
         passed on TorchTrainer initialization.
@@ -559,7 +911,6 @@ class TorchTrainer:
                 len(self.replay_buffer) == self.cfg.replay_buffer_episodes
             ), "replay buffer length shorter than expected"
 
-        errors = 0
         start_time = time.monotonic()
         if (
             self.cfg.train_step_timeout_seconds is not None
@@ -589,25 +940,67 @@ class TorchTrainer:
             pre_train_epochs = max(self.cfg.vf_warmup_training_epochs, pre_train_epochs)
 
         timed_out = self._train_vf(
-            c_agent,
+            lambda: c_agent.cached_forward(self.replay_buffer),
             pre_train_epochs,
             desc="Pre Training VF",
             deadline=deadline,
         )
 
         self._maybe_record_starting_entropy(c_agent)
-        cache_out = c_agent.cached_forward(self.replay_buffer)
-        loss_input = self.loss_inputs_of(cache_out)
-        loss_inputs = {
-            ep_data.episode_id: loss_in
-            for (ep_data, loss_in) in tu.strict_zip(
-                self.replay_buffer, loss_input.unpack()
-            )
-        }
-        self._log_dataset(cache_out, loss_input)
-        c_agent.clear_caches()
+        if self.cfg.precompute_loss_inputs:
+            cache_out = c_agent.cached_forward(self.replay_buffer)
+            loss_input = self.loss_inputs_of(cache_out)
+            loss_inputs = {
+                ep_data.episode_id: loss_in
+                for (ep_data, loss_in) in tu.strict_zip(
+                    self.replay_buffer, loss_input.unpack()
+                )
+            }
+            c_agent.clear_caches()
+        else:
+            loss_inputs = {}
 
         # Run primary training loop.
+        timed_out |= self._train_agent(c_agent, loss_inputs, deadline)
+
+        # Log dataset stats
+        cache_out = c_agent.cached_forward(self.replay_buffer)
+        loss_input = self.loss_inputs_of(cache_out)
+        self._log_dataset(cache_out, loss_input)
+
+        # Extra VF tuning after the primary training loop.
+        # This achieves similar objectives to PPG by simply not doing updates
+        # on the agent network in this phase.
+        # Inputs are guaranteed to be cached, since we ran at least one full
+        # epoch in the primary loop.
+        timed_out |= self._train_vf(
+            lambda: c_agent.cached_forward(self.replay_buffer),
+            self.cfg.vf_post_training_epochs,
+            desc="Post Training VF",
+            deadline=deadline,
+        )
+
+        # Update schedules
+        self.agent_lr_scheduler.step()
+        self.vf_lr_scheduler.step()
+        self.agent.train(mode=False)
+        self.vf.train(mode=False)
+        self.train_steps_so_far += 1
+        self.agent_grad_steps_last_train_step = (
+            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
+        )
+        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
+
+        if timed_out:
+            _LOGGER.error("train_step() timed out")
+
+    def _train_agent(
+        self,
+        cached_agent: CachedAgent,
+        loss_input_cache: dict[EpisodeID, LossInput],
+        deadline: float,
+    ) -> bool:
+        errors = 0
         for batch_i, minibatch in enumerate(
             _minibatch_episodes(
                 self.cluster,
@@ -620,13 +1013,30 @@ class TorchTrainer:
             )
         ):
             if time.monotonic() > deadline:
-                timed_out = True
-                break
-            loss_input = LossInput.pack(
-                [loss_inputs[ep_data.episode_id] for ep_data in minibatch]
-            )
-            agent_output = c_agent.agent_forward(minibatch, need_full=False)
-            loss, loss_infos = self._combined_loss_function(agent_output, loss_input)
+                return True
+
+            agent_output = cached_agent.agent_forward(minibatch, need_full=False)
+
+            if self.cfg.precompute_loss_inputs:
+                loss_inputs = LossInput.pack(
+                    [loss_input_cache[ep_data.episode_id] for ep_data in minibatch]
+                )
+            else:
+                if self._train_vf(
+                    lambda: agent_output.detach(),
+                    self.cfg.loss_input_vf_mini_epochs,
+                    desc=None,
+                    deadline=deadline,
+                ):
+                    # Propagate timeout
+                    return True
+                loss_inputs = self.loss_inputs_of(agent_output.detach())
+                for ep_data, loss_input in tu.strict_zip(
+                    minibatch, loss_inputs.unpack()
+                ):
+                    loss_input_cache[ep_data.episode_id] = loss_input
+
+            loss, loss_infos = self._combined_loss_function(agent_output, loss_inputs)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
             self.cluster.backward(loss)
@@ -665,55 +1075,16 @@ class TorchTrainer:
                 errors += 1
                 if errors > self.cfg.max_permitted_errors_per_train_step:
                     raise ex
-            if self.cfg.recompute_loss_inputs:
-                cache_out = c_agent.cached_forward(self.replay_buffer)
-                loss_input = self.loss_inputs_of(cache_out)
-                loss_inputs = {
-                    ep_data.episode_id: loss_in
-                    for (ep_data, loss_in) in tu.strict_zip(
-                        self.replay_buffer, loss_input.unpack()
-                    )
-                }
-
-        # Extra VF tuning after the primary training loop.
-        # This achieves similar objectives to PPG by simply not doing updates
-        # on the agent network in this phase.
-        # Inputs are guaranteed to be cached, since we ran at least one full
-        # epoch in the primary loop.
-        timed_out |= self._train_vf(
-            c_agent,
-            self.cfg.vf_post_training_epochs,
-            desc="Post Training VF",
-            deadline=deadline,
-        )
-
-        # Update all the statistics.
-        self.agent_lr_scheduler.step()
-        self.vf_lr_scheduler.step()
-        self.agent.train(mode=False)
-        self.vf.train(mode=False)
-        self.train_steps_so_far += 1
-        self._maybe_record_starting_entropy(c_agent)
-        self.agent_grad_steps_last_train_step = (
-            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
-        )
-        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
-
-        if timed_out:
-            _LOGGER.error("train_step() timed out")
+        return False
 
     def _train_vf(
         self,
-        cached_agent: "CachedAgent",
+        agent_output_gen: Callable[[], AgentOutput],
         training_epochs: int,
-        desc: str,
+        desc: Optional[str],
         deadline: float,
     ) -> bool:
         """Train just the VF using cached agent outputs.
-
-        state_encodings and action_lls are indexed by the `episode_id`
-        field of EpisodeData, and should contain non-differentiable cached
-        components from each episode's AgentOutput.
 
         This method does not tune the parameters of the agent.
 
@@ -728,7 +1099,8 @@ class TorchTrainer:
         if training_epochs == 0 or timed_out:
             return timed_out
 
-        agent_output = cached_agent.cached_forward(self.replay_buffer)
+        agent_output = agent_output_gen()
+
         n_timesteps = agent_output.n_timesteps
         state_enc_packed = agent_output.state_encodings
         action_lls_now = tu.pad_packed(
@@ -741,10 +1113,7 @@ class TorchTrainer:
         assert not action_lls_now.requires_grad, "action_lls unexpectedly required grad"
 
         padded_rewards = tu.pad_packed(agent_output.rewards, agent_output.n_timesteps)
-        if self.cfg.normalize_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
-        else:
-            rewards_normed = padded_rewards
+        rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
 
         original_action_lls = tu.pad_packed(
             agent_output.original_action_lls, agent_output.n_timesteps
@@ -753,7 +1122,9 @@ class TorchTrainer:
         discount = 1 - self.cfg.discount_inv
         gammas = discount * torch.ones_like(rewards_normed)
 
-        with tqdm(desc=desc, total=training_epochs * sum(n_timesteps)) as pbar:
+        with tqdm(
+            desc=desc, total=training_epochs * sum(n_timesteps), disable=desc is None
+        ) as pbar:
             for epoch in range(training_epochs):
                 if (
                     epoch == 0
@@ -813,7 +1184,7 @@ class TorchTrainer:
                         return True
         return False
 
-    def _log_dataset(self, agent_output: "AgentOutput", loss_input: LossInput):
+    def _log_dataset(self, agent_output: AgentOutput, loss_input: LossInput):
         full_episode_rewards = tu.pad_packed(
             agent_output.rewards, loss_input.n_timesteps
         )
@@ -851,8 +1222,9 @@ class TorchTrainer:
 
     def loss_inputs_of(
         self,
-        agent_output: "AgentOutput",
-    ) -> "LossInput":
+        agent_output: AgentOutput,
+    ) -> LossInput:
+        """Compute LossInput of AgentOutput using self.vf"""
         # Compute vf_returns
         self.agent.train(mode=False)
         self.vf.train(mode=False)
@@ -875,27 +1247,18 @@ class TorchTrainer:
         vf_loss_masks = []
 
         # TODO(krzentner): Refactor / eliminate this loop
-        # Can't use valids mask, since vf_returns goes to t + 1
         for i, episode_length in enumerate(n_timesteps):
-            # Everything after last valid observation should have been padded to zero
-            assert (
-                vf_returns[i, episode_length + 1 :] == 0.0
-            ).all(), "VF returns non-zero after last observation"
-
             ep_loss_mask = self.cluster.prepare_tensor(torch.ones(episode_length + 1))
-            # zero vf_{t+1} in terminated episodes
             if agent_output.terminated[i]:
+                # zero vf_{t+1} in terminated episodes
                 vf_returns[i, episode_length] = 0.0
             else:
+                # Don't run VF loss on non-terminal final states.
                 ep_loss_mask[episode_length] = 0.0
-                assert ep_loss_mask[-1] == 0.0
             vf_loss_masks.append(ep_loss_mask)
 
         padded_rewards = tu.pad_packed(agent_output.rewards, n_timesteps)
-        if self.cfg.normalize_rewards:
-            rewards_normed = self.reward_normalizer.normalize_batch(padded_rewards)
-        else:
-            rewards_normed = padded_rewards
+        rewards_normed = self.reward_normalizer(padded_rewards)
 
         discount = 1 - self.cfg.discount_inv
         gammas = discount * torch.ones_like(rewards_normed)
@@ -916,9 +1279,7 @@ class TorchTrainer:
         adv_packed = tu.pack_padded(padded_advantages, n_timesteps)
         assert not adv_packed.requires_grad, "advantages unexpectedly require grad"
 
-        if self.cfg.normalize_awr_advantages:
-            adv_packed = adv_packed - adv_packed.mean()
-            adv_packed = adv_packed / adv_packed.std()
+        adv_packed = self.advantage_normalizer(adv_packed)
 
         # This 1000 is documented in the TrainerConfig.awr_temperature
         # docstring.
@@ -926,12 +1287,14 @@ class TorchTrainer:
         if self.cfg.awr_temperature >= 1000:
             heated_adv = adv_packed / self.cfg.awr_temperature
             max_exp_adv = torch.tensor(self.cfg.advantage_clip).exp()
-            softmax_adv = tu.softmax_clip(heated_adv, max_exp_adv)
-            awr_clip_ratio = (softmax_adv == max_exp_adv).mean(dtype=torch.float32)
-            normed_exp_adv = softmax_adv * len(softmax_adv)
-            assert (
-                0.9 <= normed_exp_adv.mean() <= 1.1
-            ), "normed_exp_adv outside expected range"
+
+            adv_exp = heated_adv.exp()
+            clip_mask = ~torch.isfinite(adv_exp) | (adv_exp > max_exp_adv)
+            clipped_adv_exp = adv_exp.clone()
+            clipped_adv_exp[clip_mask] = max_exp_adv
+
+            normed_exp_adv = self.awr_coef_normalizer(clipped_adv_exp)
+            awr_clip_ratio = (normed_exp_adv == max_exp_adv).mean(dtype=torch.float32)
         else:
             awr_clip_ratio = 0.0
             normed_exp_adv = torch.ones_like(adv_packed)
@@ -1235,340 +1598,6 @@ def summarize_trainer(trainer, key, dst):
     for k, v in trainer.__dict__.items():
         if k not in _IGNORED_FIELDS and k not in "last_eval_stats":
             noko.summarize(v, f"{key}.{k}", dst)
-
-
-class Agent(nn.Module):
-    """Agent API optimized by ubrl.
-
-    You do not need to actually inherit from this class, it exists for
-    documentation purposes.
-    """
-
-    def __init__(self, state_encoding_size: int):
-        super().__init__()
-
-        self.state_encoding_size = state_encoding_size
-        """Species the dimensionality of encoded states in the
-        AgentOutput.state_encodings field."""
-
-    def forward(self, inputs: "AgentInput") -> "AgentOutput":
-        """Run the agent's forward pass. This is the main API entry point
-        between your agent and ubrl's trainer.
-
-        If you already need to use the forward pass for another purpose, you
-        can define ubrl_forward() instead, but note that this will not invoke
-        torch forward hooks.
-
-        Episodes can be any value passed to TorchTrainer.add_episode().
-
-        The inside of this function will usually look something like:
-        ```
-        logits, latents = self.net(torch.cat([ep["observations"] for ep in inputs.episodes]))
-        dist = CategoricalDistribution(logits)
-        action_lls = dist.log_prob(torch.cat([ep["actions"] for ep in inputs.episodes]))
-        return AgentOutput(
-            state_encodings=latents,
-            action_lls=action_lls,
-            action_dists=dist,
-            valid_mask=torch.ones(sum([len(ep["observations"]) for ep in inputs.episodes])),
-        )
-        ```
-        """
-        del inputs
-        raise NotImplementedError()
-
-
-@dataclass(eq=False)
-class AgentOutput:
-    """Result from all episodes concatenated together when calling .forward()
-    on an agent.
-
-    Differentiating both `state_encodings` and `action_lls` should affect
-    earlier layers in the agent.
-
-    See `AgentInput` for the input type.
-    """
-
-    state_encodings: torch.Tensor
-    """Differentiable representation of the observations. Because there should
-    be a trailing final state, this tensor should be longer than action_lls by
-    the number of episodes in AgentInput."""
-
-    action_lls: torch.Tensor
-    """Differentiable log-likelihood of actions taken, packed into a single
-    dimension."""
-
-    n_timesteps: list[int]
-    """Length of each episode packed together in `action_lls`.
-    Provided as input by `AgentInput.n_timesteps`.
-    This is the number of rewards / actions in each episode.
-    Each episode should contain one additional `state_encoding`.
-    Used for checking shape of other values, and for splitting episodes in CachedAgent.
-
-    If it is necessary to compute fewer timesteps, pad the values as if all
-    values were computed and set the valid_mask to indicate which timesteps are
-    fully computed.
-    Value function training always requires all state encodings and action lls,
-    which are requested by AgentInput.need_full.
-    """
-
-    terminated: torch.Tensor
-    """Boolean Tensor indicating if the episode reached a terminal state.
-    Should have length equal to the number of episodes.
-    Should contain False for an episode in an infinite horizon MDPs or when an
-    episode reaches a timeout.
-    """
-
-    original_action_lls: torch.Tensor
-    """Original action lls provided when the episode was added. Used for
-    v-trace off-policy correction and in the PPO loss (when enabled).
-    Packed into a single dimansion.
-
-    Do not require gradients.
-    """
-
-    rewards: torch.Tensor
-    """Rewards acquired in the episode. Should be packed into a single
-    dimension of the same shape as the action_lls (i.e. sum(n_timesteps)).
-    """
-
-    action_dists: Optional[list[tu.ActionDist]] = None
-    """Distribution used to generate actions.
-
-    Will be used for the KL penalty if not None and `cfg.use_approx_kl` is False.
-
-    Will be used for entropy regularization if not None and `cfg.approx_entropy`
-    is False.
-    """
-
-    original_action_dists: Optional[tu.ActionDist] = None
-    """Original action distributions optionally provided when the episode was
-    added."""
-
-    valid_mask: Optional[torch.Tensor] = None
-    """Mask of timesteps where `state_encodings` and `action_lls` were computed
-    and can be differentiated for.
-    If not None, must have same shape as `action_encodings`.
-
-    Mostly used for rescaling losses.
-    If None, all timesteps are presumed to be valid.
-    """
-
-    inherent_loss: Optional[torch.Tensor] = None
-    """Loss computed by the model itself. Can be used for regularization or
-    supervised co-training.
-
-    Typically should be near unit scale when used.
-    """
-
-    infos: dict[str, list[Any]] = dataclasses.field(default_factory=dict)
-    """Not used by ubrl, but can be used if agent.forward() needs to return
-    additional values for other use cases."""
-
-    @property
-    def n_observations(self):
-        return [1 + n for n in self.n_timesteps]
-
-    def __post_init__(self):
-        """Checks types and shapes of output data."""
-
-        assert (
-            len(self.state_encodings.shape) == 2
-        ), "state_encodings should have exactly two dimensions"
-        assert (
-            len(self.action_lls.shape) == 1
-        ), "action_lls should have exactly one dimension"
-        assert self.action_lls.shape[0] == sum(
-            self.n_timesteps
-        ), "Total number of timesteps does not match number of provided action_lls"
-        assert (
-            len(self.original_action_lls.shape) == 1
-        ), "action_lls should have exactly one dimension"
-        assert self.original_action_lls.shape[0] == sum(
-            self.n_timesteps
-        ), "Total number of timesteps does not match number of provided action_lls"
-        assert (
-            self.state_encodings.shape[0] != self.action_lls.shape[0]
-        ), "There should be one more state_encoding per episode than action_ll. "
-        num_expected_states = sum(self.n_timesteps) + len(self.n_timesteps)
-        if self.state_encodings.shape[0] != num_expected_states:
-            raise AssertionError(
-                f"AgentOutput number of state_encodings did not match total number of states in episodes. There should be one more state_encoding per episode than action_lls. Expected: {num_expected_states} Actual: {self.state_encodings.shape[0]}"
-            )
-
-        if self.valid_mask is not None:
-            assert (
-                len(self.valid_mask.shape) == 1
-            ), "valid_mask should have exactly one dimension"
-            assert (
-                self.valid_mask.shape == self.state_encodings.shape
-            ), "valid_mask shape does not match state_encodings shape"
-            assert (
-                self.valid_mask.dtype == torch.bool
-            ), "valid_mask does not use torch.bool dtype"
-
-        if self.inherent_loss is not None:
-            assert (
-                len(self.inherent_loss.shape) == 1
-            ), "Inherent loss should have one dimension, the episode / batch dimension"
-            assert self.inherent_loss.shape[0] == len(
-                self.n_timesteps
-            ), "If provided, there should be one inherent_loss value per episode"
-
-        if self.action_dists is not None:
-            assert isinstance(self.action_dists, list)
-            assert (
-                len(self.action_dists) == len(self.n_timesteps)
-            ), 'If provided, action_dists should be a list containing one "ActionDist" per episode'
-
-    def full_valid(self):
-        """If the AgentOutput has contains all timesteps for the requested
-        episodes."""
-        return self.valid_mask is None or self.valid_mask.all()
-
-    def unpack(self) -> list["AgentOutput"]:
-        """Splits an `AgentOutput` into one `AgentOutput` per episode.
-        Used by `CachedAgent` to cache individual episode outputs.
-        """
-        return tu.unpack_dataclass(
-            self,
-            {
-                "action_lls": self.n_timesteps,
-                "rewards": self.n_timesteps,
-                "terminated": [1 for _ in self.n_timesteps],
-                "inherent_loss": [1 for _ in self.n_timesteps],
-                "original_action_lls": self.n_timesteps,
-                "state_encodings": self.n_observations,
-                "valid_mask": self.n_observations,
-            },
-        )
-
-    @classmethod
-    def pack(cls, agent_outputs: list["AgentOutput"]) -> "AgentOutput":
-        return tu.pack_dataclass(cls, agent_outputs)
-
-    def detach(self) -> "AgentOutput":
-        detached = dataclasses.replace(
-            self,
-            state_encodings=self.state_encodings.detach(),
-            action_lls=self.action_lls.detach(),
-        )
-        for field_name, field_val in vars(detached).items():
-            if isinstance(field_val, torch.Tensor) and field_val.requires_grad:
-                raise ValueError(
-                    f"AgentOutput.{field_name} should not require_grad after being detached"
-                )
-        return detached
-
-
-@dataclass(eq=False)
-class AgentInput:
-    """Input to Agent forward() method.
-
-    See `AgentOutput` for the return type.
-    """
-
-    episodes: list[Any]
-    """List of episodes. Will be whatever type was passed in to
-    `TorchTrainer.add_episode`.
-    """
-
-    need_full: bool = True
-    """If True, the agent must return action_lls and state_encodings for the
-    entire episode (i.e. `AgentOutput.valid_mask` should be None or all True).
-
-    If False, the agent can optionally only propagate a portion of timesteps.
-    """
-
-    @classmethod
-    def from_episode_data(cls, episode_data: list[EpisodeData], need_full: bool):
-        return AgentInput(
-            episodes=[ep_data.episode for ep_data in episode_data],
-            need_full=need_full,
-        )
-
-
-class CachedAgent:
-    """Performs checking of the `Agent` API and caches outputs.
-
-    Cached values are used to cheaply fine-tune value function training.
-    This class does _not_ implement Transformer key caching and is used with
-    all implementations of the `Agent` API.
-    """
-
-    def __init__(
-        self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"
-    ):
-        self.agent: Agent = agent
-        self.cfg = cfg
-        self.cluster = cluster
-        # self.state_encodings_cache: dict[EpisodeID, torch.Tensor] = {}
-        # self.action_lls_cache: dict[EpisodeID, torch.Tensor] = {}
-        self.agent_out_cache: dict[EpisodeID, AgentOutput] = {}
-
-    def clear_caches(self):
-        self.agent_out_cache = {}
-        # self.state_encodings_cache = {}
-        # self.action_lls_cache = {}
-
-    def fill_caches(self, episode_data: list[EpisodeData]):
-        """Ensure that all episodes in `episode_data` have cached values."""
-        missing_episodes = [
-            ep_data
-            for ep_data in episode_data
-            if ep_data.episode_id not in self.agent_out_cache
-        ]
-        with torch.no_grad():
-            for minibatch in _minibatch_episodes(
-                self.cluster,
-                missing_episodes,
-                desc="Caching state encodings",
-                minibatch_max_size=self.cfg.minibatch_max_size,
-            ):
-                self.agent_forward(minibatch, need_full=True)
-
-    def cached_forward(self, episode_data: list[EpisodeData]) -> AgentOutput:
-        """Get output "as if" a forward pass was run, but avoid running the
-        forward pass if possible.
-
-        The `AgentOutput` returned by this method will not require gradients
-        (they are "detached").
-        """
-        self.fill_caches(episode_data)
-        agent_outputs = [
-            self.agent_out_cache[ep_data.episode_id] for ep_data in episode_data
-        ]
-        for output in agent_outputs:
-            assert (
-                len(output.n_timesteps) == 1
-            ), "More than one episode in cached AgentOutput"
-        return AgentOutput.pack(agent_outputs)
-
-    def agent_forward(
-        self, episode_data: list[EpisodeData], need_full: bool
-    ) -> AgentOutput:
-        """Wrapper around the Agent forward() method.
-
-        Handles delegating to ubrl_forward() if necessary, checking that
-        need_full is respected, and caching.
-        """
-        agent_input = AgentInput.from_episode_data(episode_data, need_full=need_full)
-
-        if hasattr(self.agent, "ubrl_forward"):
-            agent_output = self.agent.ubrl_forward(agent_input)
-        else:
-            agent_output = self.agent(agent_input)
-        if agent_output.full_valid():
-            for i, output in enumerate(agent_output.unpack()):
-                episode_id = episode_data[i].episode_id
-                self.agent_out_cache[episode_id] = output.detach()
-        elif need_full:
-            total_valid = agent_output.valid_mask.sum().item()
-            total_timesteps = sum(agent_output.n_timesteps)
-            raise ValueError(
-                f"Requested fully valid output but Agent only provided valid output for {total_valid}/{total_timesteps}"
-            )
-        return agent_output
 
 
 # From here to the end of the file there should be only private helper / utlity
