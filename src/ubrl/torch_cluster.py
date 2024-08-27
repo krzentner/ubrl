@@ -140,11 +140,13 @@ class AcceleratorCluster(Cluster):
         self.accelerator.backward(loss)
 
     def save(self, checkpoint: dict[str, Any], path: str):
+        # TODO: Separate checkpointing of model and Trainer to allow
+        # distributed checkpointing
         self.accelerator.wait_for_everyone()
         self.accelerator.save(checkpoint, path)
 
     def load(self, path: str) -> dict[str, Any]:
-        return self.accelerator.load(path)
+        return torch.load(path)
 
 
 if Accelerator is None:

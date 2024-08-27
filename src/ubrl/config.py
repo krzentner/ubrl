@@ -92,7 +92,7 @@ class TrainerConfig(simple_parsing.Serializable):
     compilation and VF warmup.
     """
 
-    first_train_step_timeout_coef: float = 5.0
+    first_train_step_timeout_coef: float = 2.0
     """Multiple of the normal train_step() timeout to use for the
     first train_step. Useful for accomodating additional time
     needed for JIT compilation or VF warmup (see

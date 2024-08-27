@@ -19,7 +19,6 @@ from pprint import pprint
 import noko
 import argparse
 import simple_parsing
-from torch import Value
 import yaml
 from simple_parsing.helpers.serialization import save_yaml
 from simple_parsing.helpers.serialization import load as load_yaml
@@ -513,7 +512,7 @@ def run(
         cmd_tune(
             runs_dir=args.runs_dir,
             run_name=args.run_name,
-            override_config=self.args.override_config,
+            override_config=args.override_config,
             study_storage=args.study_storage,
             n_trials=args.n_trials,
             fixed_seeds=args.fixed_seeds,
@@ -626,9 +625,15 @@ def run(
     if getattr(args, "config", None):
         # Command line arguments should override config file entries
         loaded_config = load_yaml(config_type, args.config)
-        train_parser.add_arguments(config_type, dest="cfg", default=loaded_config)
+        cfg_arg = train_parser.add_arguments(config_type, dest="cfg", default=loaded_config)
     else:
-        train_parser.add_arguments(config_type, dest="cfg")
+        cfg_arg = train_parser.add_arguments(config_type, dest="cfg")
+
+    # workaround simple-parsing bug fixed in 0.1.6
+    for field in cfg_arg.fields:
+        if (simple_parsing.utils.is_literal(field.type) and
+            None in simple_parsing.utils.get_type_arguments(field.type)):
+            field.required = False
 
     # Re-add the help command manually, now that we've added all the config arguments
     train_parser.add_argument(

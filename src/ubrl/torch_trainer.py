@@ -810,7 +810,7 @@ class TorchTrainer:
         return kl_loss_scaled, infos
 
     def _entropy_target(self) -> Optional[float]:
-        if self.starting_entropy is None:
+        if self.starting_entropy is None or self.cfg.entropy_schedule is None:
             return None
 
         agent_grad_steps_this_train_step = (
@@ -1779,6 +1779,3 @@ __all__ = [
     "AgentOutput",
     "LossInput",
 ]
-import hot_restart
-
-hot_restart.wrap_module()

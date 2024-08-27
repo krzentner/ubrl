@@ -929,8 +929,3 @@ def strict_zip(*args):
     for i in range(len(args_list[0])):
         results.append([a[i] for a in args_list])
     return results
-
-
-import hot_restart
-
-hot_restart.wrap_module()
