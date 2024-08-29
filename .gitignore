@@ -176,3 +176,4 @@ cython_debug/
 /notes/*.html
 /notes/*_files
 /notes/*.ipynb
+/notes/*.quarto_ipynb
