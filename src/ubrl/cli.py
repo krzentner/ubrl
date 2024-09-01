@@ -554,7 +554,7 @@ def run(
     tune_parser.add_argument(
         "--n-seeds-per-trial",
         type=int,
-        default=2,
+        default=3,
         help=dedent(
             """\
             Number of seeds to run for each trial / hyper pararmeter configuration.

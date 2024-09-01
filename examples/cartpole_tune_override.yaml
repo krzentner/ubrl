@@ -1,7 +1,12 @@
+agent_lr_schedule: null
+entropy_schedule: null
+first_train_step_timeout_coef: 1.0
 n_train_steps: 2
 policy_epochs_per_train_step: 3
-vf_pre_training_epochs: 0
-vf_post_training_epochs: 10
-vf_lr_schedule: null
-actor_lr_schedule: null
 train_step_timeout_seconds: 30
+vf_lr_schedule: null
+vf_post_training_epochs: 0
+vf_pre_training_epochs: 0
+vf_recompute_targets: true
+loss_input_vf_mini_epochs: 1
+precompute_loss_inputs: 1
