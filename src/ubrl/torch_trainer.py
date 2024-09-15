@@ -303,7 +303,7 @@ class EpisodeData:
 
 
 @dataclass(eq=False)
-class LossInput:
+class Targets:
     """Input values to the loss function not present in AgentOutput.
 
     Analogous to "targets" or "labels" in supervised learning.
@@ -347,10 +347,10 @@ class LossInput:
         assert self.vf_loss_mask.shape == (n_observations,)
 
     @classmethod
-    def pack(cls, loss_inputs: list["LossInput"]) -> "LossInput":
-        return tu.pack_dataclass(cls, loss_inputs)
+    def pack(cls, targets: list["Targets"]) -> "Targets":
+        return tu.pack_dataclass(cls, targets)
 
-    def unpack(self) -> list["LossInput"]:
+    def unpack(self) -> list["Targets"]:
         n_observations = [n + 1 for n in self.n_timesteps]
         return tu.unpack_dataclass(
             self,
@@ -373,25 +373,29 @@ class CachedAgent:
     """
 
     def __init__(
-        self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster"
+        self, agent: Agent, cfg: "TrainerConfig", cluster: "ubrl.cluster.Cluster",
+        use_cache: bool = True
     ):
         self.agent: Agent = agent
         self.cfg = cfg
         self.cluster = cluster
         self.agent_out_cache: dict[EpisodeID, AgentOutput] = {}
+        self.use_cache = use_cache
 
     def clear_caches(self):
         self.agent_out_cache = {}
 
     def fill_caches(self, episode_data: list[EpisodeData]):
         """Ensure that all episodes in `episode_data` have cached values."""
+        if not self.use_cache:
+            return
         missing_episodes = [
             ep_data
             for ep_data in episode_data
             if ep_data.episode_id not in self.agent_out_cache
         ]
         with torch.no_grad():
-            for minibatch in _minibatch_episodes(
+            for minibatch in minibatch_episodes(
                 self.cluster,
                 missing_episodes,
                 desc="Caching state encodings",
@@ -406,6 +410,8 @@ class CachedAgent:
         The `AgentOutput` returned by this method will not require gradients
         (they are "detached").
         """
+        if not self.use_cache:
+            return self.agent_forward(episode_data, need_full=True).detach()
         self.fill_caches(episode_data)
         agent_outputs = [
             self.agent_out_cache[ep_data.episode_id] for ep_data in episode_data
@@ -434,9 +440,10 @@ class CachedAgent:
         else:
             agent_output = self.agent(agent_input)
         if agent_output.full_valid():
-            for i, output in enumerate(agent_output.unpack()):
-                episode_id = episode_data[i].episode_id
-                self.agent_out_cache[episode_id] = output.detach()
+            if self.use_cache:
+                for i, output in enumerate(agent_output.unpack()):
+                    episode_id = episode_data[i].episode_id
+                    self.agent_out_cache[episode_id] = output.detach()
         elif need_full:
             total_valid = agent_output.valid_mask.sum().item()
             total_timesteps = sum(agent_output.n_timesteps)
@@ -646,10 +653,10 @@ class TorchTrainer:
 
         self.kl_coef_opt = torch.optim.AdamW([self.kl_coef], lr=self.cfg.kl_coef_lr)
 
-    def _combined_loss_function(
-        self, agent_output: "AgentOutput", loss_input: LossInput
+    def combined_loss_function(
+        self, agent_output: "AgentOutput", target: Targets
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Reinforcement learning loss function.
+        """Reinforcement learning combined loss function.
 
         Combines together losses from many sources to train both the agent and
         value function.
@@ -657,14 +664,20 @@ class TorchTrainer:
         Returns a loss which is usually near unit scale and a dictionary of
         infos to log for this gradient step.
 
-        Note that lagrangian losses (for the KL and entropy) are optimized in
-        their related loss functions.
+        Note that the "lagrange multiplier" loss for KL is optimized in kl_loss_of().
         """
-        kl_loss, kl_infos = self._kl_loss(agent_output, loss_input)
-        entropy_loss, entropy_infos = self._entropy_loss(agent_output, loss_input)
-        ppo_loss, ppo_infos = self._ppo_loss(agent_output, loss_input)
-        awr_loss, awr_infos = self._awr_loss(agent_output, loss_input)
-        vf_loss, vf_infos = self._vf_loss(agent_output, loss_input)
+        kl_loss, kl_infos = kl_loss_of(self.cfg, agent_output, target,
+                                       self.kl_coef, self.kl_coef_opt)
+        ppo_loss, ppo_infos = ppo_loss_of(self.cfg, agent_output, target)
+        awr_loss, awr_infos = awr_loss_of(self.cfg, agent_output, target)
+        vf_loss, vf_infos = vf_loss_of(self.cfg, agent_output, target, self.vf)
+
+        approx_entropy, entropy = self.entropy_of(
+            agent_output.action_lls,
+            agent_output.action_dists,
+        )
+        entropy_loss, entropy_infos = entropy_loss_of(
+            self.cfg, agent_output, self.entropy_target(), entropy)
 
         if agent_output.inherent_loss is not None:
             inherent_loss = (
@@ -676,241 +689,16 @@ class TorchTrainer:
         loss = ppo_loss + awr_loss + vf_loss + kl_loss + entropy_loss + inherent_loss
 
         # *_infos will all get included in locals of this method
-        tu.used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos, entropy_infos)
+        tu.used_for_logging(kl_infos, ppo_infos, awr_infos, vf_infos,
+                            entropy_infos, approx_entropy)
         return loss, locals()
-
-    def _ppo_loss(
-        self, agent_output: "AgentOutput", loss_input: LossInput
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        ratio = torch.exp(agent_output.action_lls - agent_output.original_action_lls)
-        ratio_clipped = torch.clamp(
-            ratio, 1 / (1 + self.cfg.ppo_clip_epsilon), 1 + self.cfg.ppo_clip_epsilon
-        )
-
-        policy_gradient = ratio * loss_input.advantages
-        clip_policy_gradient = ratio_clipped * loss_input.advantages
-
-        # Mean is handled in the combined_loss_function
-        ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
-        norm_coef = self.cfg.ppo_loss_coef / self.cfg.minibatch_norm_div
-        ppo_loss_scaled = norm_coef * ppo_loss.sum()
-        infos = locals()
-        del infos["self"]
-        infos["clip_portion"] = (ratio_clipped != ratio).mean(dtype=torch.float32)
-        return (ppo_loss_scaled, infos)
-
-    def _awr_loss(
-        self, agent_output: "AgentOutput", loss_input: LossInput
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # Dividing by temperature and normalizing are handled in TorchTrainer.preprocess()
-        awr_loss = -agent_output.action_lls * loss_input.exp_advantages
-
-        log_probs_scale = agent_output.action_lls.detach().abs().mean()
-        tu.used_for_logging(log_probs_scale)
-        norm_coef = self.cfg.awr_loss_coef / (self.cfg.minibatch_norm_div)
-
-        awr_loss_scaled = norm_coef * awr_loss.sum()
-        # Don't want to log these here
-        infos = locals()
-        del infos["self"]
-        return (awr_loss_scaled, infos)
-
-    def _vf_loss(
-        self, agent_output: "AgentOutput", loss_input: LossInput
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        critic_out = self.vf(agent_output.state_encodings)
-        vf_loss = F.mse_loss(critic_out, loss_input.vf_targets, reduction="none")
-        # Excludes non-terminal final states
-        vf_loss_no_final = loss_input.vf_loss_mask * vf_loss
-
-        norm_coef = self.cfg.vf_loss_coef / self.cfg.minibatch_norm_div
-        vf_loss_scaled = norm_coef * vf_loss_no_final.sum()
-        infos = locals()
-        del infos["self"]
-        return (vf_loss_scaled, infos)
-
-    def _kl_loss(
-        self, agent_output: "AgentOutput", loss_input: LossInput
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        log_probs = agent_output.action_lls.clone()
-        old_log_probs = agent_output.original_action_lls
-        # Normalize to form a proper distribution across actions P(a)
-        log_probs -= log_probs.exp().sum().log()
-        old_log_probs -= old_log_probs.exp().sum().log()
-
-        # Approximate per-timestep KL by multiplying back in the number of timesteps
-
-        total_timesteps = sum(loss_input.n_timesteps)
-        approx_kl = total_timesteps * tu.approx_kl_div_of(old_log_probs, log_probs)
-        total_approx_kl = approx_kl.sum()
-        tu.used_for_logging(total_approx_kl)
-        new_dists = agent_output.action_dists
-        old_dists = agent_output.original_action_dists
-        assert (new_dists is None) == (
-            old_dists is None
-        ), "dists do not consistently exist"
-
-        # Compute KL Divergence
-        if (
-            self.cfg.use_approx_kl is False
-            and new_dists is not None
-            and old_dists is not None
-        ):
-            # TODO: Add options for other KL directions
-            try:
-                kl = tu.kl_div_of(old_dists, new_dists)
-            except NotImplementedError:
-                kl = approx_kl
-        else:
-            kl = approx_kl
-
-        assert kl.shape == (total_timesteps,), "KL shape does not match total timesteps"
-        assert approx_kl.shape == (
-            total_timesteps,
-        ), "KL approx shape does not match total timesteps"
-        kl = kl[torch.isfinite(kl)]
-
-        # Update KL loss coefficient
-        if self.cfg.kl_target_stat == "max":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().max())
-        elif self.cfg.kl_target_stat == "mean":
-            kl_coef_loss = self.kl_coef * (self.cfg.kl_soft_target - kl.detach().mean())
-        else:
-            raise ValueError(f"Unknown kl_target_stat {self.cfg.kl_target_stat}")
-        self.kl_coef_opt.zero_grad()
-        kl_coef_loss.backward()
-        try:
-            clip_grad_norm_(
-                [self.kl_coef], max_norm=self.cfg.grad_norm_max, error_if_nonfinite=True
-            )
-            self.kl_coef_opt.step()
-        except RuntimeError:
-            # Probably inf gradients, don't apply them
-            pass
-
-        if self.kl_coef < self.cfg.kl_coef_min:
-            with torch.no_grad():
-                self.kl_coef.copy_(self.cfg.kl_coef_min)
-        # If the KL coef has become non-finite, it's probably because of
-        # infinite KL, so set to maximum.
-        if self.kl_coef > self.cfg.kl_coef_max or not torch.isfinite(self.kl_coef):
-            with torch.no_grad():
-                self.kl_coef.copy_(self.cfg.kl_coef_max)
-        kl_coef = self.kl_coef.detach()
-
-        kl_mean = kl.mean()
-        kl_max = kl.max()
-        tu.used_for_logging(kl_mean, kl_max)
-
-        norm_coef = kl_coef / self.cfg.minibatch_norm_div
-
-        kl_loss_scaled = (norm_coef * kl).sum()
-        infos = locals()
-        del infos["self"]
-        return kl_loss_scaled, infos
-
-    def _entropy_target(self) -> Optional[float]:
-        if self.starting_entropy is None or self.cfg.entropy_schedule is None:
-            return None
-
-        agent_grad_steps_this_train_step = (
-            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
-        )
-        progress_at_train_step = min(
-            1,
-            agent_grad_steps_this_train_step
-            / max(1, self.agent_grad_steps_last_train_step),
-        )
-
-        # 0 at cfg.entropy_schedule_start_train_step
-        # 1 at (and after) cfg.expected_train_steps
-        step_fraction = min(
-            1,
-            (
-                (progress_at_train_step + self.train_steps_so_far)
-                - self.cfg.entropy_schedule_start_train_step
-            )
-            / (
-                self.cfg.expected_train_steps
-                - self.cfg.entropy_schedule_start_train_step
-            ),
-        )
-        assert step_fraction >= 0, "step_fraction < 0"
-        assert step_fraction <= 1, "step_fraction > 1"
-        if self.cfg.entropy_schedule_end_target is not None:
-            final_entropy = self.cfg.entropy_schedule_end_target
-        elif self.starting_entropy < 0:
-            # We must be in an (at least partly) continuous action space.
-            # Decrease the entropy by -log(fraction) instead.
-            final_entropy = self.starting_entropy + math.log(
-                self.cfg.entropy_schedule_end_fraction
-            )
-        else:
-            final_entropy = (
-                self.cfg.entropy_schedule_end_fraction * self.starting_entropy
-            )
-
-        if self.cfg.entropy_schedule == "linear":
-            mix = step_fraction
-        elif self.cfg.entropy_schedule == "cosine":
-            # Cosine curve from 1 to 0
-            mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
-        else:
-            raise NotImplementedError(
-                f"Unknown entropy schedule {self.cfg.entropy_schedule}"
-            )
-
-        assert mix >= 0, "entropy mix < 0"
-        assert mix <= 1, "entropy mix > 1"
-        target = (1 - mix) * self.starting_entropy + mix * final_entropy
-        return target
-
-    def _entropy_loss(
-        self, agent_output: "AgentOutput", loss_input: LossInput
-    ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # LossInput is only passed here to keep all loss function signatures
-        # the same
-        del loss_input
-        approx_entropy, entropy = self._entropy_of(
-            agent_output.action_lls,
-            agent_output.action_dists,
-        )
-        entropy_target = self._entropy_target()
-        if entropy_target is not None:
-            entropy_loss = self.cfg.entropy_loss_coef * (
-                (entropy - entropy_target).sum() ** 2
-            )
-        else:
-            entropy_target = entropy.mean()
-            entropy_loss = torch.tensor(0.0)
-
-        tu.used_for_logging(approx_entropy)
-        infos = locals()
-        del infos["self"]
-        return entropy_loss, infos
 
     def new_cached_agent(self):
         return CachedAgent(self.agent, self.cfg, self.cluster)
 
-    def train_step(self):
-        """Runs one "policy step" of training.
-
-        This method should be called repeatedly until training is complete.
-        Unless training is completely off-policy, new episodes should be added
-        between each call to this method using `add_episode()`.
-
-        All options for tuning this method are present in the TrainerConfig
-        passed on TorchTrainer initialization.
-        """
-        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
-        if len(self.replay_buffer) > self.cfg.replay_buffer_episodes:
-            self.replay_buffer = list(
-                self.replay_buffer[-self.cfg.replay_buffer_episodes :]
-            )
-            assert (
-                len(self.replay_buffer) == self.cfg.replay_buffer_episodes
-            ), "replay buffer length shorter than expected"
-
+    def start_train_step(self) -> float:
+        """Prunes the replay buffer, computes the deadline for the current
+        train_step(), and sets the networks to training mode."""
         start_time = time.monotonic()
         if (
             self.cfg.train_step_timeout_seconds is not None
@@ -928,81 +716,107 @@ class TorchTrainer:
         else:
             deadline = start_time + float("inf")
 
-        timed_out = False
+        self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
+        if len(self.replay_buffer) > self.cfg.replay_buffer_episodes:
+            self.replay_buffer = list(
+                self.replay_buffer[-self.cfg.replay_buffer_episodes :]
+            )
+            assert (
+                len(self.replay_buffer) == self.cfg.replay_buffer_episodes
+            ), "replay buffer length shorter than expected"
+
 
         self.agent.train(mode=True)
         self.vf.train(mode=True)
+        return deadline
 
+    def train_step(self):
+        """Runs one "policy step" of training.
+
+        This method should be called repeatedly until training is complete.
+        Unless training is completely off-policy, new episodes should be added
+        between each call to this method using `add_episode()`.
+
+        All options for tuning this method are present in the TrainerConfig
+        passed on TorchTrainer initialization.
+        """
+
+        deadline = self.start_train_step()
         c_agent = self.new_cached_agent()
 
         pre_train_epochs = self.cfg.vf_pre_training_epochs
         if self.train_steps_so_far == 0:
             pre_train_epochs = max(self.cfg.vf_warmup_training_epochs, pre_train_epochs)
 
-        timed_out = self._train_vf(
+        timed_out = self.train_vf(
             lambda: c_agent.cached_forward(self.replay_buffer),
             pre_train_epochs,
             desc="Pre Training VF",
             deadline=deadline,
         )
 
-        self._maybe_record_starting_entropy(c_agent)
-        if self.cfg.precompute_loss_inputs:
+        if self.cfg.precompute_targets:
             cache_out = c_agent.cached_forward(self.replay_buffer)
-            loss_input = self.loss_inputs_of(cache_out)
-            loss_inputs = {
+            self._maybe_record_starting_entropy(lambda: cache_out)
+            target = self.targets_of(cache_out)
+            targets = {
                 ep_data.episode_id: loss_in
                 for (ep_data, loss_in) in tu.strict_zip(
-                    self.replay_buffer, loss_input.unpack()
+                    self.replay_buffer, target.unpack()
                 )
             }
             c_agent.clear_caches()
         else:
-            loss_inputs = {}
+            targets = {}
 
         # Run primary training loop.
-        timed_out |= self._train_agent(c_agent, loss_inputs, deadline)
+        timed_out |= self.train_agent(c_agent, targets, deadline)
 
         # Log dataset stats
         cache_out = c_agent.cached_forward(self.replay_buffer)
-        loss_input = self.loss_inputs_of(cache_out)
-        self._log_dataset(cache_out, loss_input)
+        self._maybe_record_starting_entropy(lambda: cache_out)
+        target = self.targets_of(cache_out)
+        self.log_dataset(cache_out, target)
 
         # Extra VF tuning after the primary training loop.
         # This achieves similar objectives to PPG by simply not doing updates
         # on the agent network in this phase.
         # Inputs are guaranteed to be cached, since we ran at least one full
         # epoch in the primary loop.
-        timed_out |= self._train_vf(
+        timed_out |= self.train_vf(
             lambda: c_agent.cached_forward(self.replay_buffer),
             self.cfg.vf_post_training_epochs,
             desc="Post Training VF",
             deadline=deadline,
         )
+        self.end_train_step(timed_out)
 
+    def end_train_step(self, timed_out):
+        """Update training schedules, set networks back to eval mode."""
         # Update schedules
         self.agent_lr_scheduler.step()
         self.vf_lr_scheduler.step()
-        self.agent.train(mode=False)
-        self.vf.train(mode=False)
         self.train_steps_so_far += 1
         self.agent_grad_steps_last_train_step = (
             self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
         )
         self.agent_grad_steps_at_start_of_train_step = self.total_agent_grad_steps
 
+        self.agent.train(mode=False)
+        self.vf.train(mode=False)
+
         if timed_out:
             _LOGGER.error("train_step() timed out")
 
-    def _train_agent(
+    def train_agent(
         self,
         cached_agent: CachedAgent,
-        loss_input_cache: dict[EpisodeID, LossInput],
+        target_cache: dict[EpisodeID, Targets],
         deadline: float,
     ) -> bool:
         errors = 0
         for batch_i, minibatch in enumerate(
-            _minibatch_episodes(
+            minibatch_episodes(
                 self.cluster,
                 self.replay_buffer,
                 desc="Training Agent",
@@ -1017,26 +831,26 @@ class TorchTrainer:
 
             agent_output = cached_agent.agent_forward(minibatch, need_full=False)
 
-            if self.cfg.precompute_loss_inputs:
-                loss_inputs = LossInput.pack(
-                    [loss_input_cache[ep_data.episode_id] for ep_data in minibatch]
+            if self.cfg.precompute_targets:
+                targets = Targets.pack(
+                    [target_cache[ep_data.episode_id] for ep_data in minibatch]
                 )
             else:
-                if self._train_vf(
+                if self.train_vf(
                     lambda: agent_output.detach(),
-                    self.cfg.loss_input_vf_mini_epochs,
+                    self.cfg.target_vf_mini_epochs,
                     desc=None,
                     deadline=deadline,
                 ):
                     # Propagate timeout
                     return True
-                loss_inputs = self.loss_inputs_of(agent_output.detach())
-                for ep_data, loss_input in tu.strict_zip(
-                    minibatch, loss_inputs.unpack()
+                targets = self.targets_of(agent_output.detach())
+                for ep_data, target in tu.strict_zip(
+                    minibatch, targets.unpack()
                 ):
-                    loss_input_cache[ep_data.episode_id] = loss_input
+                    target_cache[ep_data.episode_id] = target
 
-            loss, loss_infos = self._combined_loss_function(agent_output, loss_inputs)
+            loss, loss_infos = self.combined_loss_function(agent_output, targets)
             self.vf_optimizer.zero_grad()
             self.agent_optimizer.zero_grad()
             self.cluster.backward(loss)
@@ -1077,7 +891,7 @@ class TorchTrainer:
                     raise ex
         return False
 
-    def _train_vf(
+    def train_vf(
         self,
         agent_output_gen: Callable[[], AgentOutput],
         training_epochs: int,
@@ -1141,7 +955,7 @@ class TorchTrainer:
                             vf_x[i, episode_length] = 0.0
 
                     with torch.no_grad():
-                        _, vf_targets = _v_trace_estimation(
+                        _, vf_targets = scalar_v_trace_estimation(
                             lmbda=self.cfg.v_trace_lambda,
                             rho_max=self.cfg.v_trace_rho_max,
                             c_max=self.cfg.v_trace_c_max,
@@ -1184,9 +998,9 @@ class TorchTrainer:
                         return True
         return False
 
-    def _log_dataset(self, agent_output: AgentOutput, loss_input: LossInput):
+    def log_dataset(self, agent_output: AgentOutput, target: Targets):
         full_episode_rewards = tu.pad_packed(
-            agent_output.rewards, loss_input.n_timesteps
+            agent_output.rewards, target.n_timesteps
         )
         discounted_returns = tu.pack_padded(
             tu.discount_cumsum(
@@ -1195,7 +1009,7 @@ class TorchTrainer:
             agent_output.n_timesteps,
         )
         vf_returns_no_final = tu.truncate_packed(
-            loss_input.vf_returns, new_lengths=loss_input.n_timesteps, to_cut=1
+            target.vf_returns, new_lengths=target.n_timesteps, to_cut=1
         )
         dataset_stats = {
             "episode_total_rewards": full_episode_rewards.sum(dim=-1).mean(dim=0),
@@ -1204,8 +1018,8 @@ class TorchTrainer:
                 discounted_returns,
             ),
             "discounted_rewards": discounted_returns.mean(),
-            "vf_mean": loss_input.vf_returns.mean(),
-            "vf_target_mean": loss_input.vf_targets.mean(),
+            "vf_mean": target.vf_returns.mean(),
+            "vf_target_mean": target.vf_targets.mean(),
             "total_env_steps": self.total_env_steps,
         }
         for k in self.replay_buffer[0].infos.keys():
@@ -1220,11 +1034,11 @@ class TorchTrainer:
             step=self.total_env_steps,
         )
 
-    def loss_inputs_of(
+    def targets_of(
         self,
         agent_output: AgentOutput,
-    ) -> LossInput:
-        """Compute LossInput of AgentOutput using self.vf"""
+    ) -> Targets:
+        """Compute Targets of AgentOutput using self.vf"""
         # Compute vf_returns
         self.agent.train(mode=False)
         self.vf.train(mode=False)
@@ -1248,14 +1062,14 @@ class TorchTrainer:
 
         # TODO(krzentner): Refactor / eliminate this loop
         for i, episode_length in enumerate(n_timesteps):
-            ep_loss_mask = self.cluster.prepare_tensor(torch.ones(episode_length + 1))
+            ep_vf_loss_mask = self.cluster.prepare_tensor(torch.ones(episode_length + 1))
             if agent_output.terminated[i]:
                 # zero vf_{t+1} in terminated episodes
                 vf_returns[i, episode_length] = 0.0
             else:
                 # Don't run VF loss on non-terminal final states.
-                ep_loss_mask[episode_length] = 0.0
-            vf_loss_masks.append(ep_loss_mask)
+                ep_vf_loss_mask[episode_length] = 0.0
+            vf_loss_masks.append(ep_vf_loss_mask)
 
         padded_rewards = tu.pad_packed(agent_output.rewards, n_timesteps)
         rewards_normed = self.reward_normalizer(padded_rewards)
@@ -1263,7 +1077,7 @@ class TorchTrainer:
         discount = 1 - self.cfg.discount_inv
         gammas = discount * torch.ones_like(rewards_normed)
 
-        padded_advantages, vf_targets = _v_trace_estimation(
+        padded_advantages, vf_targets = scalar_v_trace_estimation(
             lmbda=self.cfg.v_trace_lambda,
             rho_max=self.cfg.v_trace_rho_max,
             c_max=self.cfg.v_trace_c_max,
@@ -1300,7 +1114,7 @@ class TorchTrainer:
             normed_exp_adv = torch.ones_like(adv_packed)
 
         vf_loss_mask = tu.pack_tensors_check(vf_loss_masks, n_observations)
-        loss_input = LossInput(
+        target = Targets(
             advantages=adv_packed,
             vf_returns=tu.pack_padded(vf_returns, n_observations),
             vf_targets=tu.pack_padded(vf_targets, n_observations),
@@ -1320,7 +1134,7 @@ class TorchTrainer:
             level=noko.TRACE,
             step=self.total_env_steps,
         )
-        return loss_input
+        return target
 
     def add_episode(
         self,
@@ -1556,7 +1370,63 @@ class TorchTrainer:
             self.agent.parameters()
         ), "agent optimizer not optimizing ageint"
 
-    def _entropy_of(
+    def entropy_target(self) -> Optional[float]:
+        if self.starting_entropy is None or self.cfg.entropy_schedule is None:
+            return None
+
+        agent_grad_steps_this_train_step = (
+            self.total_agent_grad_steps - self.agent_grad_steps_at_start_of_train_step
+        )
+        progress_at_train_step = min(
+            1,
+            agent_grad_steps_this_train_step
+            / max(1, self.agent_grad_steps_last_train_step),
+        )
+
+        # 0 at cfg.entropy_schedule_start_train_step
+        # 1 at (and after) cfg.expected_train_steps
+        step_fraction = min(
+            1,
+            (
+                (progress_at_train_step + self.train_steps_so_far)
+                - self.cfg.entropy_schedule_start_train_step
+            )
+            / (
+                self.cfg.expected_train_steps
+                - self.cfg.entropy_schedule_start_train_step
+            ),
+        )
+        assert step_fraction >= 0, "step_fraction < 0"
+        assert step_fraction <= 1, "step_fraction > 1"
+        if self.cfg.entropy_schedule_end_target is not None:
+            final_entropy = self.cfg.entropy_schedule_end_target
+        elif self.starting_entropy < 0:
+            # We must be in an (at least partly) continuous action space.
+            # Decrease the entropy by -log(fraction) instead.
+            final_entropy = self.starting_entropy + math.log(
+                self.cfg.entropy_schedule_end_fraction
+            )
+        else:
+            final_entropy = (
+                self.cfg.entropy_schedule_end_fraction * self.starting_entropy
+            )
+
+        if self.cfg.entropy_schedule == "linear":
+            mix = step_fraction
+        elif self.cfg.entropy_schedule == "cosine":
+            # Cosine curve from 1 to 0
+            mix = 1 - 0.5 * (1 + math.cos(step_fraction * math.pi))
+        else:
+            raise NotImplementedError(
+                f"Unknown entropy schedule {self.cfg.entropy_schedule}"
+            )
+
+        assert mix >= 0, "entropy mix < 0"
+        assert mix <= 1, "entropy mix > 1"
+        target = (1 - mix) * self.starting_entropy + mix * final_entropy
+        return target
+
+    def entropy_of(
         self, action_lls: torch.Tensor, action_dists: Optional[tu.ActionDist]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes the approximate entropy (and exact entropy, if possible)."""
@@ -1575,15 +1445,16 @@ class TorchTrainer:
 
     def _maybe_record_starting_entropy(
         self,
-        cached_agent: "CachedAgent",
+        agent_output_gen: Callable[[], AgentOutput],
     ):
         """Record starting_etropy if train_steps_so_far >= cfg.entropy_schedule_start_train_step."""
         if (
             self.starting_entropy is None
             and self.train_steps_so_far >= self.cfg.entropy_schedule_start_train_step
         ):
-            agent_output = cached_agent.cached_forward(self.replay_buffer)
-            approx_entropy, entropy = self._entropy_of(
+            agent_output = agent_output_gen()
+            
+            approx_entropy, entropy = self.entropy_of(
                 agent_output.action_lls, agent_output.action_dists
             )
             del approx_entropy
@@ -1600,12 +1471,175 @@ def summarize_trainer(trainer, key, dst):
             noko.summarize(v, f"{key}.{k}", dst)
 
 
-# From here to the end of the file there should be only private helper / utlity
+## Loss Functions
+
+def ppo_loss_of(
+    cfg: TrainerConfig, agent_output: "AgentOutput", target: Targets
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Proximal Policy Optimization clipping loss function."""
+    ratio = torch.exp(agent_output.action_lls - agent_output.original_action_lls)
+    ratio_clipped = torch.clamp(
+        ratio, 1 / (1 + cfg.ppo_clip_epsilon), 1 + cfg.ppo_clip_epsilon
+    )
+
+    policy_gradient = ratio * target.advantages
+    clip_policy_gradient = ratio_clipped * target.advantages
+
+    ppo_loss = -torch.min(policy_gradient, clip_policy_gradient)
+    norm_coef = cfg.ppo_loss_coef / cfg.minibatch_norm_div
+    ppo_loss_scaled = norm_coef * ppo_loss.sum()
+    infos = locals()
+    infos["clip_portion"] = (ratio_clipped != ratio).mean(dtype=torch.float32)
+    return (ppo_loss_scaled, infos)
+
+
+def awr_loss_of(
+    cfg: TrainerConfig, agent_output: "AgentOutput", target: Targets
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Advantage Weighted Regression loss function.
+
+    Much of the work for setting up this loss function is in targets_of().
+    """
+    awr_loss = -agent_output.action_lls * target.exp_advantages
+
+    log_probs_scale = agent_output.action_lls.detach().abs().mean()
+    tu.used_for_logging(log_probs_scale)
+    norm_coef = cfg.awr_loss_coef / (cfg.minibatch_norm_div)
+
+    awr_loss_scaled = norm_coef * awr_loss.sum()
+    infos = locals()
+    return (awr_loss_scaled, infos)
+
+
+def vf_loss_of(
+    cfg: TrainerConfig, agent_output: "AgentOutput", target: Targets, vf: torch.nn.Module
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Value function loss function."""
+    critic_out = vf(agent_output.state_encodings)
+    vf_loss = F.mse_loss(critic_out, target.vf_targets, reduction="none")
+    # Excludes non-terminal final states
+    vf_loss_no_final = target.vf_loss_mask * vf_loss
+
+    norm_coef = cfg.vf_loss_coef / cfg.minibatch_norm_div
+    vf_loss_scaled = norm_coef * vf_loss_no_final.sum()
+    infos = locals()
+    del infos["vf"]
+    return (vf_loss_scaled, infos)
+
+
+def kl_loss_of(
+    cfg: TrainerConfig, agent_output: "AgentOutput", target: Targets,
+    kl_coef: nn.Parameter, kl_coef_opt: torch.optim.Optimizer
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """KL divergence loss.
+
+    Updates the `kl_coef` to match the target value in the cfg and penalizes
+    large KL values.
+    """
+    log_probs = agent_output.action_lls.clone()
+    old_log_probs = agent_output.original_action_lls
+    # Normalize to form a proper distribution across actions P(a)
+    log_probs -= log_probs.exp().sum().log()
+    old_log_probs -= old_log_probs.exp().sum().log()
+
+    # Approximate per-timestep KL by multiplying back in the number of timesteps
+
+    total_timesteps = sum(target.n_timesteps)
+    approx_kl = total_timesteps * tu.approx_kl_div_of(old_log_probs, log_probs)
+    total_approx_kl = approx_kl.sum()
+    tu.used_for_logging(total_approx_kl)
+    new_dists = agent_output.action_dists
+    old_dists = agent_output.original_action_dists
+    assert (new_dists is None) == (
+        old_dists is None
+    ), "dists do not consistently exist"
+
+    # Compute KL Divergence
+    if (
+        cfg.use_approx_kl is False
+        and new_dists is not None
+        and old_dists is not None
+    ):
+        # TODO: Add options for other KL directions
+        try:
+            kl = tu.kl_div_of(old_dists, new_dists)
+        except NotImplementedError:
+            kl = approx_kl
+    else:
+        kl = approx_kl
+
+    assert kl.shape == (total_timesteps,), "KL shape does not match total timesteps"
+    assert approx_kl.shape == (
+        total_timesteps,
+    ), "KL approx shape does not match total timesteps"
+    kl = kl[torch.isfinite(kl)]
+
+    # Update KL loss coefficient
+    if cfg.kl_target_stat == "max":
+        kl_coef_loss = kl_coef * (cfg.kl_soft_target - kl.detach().max())
+    elif cfg.kl_target_stat == "mean":
+        kl_coef_loss = kl_coef * (cfg.kl_soft_target - kl.detach().mean())
+    else:
+        raise ValueError(f"Unknown kl_target_stat {cfg.kl_target_stat}")
+    kl_coef_opt.zero_grad()
+    kl_coef_loss.backward()
+    try:
+        clip_grad_norm_(
+            [kl_coef], max_norm=cfg.grad_norm_max, error_if_nonfinite=True
+        )
+        kl_coef_opt.step()
+    except RuntimeError:
+        # Probably inf gradients, don't apply them
+        pass
+
+    if kl_coef < cfg.kl_coef_min:
+        with torch.no_grad():
+            kl_coef.copy_(cfg.kl_coef_min)
+    # If the KL coef has become non-finite, it's probably because of
+    # infinite KL, so set to maximum.
+    if kl_coef > cfg.kl_coef_max or not torch.isfinite(kl_coef):
+        with torch.no_grad():
+            kl_coef.copy_(cfg.kl_coef_max)
+
+    kl_mean = kl.mean()
+    kl_max = kl.max()
+    tu.used_for_logging(kl_mean, kl_max)
+
+    norm_coef = kl_coef.detach() / cfg.minibatch_norm_div
+
+    kl_loss_scaled = (norm_coef * kl).sum()
+    infos = locals()
+    return kl_loss_scaled, infos
+
+
+def entropy_loss_of(
+    cfg: TrainerConfig, agent_output: "AgentOutput",
+    entropy_target: Optional[float], entropy: torch.Tensor
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Computes "squared mean error" of entropy relative to target.
+
+    Note that this is intentionally not "mean squared error."
+    Outliers in entropy (e.g. "chokepoint states") are typically beneficial, as
+    long as the overall training process follows the target curve.
+    """
+    if entropy_target is not None:
+        entropy_loss = cfg.entropy_loss_coef * (
+            (entropy - entropy_target).sum() ** 2
+        )
+    else:
+        # Set entropy_target to a float for logging purposes
+        entropy_target = float('nan')
+        entropy_loss = torch.tensor(0.0)
+    infos = locals()
+    return entropy_loss, infos
+
+
+# From here to the end of the file there should be only helper / utlity
 # functions.
 
 
 @torch.jit.script
-def _v_trace_estimation(
+def scalar_v_trace_estimation(
     *,
     lmbda: float,
     rho_max: float,
@@ -1696,7 +1730,7 @@ def _v_trace_estimation(
     return advantages, v_s
 
 
-def _group_episodes_to_minibatches(
+def group_episodes_to_minibatches(
     episodes: list["ubrl.EpisodeData"],
     *,
     minibatch_target_size: Optional[float] = None,
@@ -1738,7 +1772,7 @@ def _group_episodes_to_minibatches(
     return all_minibatches
 
 
-def _minibatch_episodes(
+def minibatch_episodes(
     cluster: "ubrl.cluster.Cluster",
     episodes: list[EpisodeData],
     minibatch_target_size: Optional[int] = None,
@@ -1762,7 +1796,7 @@ def _minibatch_episodes(
         for _ in range(epochs):
             episodes = cluster.shard_episodes(episodes, shuffle=shuffle)
 
-            minibatches = _group_episodes_to_minibatches(
+            minibatches = group_episodes_to_minibatches(
                 episodes=episodes,
                 minibatch_target_size=minibatch_target_size,
                 minibatch_max_size=minibatch_max_size,
@@ -1777,5 +1811,5 @@ __all__ = [
     "Agent",
     "AgentInput",
     "AgentOutput",
-    "LossInput",
+    "Targets",
 ]

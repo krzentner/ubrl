@@ -385,6 +385,18 @@ class TrainerConfig(simple_parsing.Serializable):
     The default value measures the entropy after one train step.
     """
 
+    entropy_schedule_start_minibatches: Optional[int] = None
+    """When `precompute_targets is None and
+    entropy_schedule_start_train_step == 0`, a "starting entropy" needs to be
+    recorded before performing a forward pass on the entire replay buffer.
+
+    This parameter sets how many minibatches to wait before computing the
+    starting entropy  as an average over those minibatch outputs.
+
+    This parameter must not be None if and only if `precompute_targets is None and
+    entropy_schedule_start_train_step == 0`
+    """
+
     entropy_loss_coef: float = tunable(1e-4, low=0.0, high=1.0)
     """Entropy coefficient.
 
@@ -424,7 +436,7 @@ class TrainerConfig(simple_parsing.Serializable):
     Small values will consistently lower the loss.
     """
 
-    precompute_loss_inputs: bool = tunable(False, choices=[False, True])
+    precompute_targets: bool = tunable(False, choices=[False, True])
     """Compute advantages and VF targets for all minibatches before running
     loss on any minibatch.
 
@@ -433,9 +445,9 @@ class TrainerConfig(simple_parsing.Serializable):
     If False, minibatches will become off-policy.
     """
 
-    loss_input_vf_mini_epochs: int = tunable(0, low=0, high=1)
+    target_vf_mini_epochs: int = tunable(0, low=0, high=1)
     """Number of epochs of vf training to run on each minibatch when
-    `precompute_loss_inputs` is False.
+    `precompute_targets` is False.
     """
 
     checkpoint_interval: int = 1
@@ -502,6 +514,12 @@ class TrainerConfig(simple_parsing.Serializable):
         if isinstance(self.stderr_log_level, str):
             stderr_log_level = noko.LOG_LEVELS[self.stderr_log_level]
             object.__setattr__(self, "stderr_log_level", stderr_log_level)
+
+        if self.precompute_targets is None and self.entropy_schedule_start_train_step == 0:
+            assert self.entropy_schedule_start_minibatches is not None
+            assert self.entropy_schedule_start_minibatches > 0
+        else:
+            assert self.entropy_schedule_start_minibatches is None
 
     def choose_device(self, n_params: int) -> "TrainerConfig":
         if self.device == _CUDA_ON_OVER_ONE_MILLION_PARAMS:
