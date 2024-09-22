@@ -6,7 +6,7 @@ def qmd_code_blocks(qmd_src: str) -> list[str]:
     for lino, line in enumerate(qmd_src.split("\n")):
         if line.strip().startswith("```{python}"):
             in_block = True
-            block_header = "\n" * lino
+            block_header = "\n" * (lino + 1)
         elif line.strip().startswith("```"):
             if in_block:
                 in_block = False
@@ -25,8 +25,8 @@ def run_qmd(filename: str):
     blocks = qmd_code_blocks(qmd_src)
     context = dict()
     for block in blocks:
-        print("Running:")
-        print(block)
+        # print("Running:")
+        # print(block)
         code = compile(block, filename, "exec")
         exec(code, context, context)
 

@@ -1,0 +1,137 @@
+
+# Derivations of Bin Mean Functions
+
+Setup variables.
+```{python}
+from sympy import *
+x = Symbol('x', positive=True)
+y = Symbol('y', positive=True)
+
+bin_center = Symbol('bin_center')
+
+# bin_center_left = Symbol('bin_center_left')
+# bin_center_right = Symbol('bin_center_right')
+# bin_sep_left = bin_center - bin_center_left
+# bin_sep_right = bin_center_right - bin_center
+
+# It's simpler to think of the shape of a particular bin as being dependent
+# only on the separation, instead of the adjacent bin centers directly.
+
+bin_sep_left = Symbol('bin_sep_left')
+bin_sep_right = Symbol('bin_sep_right')
+```
+
+Derive bin_mean for linear quant_prob function.
+```{python}
+linear_quant_prob_left = (1 - (bin_center - x) / bin_sep_left)
+linear_quant_prob_right = (1 - (x - bin_center) / bin_sep_right)
+
+left_mean_lin = integrate(
+    x * linear_quant_prob_left,
+    (x, bin_center - bin_sep_left, bin_center)
+)
+print('\nleft_mean_lin:', left_mean_lin)
+
+right_mean_lin = integrate(
+    x * linear_quant_prob_right,
+    (x, bin_center, bin_center + bin_sep_right)
+)
+print('\nright_mean_lin:', right_mean_lin)
+
+bin_mean_lin = simplify((left_mean_lin + right_mean_lin) / 2)
+print('\nbin_mean_lin:', bin_mean_lin)
+```
+
+Some basic checks on the linear derivation. 
+
+```{python}
+
+assert bin_mean_lin.evalf(subs={
+    bin_center: 4,
+    # bin_center_left: 2,
+    # bin_center_right: 6,
+    bin_sep_left: 2,
+    bin_sep_right: 2,
+}) == 4.0
+
+assert bin_mean_lin.evalf(subs={
+    bin_center: 4,
+    # bin_center_left: 2,
+    # bin_center_right: 4,
+    bin_sep_left: 2,
+    bin_sep_right: 0,
+}) == 5/3
+```
+
+Derive bin_mean for cubic quant_prob function.
+```{python}
+cubic_quant_prob_left = 3 * linear_quant_prob_left ** 2 - 2 * linear_quant_prob_left ** 3
+cubic_quant_prob_right = 3 * linear_quant_prob_right ** 2 - 2 * linear_quant_prob_right ** 3
+
+left_mean_cubic = integrate(
+    x * cubic_quant_prob_left,
+    (x, bin_center - bin_sep_left, bin_center)
+)
+print('\nleft_mean_cubic:', left_mean_cubic)
+
+right_mean_cubic = integrate(
+    x * cubic_quant_prob_right,
+    (x, bin_center, bin_center + bin_sep_right)
+)
+print('\nright_mean_cubic:', right_mean_cubic)
+
+bin_mean_cubic = simplify((left_mean_cubic + right_mean_cubic) / 2)
+print('\nbin_mean_cubic:', bin_mean_cubic)
+```
+
+```{python}
+assert bin_mean_cubic.evalf(subs={
+    bin_center: 4,
+    bin_sep_left: 2,
+    bin_sep_right: 2,
+}) == 4.0
+
+assert bin_mean_cubic.evalf(subs={
+    bin_center: 4,
+    bin_sep_left: 2,
+    bin_sep_right: 0,
+}) > 5/3
+```
+
+```{python}
+quant_prob_lin = 1 - x
+half_cdf_lin = integrate(quant_prob_lin, x)
+cdf_inv_lin = solve(2 * half_cdf_lin - y, x)
+print(cdf_inv_lin)
+for sol in cdf_inv_lin:
+    print('evaluating', sol)
+    good_sol = True
+    for y_val in [0, 0.5, 1.0]:
+        x_val = sol.subs({y: y_val})
+        print(f'{sol} y = {y_val}', x_val)
+        if x_val > 1 or x_val < 0:
+            print('rejecting', sol)
+            good_sol = False
+    if good_sol:
+        cdf_inv_r = sol
+        print('Found linear inverse cfg over range:', cdf_inv_r)
+```
+
+```{python}
+quant_prob_cub = 1 - (3 * x ** 2 - 2 * x ** 3)
+half_cdf_cub = integrate(quant_prob_cub, x)
+cdf_inv_cub = solve(2 * half_cdf_cub - y, x)
+# print(cdf_inv_cub)
+for sol in cdf_inv_cub:
+    # print('evaluating', sol)
+    good_sol = True
+    for y_val in [0, 0.5, 1.0]:
+        x_val = sol.subs({y: y_val})
+        # print(f'{sol} y = {y_val}', x_val)
+        if not x_val.is_real or x_val > 1 or x_val < 0:
+            # print('rejecting', sol)
+            good_sol = False
+    if good_sol:
+        cdf_inv_r = sol
+        print('Found cubic inverse cfg over range:', cdf_inv_r)
+```
