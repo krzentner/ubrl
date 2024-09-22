@@ -121,20 +121,25 @@ from typing import Literal
 import torch
 
 
-def linear_quant_prob(x: torch.Tensor, bin_centers: torch.Tensor, 
-                      left_sep: float = 1.0, right_sep: float = 1.0) -> torch.Tensor:
-    bin_sep = torch.cat([
-        torch.tensor([left_sep]),
-        bin_centers[1:] - bin_centers[:-1], 
-        torch.tensor([right_sep]), 
-    ])
-    left_bins = torch.clamp(torch.bucketize(x, bin_centers, right=True),
-                            max=len(bin_sep) - 1)
+def linear_quant_prob(
+    x: torch.Tensor,
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+) -> torch.Tensor:
+    bin_sep = torch.cat(
+        [
+            torch.tensor([left_sep]),
+            bin_centers[1:] - bin_centers[:-1],
+            torch.tensor([right_sep]),
+        ]
+    )
+    left_bins = torch.clamp(
+        torch.bucketize(x, bin_centers, right=True), max=len(bin_sep) - 1
+    )
     bin_sep_x = bin_sep[left_bins]
     abs_distance = (x[:, None] - bin_centers[None, :]).abs()
-    v = torch.clamp(
-        1 - abs_distance / bin_sep_x[:, None], min=0
-    )
+    v = torch.clamp(1 - abs_distance / bin_sep_x[:, None], min=0)
     # If x is before the first bin all prob is to first bin
     # Same with after last bin
     v[x < bin_centers[0], 0] = 1.0
@@ -169,11 +174,15 @@ def test_linear_quant_prob():
     ).all()
 
 
-def cubic_quant_prob(x: torch.Tensor, bin_centers: torch.Tensor, 
-                      left_sep: float = 1.0, right_sep: float = 1.0) -> torch.Tensor:
+def cubic_quant_prob(
+    x: torch.Tensor,
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+) -> torch.Tensor:
     y = linear_quant_prob(
-            x=x, bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
-        )
+        x=x, bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
+    )
     return 3 * y**2 - 2 * y**3
 
 
@@ -203,17 +212,21 @@ def test_cubic_quant_prob():
     ).all()
 
 
-QUANT_PROB_TYPE = Literal['linear'] | Literal['cubic']
+QUANT_PROB_TYPE = Literal["linear"] | Literal["cubic"]
+
 
 def quant_prob(
-        x: torch.Tensor, bin_centers: torch.Tensor,
-        left_sep: float = 1.0, right_sep: float = 1.0,
-        quant_prob_type: QUANT_PROB_TYPE = 'cubic') -> torch.Tensor:
-    if quant_prob_type == 'linear':
+    x: torch.Tensor,
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+    quant_prob_type: QUANT_PROB_TYPE = "cubic",
+) -> torch.Tensor:
+    if quant_prob_type == "linear":
         return linear_quant_prob(
             x=x, bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
         )
-    elif quant_prob_type == 'cubic':
+    elif quant_prob_type == "cubic":
         return cubic_quant_prob(
             x=x, bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
         )
@@ -222,44 +235,58 @@ def quant_prob(
 
 
 def linear_bin_means(
-           bin_centers: torch.Tensor,
-           left_sep: float = 1.0, right_sep: float = 1.0, 
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
 ) -> torch.Tensor:
     """See notes/two_hot.qmd for the derivation of this function."""
-    bin_sep = torch.cat([
-        torch.tensor([left_sep]),
-        bin_centers[1:] - bin_centers[:-1], 
-        torch.tensor([right_sep]), 
-    ])
+    bin_sep = torch.cat(
+        [
+            torch.tensor([left_sep]),
+            bin_centers[1:] - bin_centers[:-1],
+            torch.tensor([right_sep]),
+        ]
+    )
 
-    bin_means = bin_centers * (bin_sep[:1] + bin_sep[:-1])/4 - 3 * (bin_sep[:1]**2 + bin_sep[:-1]**2)/40
+    bin_means = (
+        bin_centers * (bin_sep[:1] + bin_sep[:-1]) / 4
+        - 3 * (bin_sep[:1] ** 2 + bin_sep[:-1] ** 2) / 40
+    )
     return bin_means
 
 
 def cubic_bin_means(
-           bin_centers: torch.Tensor,
-           left_sep: float = 1.0, right_sep: float = 1.0, 
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
 ) -> torch.Tensor:
     """See notes/two_hot.qmd for the derivation of this function."""
-    bin_sep = torch.cat([
-        torch.tensor([left_sep]),
-        bin_centers[1:] - bin_centers[:-1], 
-        torch.tensor([right_sep]), 
-    ])
+    bin_sep = torch.cat(
+        [
+            torch.tensor([left_sep]),
+            bin_centers[1:] - bin_centers[:-1],
+            torch.tensor([right_sep]),
+        ]
+    )
 
-    bin_means = bin_centers * (bin_sep[:1] + bin_sep[:-1]) / 4 - (bin_sep[:1] ** 2 + bin_sep[:-1]**2) / 12
+    bin_means = (
+        bin_centers * (bin_sep[:1] + bin_sep[:-1]) / 4
+        - (bin_sep[:1] ** 2 + bin_sep[:-1] ** 2) / 12
+    )
     return bin_means
 
 
 def bin_means(
-        bin_centers: torch.Tensor,
-        left_sep: float = 1.0, right_sep: float = 1.0, 
-        quant_prob_type: QUANT_PROB_TYPE = 'cubic') -> torch.Tensor:
-    if quant_prob_type == 'linear':
+    bin_centers: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+    quant_prob_type: QUANT_PROB_TYPE = "cubic",
+) -> torch.Tensor:
+    if quant_prob_type == "linear":
         return linear_bin_means(
             bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
         )
-    elif quant_prob_type == 'cubic':
+    elif quant_prob_type == "cubic":
         return cubic_bin_means(
             bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep
         )
@@ -268,33 +295,46 @@ def bin_means(
 
 
 def expected_value(
-           bin_centers: torch.Tensor, bin_weights: torch.Tensor,
-           left_sep: float = 1.0, right_sep: float = 1.0, 
-           quant_prob_type: QUANT_PROB_TYPE = 'cubic') -> torch.Tensor:
+    bin_centers: torch.Tensor,
+    bin_weights: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+    quant_prob_type: QUANT_PROB_TYPE = "cubic",
+) -> torch.Tensor:
     assert bin_centers.shape == bin_weights.shape
     the_bin_means = bin_means(
-        bin_centers=bin_centers, left_sep=left_sep, right_sep=right_sep,
+        bin_centers=bin_centers,
+        left_sep=left_sep,
+        right_sep=right_sep,
         quant_prob_type=quant_prob_type,
     )
     return (the_bin_means * bin_weights).sum()
 
 
-def sample(n_samples: int,
-           bin_centers: torch.Tensor, bin_weights: torch.Tensor,
-           left_sep: float = 1.0, right_sep: float = 1.0, 
-           quant_prob_type: QUANT_PROB_TYPE = 'cubic') -> torch.Tensor:
+def sample(
+    n_samples: int,
+    bin_centers: torch.Tensor,
+    bin_weights: torch.Tensor,
+    left_sep: float = 1.0,
+    right_sep: float = 1.0,
+    quant_prob_type: QUANT_PROB_TYPE = "cubic",
+) -> torch.Tensor:
     assert bin_centers.shape == bin_weights.shape
-    bin_sep = torch.cat([
-        torch.tensor([left_sep]),
-        bin_centers[1:] - bin_centers[:-1], 
-        torch.tensor([right_sep]), 
-    ])
+    bin_sep = torch.cat(
+        [
+            torch.tensor([left_sep]),
+            bin_centers[1:] - bin_centers[:-1],
+            torch.tensor([right_sep]),
+        ]
+    )
     bin_indices = torch.randint(high=len(bin_centers), size=[n_samples])
 
     # Choose what side of the bin center to sample from
     bin_left_size = bin_sep[:-1]
     bin_right_size = bin_sep[1:]
-    prob_right_side_of_bin = (bin_right_size / (bin_left_size + bin_right_size))[bin_indices]
+    prob_right_side_of_bin = (bin_right_size / (bin_left_size + bin_right_size))[
+        bin_indices
+    ]
     assert prob_right_side_of_bin.shape == (n_samples,)
     right_side_of_bin = prob_right_side_of_bin < torch.rand(n_samples)
 
@@ -302,21 +342,85 @@ def sample(n_samples: int,
     quant_offset = sample_quant_offset(n_samples, quant_prob_type) * sep_at_side
     offset = -quant_offset
     offset[right_side_of_bin] = quant_offset[right_side_of_bin]
-    points = bin_centers[bin_indices] + offset 
+    points = bin_centers[bin_indices] + offset
     assert points.shape == (n_samples,)
     return points
 
 
-def sample_quant_offset(n_samples: int, quant_prob_type: QUANT_PROB_TYPE) -> torch.Tensor:
+def sample_quant_offset(
+    n_samples: int, quant_prob_type: QUANT_PROB_TYPE
+) -> torch.Tensor:
     x = torch.randn(n_samples)
-    if quant_prob_type == 'linear':
-        return x
-    elif quant_prob_type == 'cubic':
-        return 
+    sqrt = torch.sqrt
+    if quant_prob_type == "linear":
+        return 1 - sqrt(1 - x)
+    elif quant_prob_type == "cubic":
+        return (
+            -sqrt(
+                -2
+                * (x - 1)
+                / (
+                    3
+                    * (
+                        -x / 4
+                        + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27)
+                        + 1 / 4
+                    )
+                    ** (1 / 3)
+                )
+                + 2
+                * (-x / 4 + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27) + 1 / 4)
+                ** (1 / 3)
+                + 1
+            )
+            / 2
+            + sqrt(
+                2
+                * (x - 1)
+                / (
+                    3
+                    * (
+                        -x / 4
+                        + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27)
+                        + 1 / 4
+                    )
+                    ** (1 / 3)
+                )
+                - 2
+                * (-x / 4 + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27) + 1 / 4)
+                ** (1 / 3)
+                + 2
+                + 2
+                / sqrt(
+                    -2
+                    * (x - 1)
+                    / (
+                        3
+                        * (
+                            -x / 4
+                            + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27)
+                            + 1 / 4
+                        )
+                        ** (1 / 3)
+                    )
+                    + 2
+                    * (
+                        -x / 4
+                        + sqrt((x / 2 - 1 / 2) ** 2 / 4 + (x - 1) ** 3 / 27)
+                        + 1 / 4
+                    )
+                    ** (1 / 3)
+                    + 1
+                )
+            )
+            / 2
+            + 1 / 2
+        )
 
 
 import hot_restart
+
 hot_restart.wrap_module()
-if __name__ == '__main__' and not hot_restart.is_restarting_module():
+if __name__ == "__main__" and not hot_restart.is_restarting_module():
     test_linear_quant_prob()
     test_cubic_quant_prob()
